@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: drella
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: drella
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - drella.yaml
+secretGenerator:
+  # Postgres is only reachable from the drella pod (see the NetworkPolicy in
+  # postgres.yaml). Change the password here before deploying if you like.
+  - name: postgres
+    literals:
+      - password=drella
+images:
+  - name: ghcr.io/realitydevices/drella
+    newTag: latest
