@@ -1,12 +1,12 @@
-# Tuttle
+# Lumbergh
 
-> "Listen, kid, we're all in it together."
-> — Harry Tuttle, heating engineer, *Brazil* (1985)
+> "Yeah… if you could just go ahead and get that done, that'd be great."
 
-Tuttle is a self-hosted runner for AI agents on Kubernetes. You hand it work, it
-sends an agent in to do the job, and it keeps a record of what was done.
+Lumbergh is a self-hosted runner that delegates work to AI agents on Kubernetes.
+You hand it work, it hands the work to an agent, and it keeps a record of what was
+done.
 
-**Status:** spec in progress. No code yet. The plan is for Tuttle to build itself
+**Status:** spec in progress. No code yet. The plan is for Lumbergh to build itself
 from these docs.
 
 ## The idea
