@@ -1,6 +1,6 @@
 # Decisions
 
-What's been decided, what's proposed, and what's still open. Other docs build on this
+What's been decided and what's still open. Other docs build on this
 one. When a decision changes, edit it here first.
 
 ## Agreed
@@ -17,6 +17,10 @@ one. When a decision changes, edit it here first.
    calls the Drella API to create a job, so scheduled and manual jobs follow one path.
 5. **Memory** belongs to an agent. The prompt decides what gets remembered ("record what
    you did"). Drella also keeps its own deterministic record (job history, outputs).
+   Memory is a folder of markdown files per agent, kept inside Drella and versioned: every
+   job that changes it saves a new version, so you get history and diffs. It sits behind an
+   interface, so a vector store or a mirror to a git repo can be added later. It isn't kept
+   on GitHub by default, because memory may hold private details and repos are public.
 6. Works with **any LLM endpoint**: local (e.g. Ollama) or hosted (e.g. Anthropic).
    **Model routing** is set per template, and a job can override it.
 
@@ -31,6 +35,8 @@ one. When a decision changes, edit it here first.
     ever decrypted into the pod for the job that needs them.
 11. **The agent opens its own PR.** Drella doesn't push on its behalf. Repos rely on branch
     protection, so an agent can push branches and open PRs but can't merge to `main`.
+    An agent that should post "as itself" gets its own GitHub App, whose credentials are
+    stored like any other. Agents without one use their owner's credentials.
 12. **Users:** several. Every non-human token (an agent) has an **owner**, a human token.
     An admin role comes later.
 
@@ -63,7 +69,9 @@ one. When a decision changes, edit it here first.
     carries the token) and put into a Secret for that job only. Trade-offs: a lost token
     means re-entering its credentials, rotating a token re-encrypts them, and an owner sets
     an agent's credentials when creating the agent.
-20. **Job pod contract:**
+20. **One job image.** `drella-job` contains OpenCode, Hermes and the job wrapper; the
+    job's command picks the agent. Split it only if size or dependency conflicts start to hurt.
+21. **Job pod contract:**
     - **Before the agent:** inputs land in `/in`, credentials are written to files, and memory is fetched.
     - **The agent:** writes results to `/out`.
     - **Status:** reported to the API using a token scoped to that one job.
@@ -73,34 +81,18 @@ one. When a decision changes, edit it here first.
       object storage, because pod logs disappear with the pod.
     - **If the agent is killed,** its unsaved work may be lost, but the log survives, which
       is enough to diagnose and fix. Coding agents push their branch early and often.
-21. **Queues:** endpoints and models belong to **queue groups**, each with its own
+22. **Queues:** endpoints and models belong to **queue groups**, each with its own
     concurrency limit. For example, `local` runs 1 at a time and `anthropic` runs 4. Jobs
     queue FIFO within a group.
-22. **Default limits:** 1 hour timeout, 2 GB RAM per job. Templates can override both.
+23. **Default limits:** 1 hour timeout, 2 GB RAM per job. Templates can override both.
 
 ### Process
 
-23. Repos are public, and `main` is protected (PR + 1 review).
-24. The docs in `docs/` are the spec, written for people and for the agents implementing them.
-25. **v0 is built by hand.** It's just enough to run one job: token → create job (prompt +
+24. Repos are public, and `main` is protected (PR + 1 review).
+25. The docs in `docs/` are the spec, written for people and for the agents implementing them.
+26. **v0 is built by hand.** It's just enough to run one job: token → create job (prompt +
     repo) → OpenCode against a local model → log + output artifact. No UI, schedules,
     memory or MCP yet. From then on Drella builds itself from these docs.
-
-## Proposed (accept, change or reject)
-
-- **P1. One job image.** `drella-job` contains OpenCode, Hermes and the job wrapper; the
-  job's command picks the agent. That's one image to build, version and pull. Split it
-  only if the size or dependency conflicts start to hurt.
-- **P2. Web UI without a build step:** static HTML plus a small JS library (e.g. Alpine.js)
-  calling the JSON API. HTMX is out because it wants HTML responses, and the API returns JSON (see 8).
-- **P3. Memory is versioned inside Drella.** Each agent has a folder of markdown files.
-  Every job that changes memory saves a new version, so you get history and diffs without
-  GitHub. Memory stays behind an interface, so a vector store can be added later. An
-  optional "mirror to a git repo" exporter can come later too. GitHub isn't the default
-  because memory may hold private details and repos are public (23).
-- **P4. Agent identity on GitHub:** an agent that should post "as itself" gets its own
-  GitHub App. Apps are free, and an App's credentials are stored like any other credential.
-  Agents without their own App use their owner's credentials.
 
 ## Open
 
