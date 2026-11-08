@@ -219,3 +219,13 @@ def test_logs_as_server_sent_events(client, auth, job, queue, runner):
     )
     assert r.headers["content-type"].startswith("text/event-stream")
     assert r.text == "data: line 1\n\ndata: line 2\n\nevent: end\ndata: failed\n\n"
+
+
+def test_reported_failure_message_wins_over_kubernetes_reason(client, auth, job, queue, runner):
+    queue.tick()
+    ja = job_auth(runner, job["id"])
+    client.post(f"/jobs/{job['id']}/status", json={"status": "failed", "message": "no PR"}, headers=ja)
+    runner.states[job["id"]] = RunStatus(RunState.FAILED, "BackoffLimitExceeded")
+    queue.tick()
+    got = client.get(f"/jobs/{job['id']}", headers=auth).json()
+    assert (got["status"], got["message"]) == ("failed", "no PR")

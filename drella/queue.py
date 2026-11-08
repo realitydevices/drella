@@ -114,8 +114,10 @@ class Queue:
             final = FAILED
             message = job.message or "the job exited without reporting success"
         else:
+            # If the job reported, its message says why; if it was killed (e.g.
+            # timeout, out of memory), Kubernetes does.
             final = FAILED
-            message = "; ".join(filter(None, [st.message, job.message]))
+            message = job.message if job.reported_status else st.message
         self._finish(s, job, final, message)
         self.runner.cleanup(job.id)
 
