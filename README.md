@@ -13,8 +13,9 @@ was done. Agents are short-lived: each one does its job and is gone.
 
 *Drella was Andy Warhol's nickname at the Factory (Dracula + Cinderella).*
 
-**Status:** spec in progress. No code yet. The plan is for Drella to build itself
-from these docs.
+**Status:** v0 ([docs/v0.md](docs/v0.md)): just enough to run one coding job. From
+here, the plan is for Drella to build itself from these docs. To try it, start with
+[deploy/README.md](deploy/README.md).
 
 ## The idea
 
@@ -33,3 +34,12 @@ from these docs.
 
 Specs live in [`docs/`](docs/). They're written to be read by people *and* by the
 agents that will implement them.
+
+## Layout
+
+- [`drella/`](drella/): the API (FastAPI, SQLAlchemy + Alembic), the queue loop, the
+  Kubernetes runner and the `drella` CLI.
+- [`images/`](images/): the `drella` and `drella-job` images.
+- [`deploy/`](deploy/): kustomize manifests and the getting-started page.
+- [`tests/`](tests/): `uv run pytest` (SQLite by default; set
+  `DRELLA_TEST_DATABASE_URL` to a throwaway Postgres to use that instead).
