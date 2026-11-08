@@ -1,12 +1,13 @@
-# Lumbergh
+# Mortville
 
-> "Yeah… if you could just go ahead and get that done, that'd be great."
+A self-hosted town where AI agents live and work, on Kubernetes.
 
-Lumbergh is a self-hosted runner that delegates work to AI agents on Kubernetes.
-You hand it work, it hands the work to an agent, and it keeps a record of what was
-done.
+You hand Mortville work, it sends a resident out to do it, and it keeps a record of
+what was done. Residents are short-lived: each one does its job and is gone.
 
-**Status:** spec in progress. No code yet. The plan is for Lumbergh to build itself
+*Named for the town in John Waters' *Desperate Living* (1977).*
+
+**Status:** spec in progress. No code yet. The plan is for Mortville to build itself
 from these docs.
 
 ## The idea
