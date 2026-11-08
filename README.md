@@ -1,13 +1,19 @@
-# Mortville
+# Drella
 
-A self-hosted town where AI agents live and work, on Kubernetes.
+<p align="center"><img src="assets/drella.svg" alt="Drella: four pop-art portraits of Andy Warhol in dark sunglasses" width="480"></p>
 
-You hand Mortville work, it sends a resident out to do it, and it keeps a record of
-what was done. Residents are short-lived: each one does its job and is gone.
+> *The most important thing is work.*
+>
+> Andy, as Lou Reed tells it in "Work" (*Songs for Drella*, 1990)
 
-*Named for the town in John Waters' *Desperate Living* (1977).*
+A self-hosted factory where AI agents do the work, on Kubernetes.
 
-**Status:** spec in progress. No code yet. The plan is for Mortville to build itself
+You hand Drella work, it sends an agent out to do it, and it keeps a record of what
+was done. Agents are short-lived: each one does its job and is gone.
+
+*Drella was Andy Warhol's nickname at the Factory (Dracula + Cinderella).*
+
+**Status:** spec in progress. No code yet. The plan is for Drella to build itself
 from these docs.
 
 ## The idea
