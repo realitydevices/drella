@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Drella job wrapper [21]. Runs inside the job pod:
+#   1. clones the repo with the GitHub credential (/creds/github);
+#   2. configures OpenCode for the job's endpoint and model;
+#   3. runs `opencode run` with the prompt and a standing instruction to work on a
+#      branch, push it and open a PR with gh;
+#   4. uploads /out (diff, transcript, PR URL) to the Drella API;
+#   5. reports the final status with the job-scoped token.
+set -uo pipefail
+
+: "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}" "${DRELLA_REPO:?}"
+: "${DRELLA_MODEL:?}" "${DRELLA_ENDPOINT:?}" "${DRELLA_PROMPT:?}"
+OUT=${DRELLA_OUT:-/out}
+WORK=${DRELLA_WORK:-/work}
+CREDS=${DRELLA_CREDS:-/creds}
+BRANCH="drella/${DRELLA_JOB_ID:0:8}"
+
+log() { echo "[drella] $*"; }
+
+api() {
+  curl -fsS --retry 3 -H "Authorization: Bearer $DRELLA_JOB_TOKEN" "$@"
+}
+
+upload_outputs() {
+  local f
+  for f in "$OUT"/*; do
+    [ -f "$f" ] || continue
+    log "uploading $(basename "$f")"
+    api -T "$f" "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/outputs/$(basename "$f")" \
+      || log "upload of $(basename "$f") failed"
+  done
+}
+
+# finish STATUS MESSAGE: upload outputs, report, exit.
+finish() {
+  upload_outputs
+  api -X POST -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg s "$1" --arg m "$2" '{status: $s, message: $m}')" \
+    "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/status" \
+    || log "reporting status failed"
+  log "$1: $2"
+  [ "$1" = succeeded ]
+  exit
+}
+
+# -- 1. clone ------------------------------------------------------------------
+
+[ -s "$CREDS/github" ] || finish failed "no github credential"
+export GH_TOKEN
+GH_TOKEN=$(<"$CREDS/github")
+export GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0
+# git authenticates with the same token, for the clone and the agent's pushes.
+git config --global credential.helper \
+  '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+
+if user=$(gh api user --jq '"\(.login) \(.id)"' 2>/dev/null); then
+  read -r login id <<<"$user"
+  git config --global user.name "$login"
+  git config --global user.email "$id+$login@users.noreply.github.com"
+else
+  git config --global user.name "Drella agent"
+  git config --global user.email "drella@users.noreply.github.com"
+fi
+
+log "cloning $DRELLA_REPO"
+git clone "https://github.com/$DRELLA_REPO.git" "$WORK/repo" || finish failed "clone failed"
+cd "$WORK/repo" || finish failed "no checkout"
+BASE=$(git rev-parse HEAD)
+DEFAULT_BRANCH=$(git branch --show-current)
+
+# -- 2. configure OpenCode -----------------------------------------------------
+
+# OpenCode retries an unreachable endpoint until the job times out, so check first.
+curl -fsS -m 20 -o /dev/null "$DRELLA_ENDPOINT/models" \
+  || finish failed "model endpoint $DRELLA_ENDPOINT is unreachable"
+
+# A custom OpenAI-compatible provider (Ollama serves one at <host>:11434/v1).
+export OPENCODE_CONFIG="$WORK/opencode.json"
+jq -n --arg url "$DRELLA_ENDPOINT" --arg model "$DRELLA_MODEL" '{
+  "$schema": "https://opencode.ai/config.json",
+  provider: {
+    drella: {
+      npm: "@ai-sdk/openai-compatible",
+      name: "Drella endpoint",
+      options: {baseURL: $url},
+      models: {($model): {name: $model}}
+    }
+  },
+  model: "drella/\($model)",
+  autoupdate: false,
+  share: "disabled"
+}' >"$OPENCODE_CONFIG"
+
+# -- 3. run the agent ----------------------------------------------------------
+
+read -r -d '' STANDING <<INSTRUCTIONS
+---
+Standing instructions from Drella (always follow these):
+- You are in a clone of https://github.com/$DRELLA_REPO. Its default branch is $DEFAULT_BRANCH.
+- Do the work on a new branch named $BRANCH. Never commit to or push $DEFAULT_BRANCH.
+- Commit your changes and push the branch to origin early and often.
+- When the work is done, open a pull request against $DEFAULT_BRANCH with
+  \`gh pr create\`, with a clear title and a description of what you changed.
+- git and gh are already authenticated. Nobody can answer questions: decide for yourself.
+INSTRUCTIONS
+
+log "running opencode with drella/$DRELLA_MODEL at $DRELLA_ENDPOINT"
+# Runs unattended in a throwaway pod, so it may use its tools without asking.
+opencode run --dangerously-skip-permissions --model "drella/$DRELLA_MODEL" \
+  "$DRELLA_PROMPT"$'\n\n'"$STANDING" 2>&1 | tee "$OUT/transcript.txt"
+rc=${PIPESTATUS[0]}
+log "opencode exited with $rc"
+
+# -- 4. collect outputs --------------------------------------------------------
+
+session=$(opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
+[ -n "$session" ] && opencode export "$session" >"$OUT/session.json" 2>/dev/null
+
+# Everything that changed since the clone, committed or not.
+git add -A -N
+git diff --binary "$BASE" >"$OUT/diff.patch"
+
+branch=$(git branch --show-current)
+pr=""
+for b in "$BRANCH" "$branch"; do
+  [ -n "$b" ] && [ "$b" != "$DEFAULT_BRANCH" ] || continue
+  pr=$(gh pr list --repo "$DRELLA_REPO" --head "$b" --state all --json url --jq '.[0].url // empty' 2>/dev/null)
+  [ -n "$pr" ] && break
+done
+[ -n "$pr" ] && echo "$pr" >"$OUT/pr-url.txt"
+
+# -- 5. report -----------------------------------------------------------------
+
+if [ "$rc" -ne 0 ]; then
+  finish failed "opencode exited with $rc"
+elif [ -z "$pr" ]; then
+  finish failed "the agent didn't open a pull request"
+else
+  finish succeeded "$pr"
+fi
