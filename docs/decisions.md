@@ -43,29 +43,46 @@ one. When a decision changes, edit it here first.
 14. **Python.** FastAPI, SQLAlchemy + Alembic, and `uv` for packaging.
 15. **Deploy:** plain manifests with kustomize. No Helm.
 16. Getting-started object storage: **Garage** (small, single binary, S3 API).
-17. The job launcher sits behind a small **runner interface**. Kubernetes is the only
+17. **Exposure:** Drella exposes one HTTP service from the cluster. Whatever sits in front
+    of it (a reverse proxy, an ingress, DNS, TLS) is the operator's choice. The
+    getting-started docs show one example.
+18. The job launcher sits behind a small **runner interface**. Kubernetes is the only
     implementation for now. Docker is excluded as the main target, because socket access
     is root on the host.
 
 ### Jobs
 
-18. **Tokens:** random, shown once, stored hashed. Scopes come later.
-19. **Job pod contract:**
+19. **Tokens:** random and high-entropy, shown once, never stored. Scopes come later.
+    Two separate values are derived from each token:
+    - **lookup hash** `sha256(token)`, which is stored and used to find the token;
+    - **encryption key** `HKDF(token, salt, "creds")`, which is never stored and encrypts
+      that token's credentials (Fernet).
+
+    Only someone holding the token can decrypt its credentials; a database dump or the
+    server on its own can't. Credentials are decrypted when a job is created (the request
+    carries the token) and put into a Secret for that job only. Trade-offs: a lost token
+    means re-entering its credentials, rotating a token re-encrypts them, and an owner sets
+    an agent's credentials when creating the agent.
+20. **Job pod contract:**
     - **Before the agent:** inputs land in `/in`, credentials are written to files, and memory is fetched.
     - **The agent:** writes results to `/out`.
     - **Status:** reported to the API using a token scoped to that one job.
-    - **Live logs:** you can follow a job's logs as it runs.
-    - **If the job dies:** nothing it had already written is lost (see P3).
-20. **Queues:** endpoints and models belong to **queue groups**, each with its own
+    - **On exit:** the wrapper uploads `/out` and memory.
+    - **Logs** come straight from Kubernetes. The API follows the pod's logs for live tail
+      (`GET /jobs/{id}/logs?follow=1`). When a job finishes, Drella copies the full log to
+      object storage, because pod logs disappear with the pod.
+    - **If the agent is killed,** its unsaved work may be lost, but the log survives, which
+      is enough to diagnose and fix. Coding agents push their branch early and often.
+21. **Queues:** endpoints and models belong to **queue groups**, each with its own
     concurrency limit. For example, `local` runs 1 at a time and `anthropic` runs 4. Jobs
     queue FIFO within a group.
-21. **Default limits:** 1 hour timeout, 2 GB RAM per job. Templates can override both.
+22. **Default limits:** 1 hour timeout, 2 GB RAM per job. Templates can override both.
 
 ### Process
 
-22. Repos are public, and `main` is protected (PR + 1 review).
-23. The docs in `docs/` are the spec, written for people and for the agents implementing them.
-24. **v0 is built by hand.** It's just enough to run one job: token → create job (prompt +
+23. Repos are public, and `main` is protected (PR + 1 review).
+24. The docs in `docs/` are the spec, written for people and for the agents implementing them.
+25. **v0 is built by hand.** It's just enough to run one job: token → create job (prompt +
     repo) → OpenCode against a local model → log + output artifact. No UI, schedules,
     memory or MCP yet. From then on Drella builds itself from these docs.
 
@@ -76,36 +93,15 @@ one. When a decision changes, edit it here first.
   only if the size or dependency conflicts start to hurt.
 - **P2. Web UI without a build step:** static HTML plus a small JS library (e.g. Alpine.js)
   calling the JSON API. HTMX is out because it wants HTML responses, and the API returns JSON (see 8).
-- **P3. Nothing lost when a job dies.** Each job pod gets a **shipper** sidecar beside the
-  agent. The sidecar:
-  - streams log lines to the API every second or so; the API keeps them and serves
-    `GET /jobs/{id}/logs?follow=1` as server-sent events;
-  - uploads `/out` and `/memory` whenever they change, and again on exit.
-
-  If the agent is OOM-killed, the sidecar still finishes uploading. If the whole node
-  dies, you lose only the last few seconds. Coding agents also push their branch early and often.
-- **P4. Token-derived credential keys.** Credentials are encrypted with a key derived from
-  the token, so only someone holding the token can decrypt them. Neither a database dump
-  nor the server can. Two values come from the token, and they must be different:
-  - the lookup hash, `sha256(token)`, which is stored;
-  - the encryption key, `HKDF(token, salt, "creds")`, which is never stored.
-
-  Credentials get decrypted when a job is created (the request carries the token) and are
-  put into a Secret for that job only. Trade-offs:
-  - A lost token means re-entering its credentials.
-  - Rotating a token re-encrypts them.
-  - An owner sets an agent's credentials when creating the agent.
-- **P5. Memory is versioned inside Drella.** Each agent has a folder of markdown files.
+- **P3. Memory is versioned inside Drella.** Each agent has a folder of markdown files.
   Every job that changes memory saves a new version, so you get history and diffs without
   GitHub. Memory stays behind an interface, so a vector store can be added later. An
   optional "mirror to a git repo" exporter can come later too. GitHub isn't the default
-  because memory may hold private details and repos are public (22).
-- **P6. Agent identity on GitHub:** an agent that should post "as itself" gets its own
+  because memory may hold private details and repos are public (23).
+- **P4. Agent identity on GitHub:** an agent that should post "as itself" gets its own
   GitHub App. Apps are free, and an App's credentials are stored like any other credential.
   Agents without their own App use their owner's credentials.
 
 ## Open
 
-- **O1. Exposure:** how Drella is reached from outside the cluster (ingress, TLS). The
-  getting-started deploy is LAN-only; production setups vary.
-- **O2. Retention:** how long job logs, artifacts and memory versions are kept.
+- **O1. Retention:** how long job logs, artifacts and memory versions are kept.
