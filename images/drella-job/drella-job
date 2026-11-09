@@ -12,10 +12,12 @@
 #
 # Time limits (docs/v0.md): the agent runs under a timer that stops it
 # DRELLA_AGENT_GRACE seconds before DRELLA_DEADLINE (the Job's hard limit). If the pod
-# is told to stop (TERM), the agent is stopped too. Either way, steps 4 and 5 share
-# whatever time is left: until the deadline, or until the pod's grace period
-# (DRELLA_TERM_GRACE) ends. Every step after the agent is bounded by that, so the
-# status is reported unless the Drella API stays unreachable for all of it.
+# is told to stop (TERM), the agent is stopped too. Either way, everything after the
+# agent shares whatever time is left: until the deadline, or until the pod's grace
+# period (DRELLA_TERM_GRACE) ends. If the job has already failed when the agent ends
+# (stopped, out of time, killed), that status is reported straight away, before
+# step 4. Step 4 stops RESERVE seconds early, so the final status always gets that
+# long to reach the Drella API.
 set -uo pipefail
 
 : "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}"
@@ -30,16 +32,18 @@ NOW=$(date +%s)
 DEADLINE=${DRELLA_DEADLINE:-$((NOW + 3600))}
 AGENT_GRACE=${DRELLA_AGENT_GRACE:-300}
 TERM_GRACE=${DRELLA_TERM_GRACE:-120}
-MARGIN=10  # stop this long before being killed
+MARGIN=10   # stop this long before being killed
+RESERVE=30  # step 4 leaves this long for the final status report
 
 # Everything has to be done by FINISH_BY: the hard deadline, or the end of the grace
 # period once the pod has been told to stop.
 FINISH_BY=$((DEADLINE - MARGIN))
 left() { echo $((FINISH_BY - $(date +%s))); }
-# within MAX CMD...: run CMD for at most MAX seconds, and never past FINISH_BY.
+# within MAX CMD...: run a step-4 command for at most MAX seconds, and never into the
+# time reserved for the final status report.
 within() {
   local t
-  t=$(left)
+  t=$(($(left) - RESERVE))
   [ "$t" -gt "$1" ] && t=$1
   [ "$t" -ge 1 ] || return 124
   shift
@@ -72,36 +76,43 @@ upload_outputs() {
   done
 }
 
-# finish STATUS MESSAGE: report, upload outputs, exit. The status goes first: it
-# matters most, and Drella accepts outputs until the pod has exited.
-finishing="" uploaded=""
-finish() {
-  finishing=1
+# report STATUS MESSAGE: tell Drella the job's status. Drella keeps the latest report
+# while the job runs, so a provisional status can be replaced by a final one.
+report() {
   log "$1: $2"
   api -X POST -H 'Content-Type: application/json' \
     -d "$(jq -n --arg s "$1" --arg m "$2" '{status: $s, message: $m}')" \
     "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/status" \
     || log "reporting status failed"
+}
+
+# finish STATUS MESSAGE: report, upload outputs, exit. The status goes first: it
+# matters most, and Drella accepts outputs until the pod has exited.
+uploaded=""
+finish() {
+  phase=finishing
+  report "$1" "$2"
   upload_outputs
   [ "$1" = succeeded ]
   exit
 }
 
-# Told to stop (pod deleted, evicted, node drained): stop the agent and carry on to
-# steps 4 and 5. Before the agent has started, just report.
-agent_pid="" stopped=""
+# Where the wrapper is: setup (steps 1-2), agent (3), collect (4), finishing (5).
+phase=setup agent_pid="" stopped=""
+# Told to stop (pod deleted, evicted, node drained). The pod is killed when its grace
+# period ends, so everything left has to fit in it.
 on_term() {
   [ -n "$stopped" ] && return
   stopped=1
-  # The pod is killed when its grace period ends.
   local by=$(($(date +%s) + TERM_GRACE - MARGIN))
   [ "$by" -lt "$FINISH_BY" ] && FINISH_BY=$by
-  log "told to stop; finishing within $(left)s"
-  if [ -n "$agent_pid" ]; then
-    kill -TERM "$agent_pid" 2>/dev/null
-  elif [ -z "$finishing" ]; then
-    finish failed "the job was stopped before the agent started"
-  fi
+  log "told to stop during $phase; finishing within $(left)s"
+  case $phase in
+    setup) finish failed "the job was stopped before the agent started" ;;
+    # Stop the agent. If its pid isn't known yet, that happens as soon as it is.
+    agent) [ -n "$agent_pid" ] && kill -TERM "$agent_pid" 2>/dev/null ;;
+    # collect, finishing: carry on within the shorter time; the result says "stopped".
+  esac
 }
 trap on_term TERM INT
 
@@ -192,6 +203,7 @@ log "running opencode with drella/$DRELLA_MODEL at $DRELLA_ENDPOINT (stops after
 # Runs unattended in a throwaway pod, so it may use its tools without asking. It runs
 # in the background so the TERM trap can fire while it works; the inner shell records
 # the agent's pid and exit code.
+phase=agent
 agent_started=$(date +%s)
 {
   timeout --signal=TERM --kill-after=30 "$budget" \
@@ -202,13 +214,33 @@ agent_started=$(date +%s)
 } 2>&1 | tee "$OUT/transcript.txt" &
 pipe_pid=$!
 for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
-agent_pid=$(<"$WORK/agent.pid")
+agent_pid=$(cat "$WORK/agent.pid" 2>/dev/null)
+# Told to stop before the pid was known.
+[ -n "$stopped" ] && [ -n "$agent_pid" ] && kill -TERM "$agent_pid" 2>/dev/null
 # `wait` returns early when the trap fires, so keep waiting until the agent is done.
 while kill -0 "$pipe_pid" 2>/dev/null; do wait "$pipe_pid"; done
-rc=$(cat "$WORK/agent.rc" 2>/dev/null || echo 1)
-agent_pid=""
+phase=collect
+rc=$(cat "$WORK/agent.rc" 2>/dev/null)
+[[ "$rc" =~ ^[0-9]+$ ]] || rc=1  # no exit code recorded: treat as a failure
 elapsed=$(($(date +%s) - agent_started))
 log "opencode exited with $rc after ${elapsed}s"
+
+# Why the job has failed, if it already has. Reported straight away, so the status
+# doesn't depend on step 4; the final report adds the PR, if there is one.
+failure() {
+  if [ -n "$stopped" ]; then
+    echo "the job was stopped (pod deleted, evicted or drained)"
+  elif [ "$rc" -ne 0 ] && [ "$elapsed" -ge "$budget" ]; then
+    # Stopped by the timer (124, or 137 if it had to be killed).
+    echo "the agent ran out of time (stopped after ${budget}s)"
+  elif [ "$rc" -eq 137 ]; then
+    echo "the agent was killed (exit 137, possibly out of memory)"
+  elif [ "$rc" -ne 0 ]; then
+    echo "opencode exited with $rc"
+  fi
+}
+reason=$(failure)
+[ -n "$reason" ] && report failed "$reason"
 
 # -- 4. collect outputs --------------------------------------------------------
 
@@ -216,11 +248,13 @@ log "opencode exited with $rc after ${elapsed}s"
 session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
 [ -n "$session" ] && within 20 opencode export "$session" >"$OUT/session.json" 2>/dev/null
 
-pr=""
+pr="" diff_note=""
 if [ -n "$REPO" ]; then
   # Everything that changed since the clone, committed or not.
-  git add -A -N
-  within 30 git diff --binary "$BASE" >"$OUT/diff.patch"
+  within 30 git add -A -N
+  if ! within 30 git diff --binary "$BASE" >"$OUT/diff.patch"; then
+    diff_note="; diff.patch is incomplete (git diff failed or timed out)"
+  fi
 
   branch=$(git branch --show-current)
   for b in "$BRANCH" "$branch"; do
@@ -235,19 +269,14 @@ fi
 
 # -- 5. report -----------------------------------------------------------------
 
-if [ -n "$stopped" ]; then
-  finish failed "the job was stopped (pod deleted, evicted or drained)${pr:+; PR: $pr}"
-elif [ "$rc" -ne 0 ] && [ "$elapsed" -ge "$budget" ]; then
-  # Stopped by the timer (124, or 137 if it had to be killed).
-  finish failed "the agent ran out of time (stopped after ${budget}s)${pr:+; PR: $pr}"
-elif [ "$rc" -eq 137 ]; then
-  finish failed "the agent was killed (exit 137, possibly out of memory)${pr:+; PR: $pr}"
-elif [ "$rc" -ne 0 ]; then
-  finish failed "opencode exited with $rc${pr:+; PR: $pr}"
+# Told to stop during step 4 counts too: the job didn't get to finish normally.
+reason=$(failure)
+if [ -n "$reason" ]; then
+  finish failed "$reason${pr:+; PR: $pr}$diff_note"
 elif [ -z "$REPO" ]; then
   finish succeeded "done"
 elif [ -z "$pr" ]; then
-  finish failed "the agent didn't open a pull request"
+  finish failed "the agent didn't open a pull request$diff_note"
 else
-  finish succeeded "$pr"
+  finish succeeded "$pr$diff_note"
 fi
