@@ -16,8 +16,8 @@
 # agent shares whatever time is left: until the deadline, or until the pod's grace
 # period (DRELLA_TERM_GRACE) ends. If the job has already failed when the agent ends
 # (stopped, out of time, killed), that status is reported straight away, before
-# step 4. Step 4 stops RESERVE seconds early, so the final status always gets that
-# long to reach the Drella API.
+# step 4. Step 4 stops RESERVE seconds early, leaving the final status that long to
+# reach the Drella API (less if the provisional report used it up).
 set -uo pipefail
 
 : "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}"
@@ -257,11 +257,14 @@ if [ -n "$REPO" ]; then
   fi
 
   branch=$(git branch --show-current)
+  pr_lookup_failed=""
   for b in "$BRANCH" "$branch"; do
     [ -n "$b" ] && [ "$b" != "$DEFAULT_BRANCH" ] || continue
     # Only a PR opened by this job counts, not an older one on a reused branch.
-    pr=$(within 20 gh pr list --repo "$REPO" --head "$b" --state all --json url,createdAt \
-      --jq "[.[] | select(.createdAt >= \"$STARTED\")][0].url // empty" 2>/dev/null)
+    if ! pr=$(within 20 gh pr list --repo "$REPO" --head "$b" --state all --json url,createdAt \
+      --jq "[.[] | select(.createdAt >= \"$STARTED\")][0].url // empty" 2>/dev/null); then
+      pr="" pr_lookup_failed=1
+    fi
     [ -n "$pr" ] && break
   done
   [ -n "$pr" ] && echo "$pr" >"$OUT/pr-url.txt"
@@ -275,6 +278,8 @@ if [ -n "$reason" ]; then
   finish failed "$reason${pr:+; PR: $pr}$diff_note"
 elif [ -z "$REPO" ]; then
   finish succeeded "done"
+elif [ -z "$pr" ] && [ -n "$pr_lookup_failed" ]; then
+  finish failed "couldn't check for a pull request (gh pr list failed or timed out)$diff_note"
 elif [ -z "$pr" ]; then
   finish failed "the agent didn't open a pull request$diff_note"
 else

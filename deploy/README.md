@@ -65,9 +65,9 @@ change `newTag` and apply again.
 
 **Job network:** job pods can reach DNS, the Drella API, the public internet, and port
 11434 (Ollama's default) on private networks outside the cluster, and nothing else on
-your LAN or in the cluster. (Anything with a public address, including the node itself
-if it has one, counts as the public internet.) If your model endpoint uses a different port, edit the last
-rule in `job-network.yaml`. That policy assumes k3s's default pod and service ranges
+your LAN or in the cluster. (Anything with a public address, including the node
+itself if it has one, counts as the public internet.) If your model endpoint uses a
+different port, edit the last rule in `job-network.yaml`. That policy assumes k3s's default pod and service ranges
 (`10.42.0.0/16`, `10.43.0.0/16`); change them there if yours differ.
 
 The Postgres password is set in `deploy/kustomization.yaml`. Only the Drella pod can
@@ -119,10 +119,11 @@ auth="Authorization: Bearer $TOKEN"
 # 1. Store a GitHub credential (needed only for jobs with a repo): a fine-grained
 #    PAT for the target repo only, with Contents and Pull requests read/write, and
 #    without the Workflows permission (so it can't edit .github/workflows). Protect
-#    the repo's default branch (pull requests only, no force pushes). The agent holds
-#    this token and has internet access, so treat it as exposed to whatever the agent
-#    reads; and the repo's CI will run code the agent wrote. See Security in
-#    docs/v0.md.
+#    the repo's default branch for everyone, admins included: pull requests only,
+#    at least one approval, no force pushes. Protect release tags too. The agent
+#    holds this token and has internet access, so treat it as exposed to whatever
+#    the agent reads; and the repo's CI will run code the agent wrote. See
+#    Security in docs/v0.md.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "github_pat_..."}' $DRELLA/credentials/github
 
