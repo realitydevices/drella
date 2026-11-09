@@ -5,9 +5,9 @@ from drella.runner import JOB_TOKEN_KEY, RunState, RunStatus
 
 JOB = {
     "prompt": "add a CHANGELOG.md",
-    "repo": "realitydevices/drella",
-    "model": "qwen3.6:35b-a3b-coding",
-    "endpoint": "http://192.168.50.73:11434/v1",
+    "repo": "octo/widgets",
+    "model": "some-model",
+    "endpoint": "http://ollama:11434/v1",
 }
 
 
@@ -183,6 +183,18 @@ def test_log_survives_the_pod_via_snapshots(client, auth, job, queue, runner):
     got = client.get(f"/jobs/{job['id']}", headers=auth).json()
     assert got["status"] == "failed" and got["message"] == "DeadlineExceeded"
     assert client.get(f"/jobs/{job['id']}/logs", headers=auth).text == "step 1\nstep 2\n"
+
+
+def test_a_shorter_log_never_replaces_the_archived_one(client, auth, job, queue, runner):
+    queue.log_snapshot_seconds = 0
+    queue.tick()
+    runner.pod_logs[job["id"]] = b"line\n" * 100
+    queue.tick()
+    # The kubelet rotated the log: the API now returns only the newest part.
+    runner.pod_logs[job["id"]] = b"tail\n"
+    runner.states[job["id"]] = RunStatus(RunState.FAILED, "DeadlineExceeded")
+    queue.tick()
+    assert client.get(f"/jobs/{job['id']}/logs", headers=auth).text == "line\n" * 100
 
 
 def test_a_failing_job_check_does_not_stop_the_tick(client, auth, job, queue, runner):

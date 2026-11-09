@@ -203,14 +203,16 @@ DepsDep = Annotated[Deps, Depends(get_deps)]
 router = APIRouter()
 
 
+# The health checks are async, so they run on the event loop and still answer when
+# every worker thread is busy (e.g. with log followers).
 @router.get("/healthz")
-def healthz() -> dict:
+async def healthz() -> dict:
     """Readiness: the API is serving."""
     return {"ok": True}
 
 
 @router.get("/livez")
-def livez(deps: DepsDep) -> dict:
+async def livez(deps: DepsDep) -> dict:
     """Liveness: fails if the queue loop has stalled, so Kubernetes restarts Drella."""
     if not deps.queue.alive():
         raise HTTPException(503, "the queue loop has stalled")

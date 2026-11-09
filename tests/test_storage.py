@@ -11,7 +11,7 @@ def store(tmp_path):
 def test_put_get_streams(store):
     assert store.put("jobs/1/log.txt", iter([b"hello ", b"world"])) == 11
     assert b"".join(store.get("jobs/1/log.txt")) == b"hello world"
-    assert store.exists("jobs/1/log.txt")
+    assert store.size("jobs/1/log.txt") == 11
 
 
 def test_large_object_is_chunked(store):
@@ -43,7 +43,7 @@ def test_delete(store):
     store.put("k", [b"."])
     store.delete("k")
     store.delete("k")  # missing is fine
-    assert not store.exists("k")
+    assert store.size("k") is None
 
 
 def test_failed_put_leaves_nothing(store):

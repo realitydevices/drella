@@ -15,11 +15,10 @@ class Settings:
     )
     # Namespace that Jobs and Secrets are created in.
     namespace: str = field(default_factory=lambda: os.environ.get("DRELLA_NAMESPACE", "drella"))
-    # The image's own version, baked in at build time (a release tag like v0.1.0,
-    # or main / sha-<commit> for test builds).
-    version: str = field(default_factory=lambda: os.environ.get("DRELLA_VERSION", "main"))
     # Defaults to the drella-job image with the same tag as this image, so the two
-    # always match. Set DRELLA_JOB_IMAGE only to override that.
+    # always match. DRELLA_VERSION is baked into the image at build time: a release
+    # tag like v0.1.0, sha-<commit> for builds from main, or "main" for a local build.
+    # Set DRELLA_JOB_IMAGE only to override that.
     job_image: str = field(
         default_factory=lambda: os.environ.get(
             "DRELLA_JOB_IMAGE",

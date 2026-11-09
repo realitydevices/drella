@@ -30,7 +30,8 @@ class Storage(Protocol):
     def delete(self, key: str) -> None:
         """Remove an object. Missing objects are ignored."""
 
-    def exists(self, key: str) -> bool: ...
+    def size(self, key: str) -> int | None:
+        """The object's size in bytes, or None if it doesn't exist."""
 
 
 def _check_key(key: str) -> str:
@@ -99,5 +100,6 @@ class LocalStorage:
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
 
-    def exists(self, key: str) -> bool:
-        return self._path(key).is_file()
+    def size(self, key: str) -> int | None:
+        p = self._path(key)
+        return p.stat().st_size if p.is_file() else None

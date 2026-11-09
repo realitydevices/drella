@@ -167,8 +167,10 @@ class Queue:
         self._archive_log(job_id)
 
     def _archive_log(self, job_id: str) -> None:
-        """Copy the pod's log to storage. Best effort: a failure is logged, and an
-        earlier snapshot is kept rather than overwritten."""
+        """Copy the pod's log to storage. Best effort: a failure is logged.
+
+        Never replaces a snapshot with a shorter copy: the pod's log can come back
+        empty or, once the kubelet has rotated it (at about 10 MB), shorter."""
         try:
             data = b"".join(self.runner.logs(job_id, follow=False))
         except LogsUnavailable:
@@ -177,7 +179,8 @@ class Queue:
         except Exception:
             log.warning("reading the log of job %s failed", job_id, exc_info=True)
             return
-        if not data and self.storage.exists(log_key(job_id)):
+        if len(data) < (self.storage.size(log_key(job_id)) or 0):
+            log.info("keeping the longer archived log of job %s", job_id)
             return
         try:
             self.storage.put(log_key(job_id), [data])

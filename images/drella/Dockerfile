@@ -11,8 +11,9 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY drella ./drella
 RUN uv sync --frozen --no-dev
 
-# The image's version (a release tag like v0.1.0, or main / sha-<commit>). Drella
-# launches the drella-job image with the same tag.
+# The image's version: a release tag like v0.1.0, or sha-<commit> for builds from
+# main (CI sets it; a local build gets "main"). Drella launches the drella-job image
+# with the same tag.
 ARG DRELLA_VERSION=main
 ENV DRELLA_VERSION=$DRELLA_VERSION
 
