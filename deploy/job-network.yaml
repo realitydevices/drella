@@ -11,7 +11,8 @@
 #     services); change them below if your cluster uses others. If your model
 #     endpoint uses another port, edit the last rule.
 # So a job can't reach other services on your LAN, the cluster, or the node,
-# except on port 11434. v0 supports model endpoints that need no API key, so
+# except on port 11434, as long as they have private addresses. A node or router
+# with a public address is reachable through the public-internet rule. v0 supports model endpoints that need no API key, so
 # hosted APIs aren't a target yet.
 # k3s enforces NetworkPolicy out of the box.
 apiVersion: networking.k8s.io/v1
