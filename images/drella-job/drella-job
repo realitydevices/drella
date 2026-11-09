@@ -8,6 +8,11 @@
 #   4. uploads /out (transcript, plus diff and PR URL for a repo job) to the Drella API;
 #   5. reports the final status with the job-scoped token. A repo job succeeds only
 #      if a PR exists; a job without a repo succeeds if the agent exits cleanly.
+#
+# Time limits (docs/v0.md): the agent runs under a timer that stops it
+# DRELLA_AGENT_GRACE seconds before DRELLA_DEADLINE (the Job's hard limit), so there's
+# always time for steps 4 and 5. If the pod is told to stop (TERM), the agent is
+# stopped and steps 4 and 5 still run.
 set -uo pipefail
 
 : "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}"
@@ -17,11 +22,18 @@ WORK=${DRELLA_WORK:-/work}
 CREDS=${DRELLA_CREDS:-/creds}
 REPO=${DRELLA_REPO:-}
 BRANCH="drella/${DRELLA_JOB_ID:0:8}"
+STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+NOW=$(date +%s)
+DEADLINE=${DRELLA_DEADLINE:-$((NOW + 3600))}
+AGENT_GRACE=${DRELLA_AGENT_GRACE:-300}
 
 log() { echo "[drella] $*"; }
 
+# Calls to the Drella API. Drella may be restarting (e.g. an upgrade), so retry for
+# up to 5 minutes, including refused connections. Both calls are idempotent.
 api() {
-  curl -fsS --retry 3 -H "Authorization: Bearer $DRELLA_JOB_TOKEN" "$@"
+  curl -fsS --retry 30 --retry-delay 5 --retry-max-time 300 --retry-connrefused -m 120 \
+    -H "Authorization: Bearer $DRELLA_JOB_TOKEN" "$@"
 }
 
 upload_outputs() {
@@ -35,7 +47,9 @@ upload_outputs() {
 }
 
 # finish STATUS MESSAGE: upload outputs, report, exit.
+finishing=""
 finish() {
+  finishing=1
   upload_outputs
   api -X POST -H 'Content-Type: application/json' \
     -d "$(jq -n --arg s "$1" --arg m "$2" '{status: $s, message: $m}')" \
@@ -45,6 +59,20 @@ finish() {
   [ "$1" = succeeded ]
   exit
 }
+
+# Told to stop (pod deleted, evicted, node drained): stop the agent and carry on to
+# steps 4 and 5. Before the agent has started, just report.
+agent_pid="" stopped=""
+on_term() {
+  stopped=1
+  log "told to stop"
+  if [ -n "$agent_pid" ]; then
+    kill -TERM "$agent_pid" 2>/dev/null
+  elif [ -z "$finishing" ]; then
+    finish failed "the job was stopped before the agent started"
+  fi
+}
+trap on_term TERM INT
 
 # -- 1. workspace -------------------------------------------------------------
 
@@ -121,11 +149,33 @@ Standing instructions from Drella (always follow these):
 INSTRUCTIONS
 fi
 
-log "running opencode with drella/$DRELLA_MODEL at $DRELLA_ENDPOINT"
-# Runs unattended in a throwaway pod, so it may use its tools without asking.
-opencode run --dangerously-skip-permissions --model "drella/$DRELLA_MODEL" \
-  "$DRELLA_PROMPT"$'\n\n'"$STANDING" 2>&1 | tee "$OUT/transcript.txt"
-rc=${PIPESTATUS[0]}
+# The message starts with a fixed line, so a prompt beginning with "-" can't be
+# read as an OpenCode option.
+MESSAGE="Task from Drella:"$'\n'"$DRELLA_PROMPT"$'\n\n'"$STANDING"
+
+# The soft limit: stop the agent AGENT_GRACE seconds before the hard limit.
+budget=$((DEADLINE - AGENT_GRACE - $(date +%s)))
+[ "$budget" -gt 60 ] || finish failed "no time left to run the agent (the deadline is too close)"
+
+log "running opencode with drella/$DRELLA_MODEL at $DRELLA_ENDPOINT (stops after ${budget}s)"
+# Runs unattended in a throwaway pod, so it may use its tools without asking. It runs
+# in the background so the TERM trap can fire while it works; the inner shell records
+# the agent's pid and exit code.
+{
+  timeout --signal=TERM --kill-after=30 "$budget" \
+    opencode run --dangerously-skip-permissions --model "drella/$DRELLA_MODEL" "$MESSAGE" &
+  echo $! >"$WORK/agent.pid"
+  wait $!
+  echo $? >"$WORK/agent.rc"
+} 2>&1 | tee "$OUT/transcript.txt" &
+pipe_pid=$!
+for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
+agent_pid=$(<"$WORK/agent.pid")
+[ -n "$stopped" ] && kill -TERM "$agent_pid" 2>/dev/null  # TERM arrived while starting
+# `wait` returns early when the trap fires, so keep waiting until the agent is done.
+while kill -0 "$pipe_pid" 2>/dev/null; do wait "$pipe_pid"; done
+rc=$(cat "$WORK/agent.rc" 2>/dev/null || echo 1)
+agent_pid=""
 log "opencode exited with $rc"
 
 # -- 4. collect outputs --------------------------------------------------------
@@ -142,7 +192,9 @@ if [ -n "$REPO" ]; then
   branch=$(git branch --show-current)
   for b in "$BRANCH" "$branch"; do
     [ -n "$b" ] && [ "$b" != "$DEFAULT_BRANCH" ] || continue
-    pr=$(gh pr list --repo "$REPO" --head "$b" --state all --json url --jq '.[0].url // empty' 2>/dev/null)
+    # Only a PR opened by this job counts, not an older one on a reused branch.
+    pr=$(gh pr list --repo "$REPO" --head "$b" --state all --json url,createdAt \
+      --jq "[.[] | select(.createdAt >= \"$STARTED\")][0].url // empty" 2>/dev/null)
     [ -n "$pr" ] && break
   done
   [ -n "$pr" ] && echo "$pr" >"$OUT/pr-url.txt"
@@ -150,7 +202,11 @@ fi
 
 # -- 5. report -----------------------------------------------------------------
 
-if [ "$rc" -ne 0 ]; then
+if [ -n "$stopped" ]; then
+  finish failed "the job was stopped (pod deleted, evicted or drained)${pr:+; PR: $pr}"
+elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+  finish failed "the agent ran out of time (stopped after ${budget}s)${pr:+; PR: $pr}"
+elif [ "$rc" -ne 0 ]; then
   finish failed "opencode exited with $rc"
 elif [ -z "$REPO" ]; then
   finish succeeded "done"

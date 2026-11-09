@@ -125,7 +125,15 @@ def create_app(
             deps.queue.stop()
 
     app = FastAPI(title="Drella", version="0", lifespan=lifespan)
-    queue = Queue(sessions, runner, storage, settings.queue_concurrency, settings.queue_interval)
+    queue = Queue(
+        sessions,
+        runner,
+        storage,
+        settings.queue_concurrency,
+        settings.queue_interval,
+        log_snapshot_seconds=settings.log_snapshot_seconds,
+        stall_seconds=settings.queue_stall_seconds,
+    )
     app.state.deps = Deps(settings, sessions, runner, storage, queue)
     app.include_router(router)
     return app
@@ -197,6 +205,15 @@ router = APIRouter()
 
 @router.get("/healthz")
 def healthz() -> dict:
+    """Readiness: the API is serving."""
+    return {"ok": True}
+
+
+@router.get("/livez")
+def livez(deps: DepsDep) -> dict:
+    """Liveness: fails if the queue loop has stalled, so Kubernetes restarts Drella."""
+    if not deps.queue.alive():
+        raise HTTPException(503, "the queue loop has stalled")
     return {"ok": True}
 
 
@@ -233,8 +250,14 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     if body.repo and GITHUB_CREDENTIAL not in {cred.name for cred in creds}:
         raise HTTPException(422, f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential")
     # The request carries the token, so this is when credentials are decrypted
-    # [19]. They go straight into the job's Secret, never into the database.
-    secrets = {cred.name: crypto.decrypt(c.secret, c.token.salt, cred.ciphertext) for cred in creds}
+    # [19]. They go straight into the job's Secret, never into the database. A job
+    # gets only what it needs [10]: in v0 that's the GitHub credential, for a repo job.
+    needed = {GITHUB_CREDENTIAL} if body.repo else set()
+    secrets = {
+        cred.name: crypto.decrypt(c.secret, c.token.salt, cred.ciphertext)
+        for cred in creds
+        if cred.name in needed
+    }
     job_token = crypto.new_token(crypto.JOB_TOKEN_PREFIX)
     secrets[JOB_TOKEN_KEY] = job_token
     job = Job(
@@ -253,7 +276,15 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         log.exception("creating the Secret for job %s failed", job.id)
         db.rollback()
         raise HTTPException(503, "couldn't store the job's credentials in the cluster")
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        # Don't leave decrypted credentials behind for a job that doesn't exist.
+        try:
+            deps.runner.cleanup(job.id)
+        except Exception:
+            log.exception("deleting the Secret for job %s failed", job.id)
+        raise
     deps.queue.wake()
     return job_out(job)
 

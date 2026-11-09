@@ -4,6 +4,7 @@ import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
@@ -56,6 +57,9 @@ class Runner(Protocol):
     def cleanup(self, job_id: str) -> None:
         """Delete the job and its Secret. Safe to call more than once."""
 
+    def job_secrets(self) -> dict[str, datetime]:
+        """Job id -> creation time, for every job Secret that exists."""
+
 
 def k8s_name(job_id: str) -> str:
     return f"drella-job-{job_id}"
@@ -74,6 +78,9 @@ class KubernetesRunner:
                 config.load_kube_config()
             batch, core = client.BatchV1Api(), client.CoreV1Api()
         self.batch, self.core = batch, core
+        # Every non-streaming call gets a timeout, so a hung connection can't stall
+        # the queue.
+        self.t = settings.k8s_timeout_seconds
 
     # -- prepare / launch ------------------------------------------------------
 
@@ -87,10 +94,25 @@ class KubernetesRunner:
                 "type": "Opaque",
                 "stringData": secrets,
             },
+            _request_timeout=self.t,
         )
 
     def launch(self, spec: JobSpec) -> None:
-        job = self.batch.create_namespaced_job(self.ns, self._job_manifest(spec))
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            job = self.batch.create_namespaced_job(
+                self.ns, self._job_manifest(spec), _request_timeout=self.t
+            )
+        except ApiException as e:
+            if e.status != 409:
+                raise
+            # Already exists: Drella restarted between creating the Job and recording
+            # it as running. Adopt it rather than failing a job that's running.
+            log.info("job %s already exists in Kubernetes; adopting it", spec.job_id)
+            job = self.batch.read_namespaced_job(
+                k8s_name(spec.job_id), self.ns, _request_timeout=self.t
+            )
         uid = job.metadata.uid
         try:
             # Owned by the Job, so Kubernetes deletes the Secret along with it.
@@ -109,6 +131,7 @@ class KubernetesRunner:
                         ]
                     }
                 },
+                _request_timeout=self.t,
             )
         except Exception:
             self.cleanup(spec.job_id)
@@ -129,6 +152,10 @@ class KubernetesRunner:
         }
         if spec.repo:
             env["DRELLA_REPO"] = spec.repo
+        # The soft limit: the wrapper stops the agent this long before the hard limit
+        # (activeDeadlineSeconds), which runs from roughly now.
+        env["DRELLA_DEADLINE"] = str(int(time.time()) + s.job_timeout_seconds)
+        env["DRELLA_AGENT_GRACE"] = str(s.agent_grace_seconds)
         return {
             "apiVersion": "batch/v1",
             "kind": "Job",
@@ -142,6 +169,15 @@ class KubernetesRunner:
                         "restartPolicy": "Never",
                         # Job pods talk only to the Drella API, never to Kubernetes.
                         "automountServiceAccountToken": False,
+                        # Time to upload and report after being told to stop.
+                        "terminationGracePeriodSeconds": s.job_termination_grace_seconds,
+                        "securityContext": {
+                            "runAsNonRoot": True,
+                            "runAsUser": 1000,
+                            "runAsGroup": 1000,
+                            "fsGroup": 1000,
+                            "seccompProfile": {"type": "RuntimeDefault"},
+                        },
                         "containers": [
                             {
                                 "name": "job",
@@ -155,9 +191,20 @@ class KubernetesRunner:
                                         },
                                     }
                                 ],
+                                "securityContext": {
+                                    "allowPrivilegeEscalation": False,
+                                    "capabilities": {"drop": ["ALL"]},
+                                },
                                 "resources": {
-                                    "requests": {"memory": "512Mi", "cpu": "250m"},
-                                    "limits": {"memory": s.job_memory},
+                                    "requests": {
+                                        "memory": "512Mi",
+                                        "cpu": "250m",
+                                        "ephemeral-storage": "1Gi",
+                                    },
+                                    "limits": {
+                                        "memory": s.job_memory,
+                                        "ephemeral-storage": s.job_disk,
+                                    },
                                 },
                                 "volumeMounts": [
                                     {"name": "creds", "mountPath": "/creds", "readOnly": True},
@@ -168,8 +215,8 @@ class KubernetesRunner:
                         ],
                         "volumes": [
                             {"name": "creds", "secret": {"secretName": name}},
-                            {"name": "out", "emptyDir": {}},
-                            {"name": "work", "emptyDir": {}},
+                            {"name": "out", "emptyDir": {"sizeLimit": "1Gi"}},
+                            {"name": "work", "emptyDir": {"sizeLimit": s.job_disk}},
                         ],
                     },
                 },
@@ -182,7 +229,9 @@ class KubernetesRunner:
         from kubernetes.client.exceptions import ApiException
 
         try:
-            job = self.batch.read_namespaced_job_status(k8s_name(job_id), self.ns)
+            job = self.batch.read_namespaced_job_status(
+                k8s_name(job_id), self.ns, _request_timeout=self.t
+            )
         except ApiException as e:
             if e.status == 404:
                 return RunStatus(RunState.MISSING, "Kubernetes Job not found")
@@ -215,7 +264,7 @@ class KubernetesRunner:
 
     def _pod(self, job_id: str):
         pods = self.core.list_namespaced_pod(
-            self.ns, label_selector=f"drella.dev/job-id={job_id}"
+            self.ns, label_selector=f"drella.dev/job-id={job_id}", _request_timeout=self.t
         ).items
         return pods[0] if pods else None
 
@@ -229,7 +278,12 @@ class KubernetesRunner:
             time.sleep(2)
             pod = self._pod(job_id)
         resp = self.core.read_namespaced_pod_log(
-            pod.metadata.name, self.ns, follow=follow, _preload_content=False
+            pod.metadata.name,
+            self.ns,
+            follow=follow,
+            _preload_content=False,
+            # Following has no overall timeout; a one-off read does.
+            _request_timeout=None if follow else self.t,
         )
         return self._stream(resp)
 
@@ -246,14 +300,23 @@ class KubernetesRunner:
         name = k8s_name(job_id)
         for delete in (
             lambda: self.batch.delete_namespaced_job(
-                name, self.ns, propagation_policy="Background"
+                name, self.ns, propagation_policy="Background", _request_timeout=self.t
             ),
             # Normally garbage-collected with the Job; this covers a job that was
             # never launched.
-            lambda: self.core.delete_namespaced_secret(name, self.ns),
+            lambda: self.core.delete_namespaced_secret(name, self.ns, _request_timeout=self.t),
         ):
             try:
                 delete()
             except ApiException as e:
                 if e.status != 404:
                     raise
+
+    def job_secrets(self) -> dict[str, datetime]:
+        secrets = self.core.list_namespaced_secret(
+            self.ns, label_selector="drella.dev/job-id", _request_timeout=self.t
+        ).items
+        return {
+            sec.metadata.labels["drella.dev/job-id"]: sec.metadata.creation_timestamp
+            for sec in secrets
+        }

@@ -154,3 +154,46 @@ def test_launch_without_repo_omits_drella_repo(k8s):
     _, job = batch.create_namespaced_job.call_args.args
     (c,) = job["spec"]["template"]["spec"]["containers"]
     assert "DRELLA_REPO" not in {e["name"] for e in c["env"]}
+
+
+def test_launch_adopts_a_job_that_already_exists(k8s):
+    # Drella restarted after creating the Job but before recording it as running.
+    r, batch, core = k8s
+    batch.create_namespaced_job.side_effect = ApiException(status=409)
+    batch.read_namespaced_job.return_value = V1Job(metadata=V1ObjectMeta(name=NAME, uid="uid-old"))
+    r.launch(SPEC)
+    patch = core.patch_namespaced_secret.call_args.args[2]
+    assert patch["metadata"]["ownerReferences"][0]["uid"] == "uid-old"
+    batch.delete_namespaced_job.assert_not_called()
+
+
+def test_job_pod_is_hardened_and_has_a_deadline(k8s):
+    import time
+
+    r, batch, _ = k8s
+    r.launch(SPEC)
+    _, job = batch.create_namespaced_job.call_args.args
+    pod = job["spec"]["template"]["spec"]
+    assert pod["securityContext"]["runAsNonRoot"] is True
+    assert pod["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
+    assert pod["terminationGracePeriodSeconds"] == 120
+    (c,) = pod["containers"]
+    assert c["securityContext"] == {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}
+    assert c["resources"]["limits"]["ephemeral-storage"] == "10Gi"
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    deadline = int(env["DRELLA_DEADLINE"])
+    assert abs(deadline - (time.time() + 3600)) < 60
+    assert env["DRELLA_AGENT_GRACE"] == "300"
+
+
+def test_job_secrets_lists_secrets_by_job_id(k8s):
+    from datetime import UTC, datetime
+
+    from kubernetes.client import V1Secret, V1SecretList
+
+    r, _, core = k8s
+    t = datetime(2026, 11, 9, tzinfo=UTC)
+    core.list_namespaced_secret.return_value = V1SecretList(
+        items=[V1Secret(metadata=V1ObjectMeta(labels={"drella.dev/job-id": "j1"}, creation_timestamp=t))]
+    )
+    assert r.job_secrets() == {"j1": t}

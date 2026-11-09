@@ -1,4 +1,5 @@
 import os
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +17,7 @@ class FakeRunner:
 
     def __init__(self):
         self.secrets: dict[str, dict] = {}
+        self.secret_created: dict[str, datetime] = {}
         self.launched = []
         self.states: dict[str, RunStatus] = {}
         self.pod_logs: dict[str, bytes] = {}
@@ -24,6 +26,7 @@ class FakeRunner:
 
     def prepare(self, job_id, secrets):
         self.secrets[job_id] = dict(secrets)
+        self.secret_created[job_id] = datetime.now(UTC)
 
     def launch(self, spec):
         if self.fail_launch:
@@ -41,6 +44,9 @@ class FakeRunner:
 
     def cleanup(self, job_id):
         self.cleaned.append(job_id)
+
+    def job_secrets(self):
+        return {j: t for j, t in self.secret_created.items() if j not in self.cleaned}
 
 
 @pytest.fixture

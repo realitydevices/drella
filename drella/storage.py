@@ -82,8 +82,14 @@ class LocalStorage:
                 yield chunk
 
     def list(self, prefix: str = "") -> list[str]:
+        if ".." in PurePosixPath(prefix).parts or prefix.startswith("/"):
+            raise ValueError(f"invalid storage prefix: {prefix!r}")
+        # Walk only the deepest directory the prefix names, not the whole tree.
+        base = self.root / prefix.rsplit("/", 1)[0] if "/" in prefix else self.root
+        if not base.is_dir():
+            return []
         keys = []
-        for path in self.root.rglob("*"):
+        for path in base.rglob("*"):
             if path.is_file() and not path.name.startswith(".tmp-"):
                 key = path.relative_to(self.root).as_posix()
                 if key.startswith(prefix):

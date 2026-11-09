@@ -71,13 +71,14 @@ def test_create_job_validates_body(client, auth):
         assert client.post("/jobs", json=JOB | bad, headers=auth).status_code == 422
 
 
-def test_create_job_puts_decrypted_credentials_in_its_secret(client, auth, runner):
+def test_job_secret_holds_only_the_credentials_it_needs(client, auth, runner):
     client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
-    client.put("/credentials/other", json={"value": "o"}, headers=auth)
+    client.put("/credentials/anthropic", json={"value": "sk-x"}, headers=auth)
     job = client.post("/jobs", json=JOB, headers=auth).json()
     assert job["status"] == "queued"
     secret = runner.secrets[job["id"]]
-    assert secret["github"] == "ghp_x" and secret["other"] == "o"
+    assert set(secret) == {"github", JOB_TOKEN_KEY}
+    assert secret["github"] == "ghp_x"
     assert secret[JOB_TOKEN_KEY].startswith("drj_")
 
 
@@ -168,6 +169,65 @@ def test_killed_job_fails_with_reason_and_keeps_log(client, auth, job, queue, ru
     got = client.get(f"/jobs/{job['id']}", headers=auth).json()
     assert got["status"] == "failed" and got["message"] == "DeadlineExceeded"
     assert client.get(f"/jobs/{job['id']}/logs", headers=auth).text == "working...\n"
+
+
+def test_log_survives_the_pod_via_snapshots(client, auth, job, queue, runner):
+    queue.log_snapshot_seconds = 0
+    queue.tick()
+    runner.pod_logs[job["id"]] = b"step 1\nstep 2\n"
+    queue.tick()  # running: snapshot taken
+    # Timed out: Kubernetes deleted the pod, and its log with it.
+    del runner.pod_logs[job["id"]]
+    runner.states[job["id"]] = RunStatus(RunState.FAILED, "DeadlineExceeded")
+    queue.tick()
+    got = client.get(f"/jobs/{job['id']}", headers=auth).json()
+    assert got["status"] == "failed" and got["message"] == "DeadlineExceeded"
+    assert client.get(f"/jobs/{job['id']}/logs", headers=auth).text == "step 1\nstep 2\n"
+
+
+def test_a_failing_job_check_does_not_stop_the_tick(client, auth, job, queue, runner):
+    queue.tick()
+
+    def broken(job_id, follow=False):
+        raise RuntimeError("pod vanished mid-read")
+
+    runner.logs = broken
+    runner.states[job["id"]] = RunStatus(RunState.FAILED, "Evicted")
+    queue.tick()  # archiving fails, but the job still settles
+    assert client.get(f"/jobs/{job['id']}", headers=auth).json()["status"] == "failed"
+
+    def status_boom(job_id):
+        raise RuntimeError("API server unreachable")
+
+    second = client.post("/jobs", json=JOB, headers=auth).json()
+    queue.tick()
+    runner.status = status_boom
+    queue.tick()  # logged, not raised
+    assert queue.alive()
+    assert client.get(f"/jobs/{second['id']}", headers=auth).json()["status"] == "running"
+
+
+def test_leftover_secrets_are_reaped(client, auth, job, queue, runner):
+    from datetime import timedelta
+
+    queue.tick()
+    runner.states[job["id"]] = RunStatus(RunState.FAILED, "x")
+    runner.cleanup = lambda job_id: (_ for _ in ()).throw(RuntimeError("API down"))
+    queue.tick()  # finished, but cleanup failed: the Secret is left behind
+    queued = client.post("/jobs", json=JOB | {"prompt": "later"}, headers=auth).json()
+    old = runner.secret_created[job["id"]] - timedelta(hours=1)
+    runner.secret_created = {job["id"]: old, queued["id"]: old, "gone": old, "young": runner.secret_created[queued["id"]]}
+    del runner.cleanup  # back to the real fake
+    queue._last_reap = 0
+    queue.concurrency = 0  # keep the second job queued
+    queue.tick()
+    assert set(runner.cleaned) == {job["id"], "gone"}
+
+
+def test_livez_fails_when_the_queue_stalls(client, queue):
+    assert client.get("/livez").status_code == 200
+    queue._last_tick -= 10_000
+    assert client.get("/livez").status_code == 503
 
 
 def test_launch_failure_fails_the_job(client, auth, job, queue, runner):
