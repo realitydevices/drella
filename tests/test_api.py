@@ -185,16 +185,34 @@ def test_log_survives_the_pod_via_snapshots(client, auth, job, queue, runner):
     assert client.get(f"/jobs/{job['id']}/logs", headers=auth).text == "step 1\nstep 2\n"
 
 
-def test_a_shorter_log_never_replaces_the_archived_one(client, auth, job, queue, runner):
+def test_a_rotated_log_keeps_the_earlier_segment(client, auth, job, queue, runner):
     queue.log_snapshot_seconds = 0
     queue.tick()
     runner.pod_logs[job["id"]] = b"line\n" * 100
     queue.tick()
     # The kubelet rotated the log: the API now returns only the newest part.
     runner.pod_logs[job["id"]] = b"tail\n"
+    queue.tick()
+    # The new segment grows past the old one's length; the old one is still kept.
+    runner.pod_logs[job["id"]] = b"tail\n" + b"more\n" * 200
+    queue.tick()
+    runner.pod_logs[job["id"]] = b""  # an empty read never replaces anything
     runner.states[job["id"]] = RunStatus(RunState.FAILED, "DeadlineExceeded")
     queue.tick()
-    assert client.get(f"/jobs/{job['id']}/logs", headers=auth).text == "line\n" * 100
+    log = client.get(f"/jobs/{job['id']}/logs", headers=auth).text
+    assert log == "line\n" * 100 + "\n[drella] the pod's log was rotated here; some output may be missing\n" + "tail\n" + "more\n" * 200
+
+
+def test_a_log_that_only_grows_is_one_segment(client, auth, job, queue, runner, storage):
+    queue.log_snapshot_seconds = 0
+    queue.tick()
+    for n in (1, 2, 3):
+        runner.pod_logs[job["id"]] = b"step\n" * n
+        queue.tick()
+    assert storage.list(f"jobs/{job['id']}/log/") == []
+    runner.states[job["id"]] = RunStatus(RunState.SUCCEEDED)
+    queue.tick()
+    assert client.get(f"/jobs/{job['id']}/logs", headers=auth).text == "step\n" * 3
 
 
 def test_a_failing_job_check_does_not_stop_the_tick(client, auth, job, queue, runner):
@@ -240,6 +258,38 @@ def test_livez_fails_when_the_queue_stalls(client, queue):
     assert client.get("/livez").status_code == 200
     queue._last_tick -= 10_000
     assert client.get("/livez").status_code == 503
+
+
+def test_health_checks_answer_when_every_worker_thread_is_busy(client):
+    """Log followers can occupy the whole thread pool (#5); liveness mustn't fail
+    because of that, or Kubernetes would restart a Drella that's working."""
+    import threading
+
+    import anyio.to_thread
+
+    def limiter():
+        return anyio.to_thread.current_default_thread_limiter()
+
+    tokens = client.portal.call(lambda: limiter().total_tokens)
+    release = threading.Event()
+    try:
+        # One worker thread, and something blocking it.
+        client.portal.call(lambda: setattr(limiter(), "total_tokens", 1))
+        client.portal.start_task_soon(anyio.to_thread.run_sync, release.wait)
+        results = {}
+
+        def probe(path):
+            results[path] = client.get(path).status_code
+
+        threads = [threading.Thread(target=probe, args=(p,)) for p in ("/healthz", "/livez")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        assert results == {"/healthz": 200, "/livez": 200}
+    finally:
+        release.set()
+        client.portal.call(lambda: setattr(limiter(), "total_tokens", tokens))
 
 
 def test_launch_failure_fails_the_job(client, auth, job, queue, runner):

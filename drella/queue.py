@@ -10,9 +10,11 @@ v0 has one queue group with concurrency 1. Each tick:
 3. now and then, deletes job Secrets whose job has finished or doesn't exist.
 """
 
+import itertools
 import logging
 import threading
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
@@ -20,7 +22,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState
-from drella.storage import Storage
+from drella.storage import CHUNK, NotFound, Storage
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +32,32 @@ REAP_EVERY = 60  # seconds
 
 
 def log_key(job_id: str) -> str:
+    """The archived log: its current segment (see Queue._archive_log)."""
     return f"jobs/{job_id}/log.txt"
+
+
+def log_segment_key(job_id: str, n: int) -> str:
+    """An earlier segment of the archived log, from before a rotation."""
+    return f"jobs/{job_id}/log/{n:04d}.txt"
+
+
+ROTATED = b"\n[drella] the pod's log was rotated here; some output may be missing\n"
+
+
+def archived_log(storage: Storage, job_id: str) -> Iterator[bytes]:
+    """The archived log: earlier segments, then the current one. Raises NotFound if
+    nothing was archived."""
+    keys = storage.list(f"jobs/{job_id}/log/")
+    if storage.size(log_key(job_id)) is not None:
+        keys.append(log_key(job_id))
+    if not keys:
+        raise NotFound(log_key(job_id))
+    parts = []
+    for i, key in enumerate(keys):
+        if i:
+            parts.append([ROTATED])
+        parts.append(storage.get(key))
+    return itertools.chain.from_iterable(parts)
 
 
 def output_prefix(job_id: str) -> str:
@@ -169,8 +196,11 @@ class Queue:
     def _archive_log(self, job_id: str) -> None:
         """Copy the pod's log to storage. Best effort: a failure is logged.
 
-        Never replaces a snapshot with a shorter copy: the pod's log can come back
-        empty or, once the kubelet has rotated it (at about 10 MB), shorter."""
+        The kubelet rotates a container's log at about 10 MB, and the log API returns
+        only the current file. A pod log of the same file only grows, so a read that
+        doesn't start with what's archived, or is shorter than it, means a rotation:
+        the archived copy is kept as an earlier segment and a new one starts. An
+        empty read never replaces anything."""
         try:
             data = b"".join(self.runner.logs(job_id, follow=False))
         except LogsUnavailable:
@@ -179,11 +209,18 @@ class Queue:
         except Exception:
             log.warning("reading the log of job %s failed", job_id, exc_info=True)
             return
-        if len(data) < (self.storage.size(log_key(job_id)) or 0):
-            log.info("keeping the longer archived log of job %s", job_id)
-            return
+        key = log_key(job_id)
         try:
-            self.storage.put(log_key(job_id), [data])
+            size = self.storage.size(key)
+            if size:
+                if not data:
+                    return
+                head = next(iter(self.storage.get(key)), b"")[:CHUNK]
+                if len(data) < size or not data.startswith(head):
+                    n = len(self.storage.list(f"jobs/{job_id}/log/")) + 1
+                    log.info("the log of job %s was rotated; keeping segment %d", job_id, n)
+                    self.storage.put(log_segment_key(job_id, n), self.storage.get(key))
+            self.storage.put(key, [data])
         except Exception:
             log.warning("storing the log of job %s failed", job_id, exc_info=True)
 

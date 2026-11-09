@@ -21,7 +21,7 @@ from drella import crypto
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
 from drella.models import QUEUED, RUNNING, TERMINAL, Credential, Job, Token
-from drella.queue import Queue, log_key, output_prefix
+from drella.queue import Queue, archived_log, output_prefix
 from drella.runner import JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
 from drella.storage import CHUNK, LocalStorage, NotFound, Storage
 
@@ -142,7 +142,9 @@ def create_app(
 # -- dependencies ------------------------------------------------------------
 
 
-def get_deps(request: Request) -> Deps:
+async def get_deps(request: Request) -> Deps:
+    # Async, so /livez and anything else that needs only this doesn't wait for a free
+    # worker thread (FastAPI runs plain `def` dependencies in the thread pool).
     return request.app.state.deps
 
 
@@ -337,7 +339,7 @@ def job_logs(
 def _log_source(deps: Deps, job_id: str, status: str, follow: bool) -> Iterator[bytes]:
     if status in TERMINAL:
         try:
-            return deps.storage.get(log_key(job_id))
+            return archived_log(deps.storage, job_id)
         except NotFound:
             raise HTTPException(404, "no archived log for this job") from None
     try:
