@@ -18,7 +18,7 @@ JOB_TOKEN_KEY = "_job-token"
 @dataclass(frozen=True)
 class JobSpec:
     job_id: str
-    repo: str
+    repo: str | None
     model: str
     endpoint: str
     prompt: str
@@ -123,11 +123,12 @@ class KubernetesRunner:
         env = {
             "DRELLA_API_URL": s.api_url,
             "DRELLA_JOB_ID": spec.job_id,
-            "DRELLA_REPO": spec.repo,
             "DRELLA_MODEL": spec.model,
             "DRELLA_ENDPOINT": spec.endpoint,
             "DRELLA_PROMPT": spec.prompt,
         }
+        if spec.repo:
+            env["DRELLA_REPO"] = spec.repo
         return {
             "apiVersion": "batch/v1",
             "kind": "Job",

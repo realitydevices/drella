@@ -20,8 +20,8 @@ jobs:
             context: .
             file: images/drella/Dockerfile
           - image: ghcr.io/realitydevices/drella-job
-            context: images/job
-            file: images/job/Dockerfile
+            context: images/drella-job
+            file: images/drella-job/Dockerfile
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3

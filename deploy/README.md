@@ -100,12 +100,14 @@ With `DRELLA=http://localhost:8000` and `TOKEN` set to your token:
 ```sh
 auth="Authorization: Bearer $TOKEN"
 
-# 1. Store a GitHub credential: a fine-grained PAT for the target repo with
-#    Contents and Pull requests read/write.
+# 1. Store a GitHub credential (needed only for jobs with a repo): a fine-grained
+#    PAT for the target repo with Contents and Pull requests read/write.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "github_pat_..."}' $DRELLA/credentials/github
 
 # 2. Create a job. `endpoint` is an OpenAI-compatible base URL; for Ollama, add /v1.
+#    Leave out "repo" for a job with no repo: it opens no PR, and its results are
+#    whatever the agent writes to /out.
 curl -X POST -H "$auth" -H 'Content-Type: application/json' -d '{
   "prompt": "add a CHANGELOG.md",
   "repo": "realitydevices/drella",

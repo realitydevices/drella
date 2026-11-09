@@ -48,7 +48,7 @@ class Job(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
     token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"))
     prompt: Mapped[str] = mapped_column(Text)
-    repo: Mapped[str] = mapped_column(String(200))
+    repo: Mapped[str | None] = mapped_column(String(200), nullable=True)
     model: Mapped[str] = mapped_column(String(200))
     endpoint: Mapped[str] = mapped_column(String(500))
     status: Mapped[str] = mapped_column(String(16), default=QUEUED, index=True)

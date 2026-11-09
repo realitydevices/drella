@@ -50,10 +50,19 @@ def test_credential_names_are_restricted(client, auth, name):
 # -- jobs -----------------------------------------------------------------------
 
 
-def test_create_job_requires_github_credential(client, auth):
+def test_job_with_repo_requires_github_credential(client, auth):
     r = client.post("/jobs", json=JOB, headers=auth)
     assert r.status_code == 422
     assert "github" in r.json()["detail"]
+
+
+def test_job_without_repo_needs_no_credentials(client, auth, runner):
+    no_repo = {k: v for k, v in JOB.items() if k != "repo"}
+    r = client.post("/jobs", json=no_repo, headers=auth)
+    assert r.status_code == 201, r.text
+    job = r.json()
+    assert job["repo"] is None
+    assert set(runner.secrets[job["id"]]) == {JOB_TOKEN_KEY}
 
 
 def test_create_job_validates_body(client, auth):

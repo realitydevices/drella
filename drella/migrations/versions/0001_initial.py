@@ -39,7 +39,7 @@ def upgrade() -> None:
     sa.Column('id', sa.String(length=32), nullable=False),
     sa.Column('token_id', sa.Integer(), nullable=False),
     sa.Column('prompt', sa.Text(), nullable=False),
-    sa.Column('repo', sa.String(length=200), nullable=False),
+    sa.Column('repo', sa.String(length=200), nullable=True),
     sa.Column('model', sa.String(length=200), nullable=False),
     sa.Column('endpoint', sa.String(length=500), nullable=False),
     sa.Column('status', sa.String(length=16), nullable=False),

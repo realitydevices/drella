@@ -44,7 +44,11 @@ class CredentialIn(BaseModel):
 
 class JobIn(BaseModel):
     prompt: str = Field(min_length=1)
-    repo: str = Field(pattern=REPO_RE, description="GitHub repo as owner/name")
+    repo: str | None = Field(
+        default=None,
+        pattern=REPO_RE,
+        description="GitHub repo as owner/name. Leave it out for a job with no repo (no PR).",
+    )
     model: str = Field(min_length=1)
     endpoint: str = Field(pattern=r"^https?://", description="OpenAI-compatible base URL")
 
@@ -53,7 +57,7 @@ class JobOut(BaseModel):
     id: str
     status: str
     prompt: str
-    repo: str
+    repo: str | None
     model: str
     endpoint: str
     message: str | None
@@ -225,8 +229,9 @@ def list_credentials(c: CallerDep, db: DbDep) -> list[str]:
 @router.post("/jobs", status_code=201)
 def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     creds = db.scalars(select(Credential).where(Credential.token_id == c.token.id)).all()
-    if GITHUB_CREDENTIAL not in {cred.name for cred in creds}:
-        raise HTTPException(422, f"store a '{GITHUB_CREDENTIAL}' credential first")
+    # Only a job with a repo needs git access.
+    if body.repo and GITHUB_CREDENTIAL not in {cred.name for cred in creds}:
+        raise HTTPException(422, f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential")
     # The request carries the token, so this is when credentials are decrypted
     # [19]. They go straight into the job's Secret, never into the database.
     secrets = {cred.name: crypto.decrypt(c.secret, c.token.salt, cred.ciphertext) for cred in creds}

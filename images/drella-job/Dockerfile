@@ -1,5 +1,5 @@
 # The job image [20]: OpenCode, git, gh and the job wrapper.
-#   docker build -t drella-job images/job
+#   docker build -t drella-job images/drella-job
 FROM debian:bookworm-slim
 
 ARG OPENCODE_VERSION=1.15.11

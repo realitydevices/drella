@@ -146,3 +146,11 @@ def test_cleanup_ignores_already_deleted(k8s):
     core.delete_namespaced_secret.side_effect = ApiException(status=404)
     r.cleanup(JOB_ID)
     assert batch.delete_namespaced_job.call_args.kwargs["propagation_policy"] == "Background"
+
+
+def test_launch_without_repo_omits_drella_repo(k8s):
+    r, batch, _ = k8s
+    r.launch(JobSpec(JOB_ID, None, "qwen", "http://ollama:11434/v1", "summarise"))
+    _, job = batch.create_namespaced_job.call_args.args
+    (c,) = job["spec"]["template"]["spec"]["containers"]
+    assert "DRELLA_REPO" not in {e["name"] for e in c["env"]}

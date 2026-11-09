@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # Drella job wrapper [21]. Runs inside the job pod:
-#   1. clones the repo with the GitHub credential (/creds/github);
+#   1. with a repo (DRELLA_REPO): clones it with the GitHub credential (/creds/github).
+#      Without one: starts in an empty working directory;
 #   2. configures OpenCode for the job's endpoint and model;
-#   3. runs `opencode run` with the prompt and a standing instruction to work on a
-#      branch, push it and open a PR with gh;
-#   4. uploads /out (diff, transcript, PR URL) to the Drella API;
-#   5. reports the final status with the job-scoped token.
+#   3. runs `opencode run` with the prompt and standing instructions: with a repo,
+#      work on a branch, push it and open a PR with gh; without one, write results to /out;
+#   4. uploads /out (transcript, plus diff and PR URL for a repo job) to the Drella API;
+#   5. reports the final status with the job-scoped token. A repo job succeeds only
+#      if a PR exists; a job without a repo succeeds if the agent exits cleanly.
 set -uo pipefail
 
-: "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}" "${DRELLA_REPO:?}"
+: "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}"
 : "${DRELLA_MODEL:?}" "${DRELLA_ENDPOINT:?}" "${DRELLA_PROMPT:?}"
 OUT=${DRELLA_OUT:-/out}
 WORK=${DRELLA_WORK:-/work}
 CREDS=${DRELLA_CREDS:-/creds}
+REPO=${DRELLA_REPO:-}
 BRANCH="drella/${DRELLA_JOB_ID:0:8}"
 
 log() { echo "[drella] $*"; }
@@ -43,30 +46,34 @@ finish() {
   exit
 }
 
-# -- 1. clone ------------------------------------------------------------------
+# -- 1. workspace -------------------------------------------------------------
 
-[ -s "$CREDS/github" ] || finish failed "no github credential"
-export GH_TOKEN
-GH_TOKEN=$(<"$CREDS/github")
 export GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0
-# git authenticates with the same token, for the clone and the agent's pushes.
-git config --global credential.helper \
-  '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
-
-if user=$(gh api user --jq '"\(.login) \(.id)"' 2>/dev/null); then
-  read -r login id <<<"$user"
-  git config --global user.name "$login"
-  git config --global user.email "$id+$login@users.noreply.github.com"
-else
-  git config --global user.name "Drella agent"
-  git config --global user.email "drella@users.noreply.github.com"
+if [ -s "$CREDS/github" ]; then
+  export GH_TOKEN
+  GH_TOKEN=$(<"$CREDS/github")
+  # git authenticates with the same token, for the clone and the agent's pushes.
+  git config --global credential.helper \
+    '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+  if user=$(gh api user --jq '"\(.login) \(.id)"' 2>/dev/null); then
+    read -r login id <<<"$user"
+    git config --global user.name "$login"
+    git config --global user.email "$id+$login@users.noreply.github.com"
+  fi
 fi
+git config --global user.name >/dev/null || git config --global user.name "Drella agent"
+git config --global user.email >/dev/null || git config --global user.email "drella@users.noreply.github.com"
 
-log "cloning $DRELLA_REPO"
-git clone "https://github.com/$DRELLA_REPO.git" "$WORK/repo" || finish failed "clone failed"
-cd "$WORK/repo" || finish failed "no checkout"
-BASE=$(git rev-parse HEAD)
-DEFAULT_BRANCH=$(git branch --show-current)
+if [ -n "$REPO" ]; then
+  [ -s "$CREDS/github" ] || finish failed "a job with a repo needs a github credential"
+  log "cloning $REPO"
+  git clone "https://github.com/$REPO.git" "$WORK/repo" || finish failed "clone failed"
+  cd "$WORK/repo" || finish failed "no checkout"
+  BASE=$(git rev-parse HEAD)
+  DEFAULT_BRANCH=$(git branch --show-current)
+else
+  mkdir -p "$WORK/space" && cd "$WORK/space" || finish failed "no working directory"
+fi
 
 # -- 2. configure OpenCode -----------------------------------------------------
 
@@ -93,16 +100,26 @@ jq -n --arg url "$DRELLA_ENDPOINT" --arg model "$DRELLA_MODEL" '{
 
 # -- 3. run the agent ----------------------------------------------------------
 
+if [ -n "$REPO" ]; then
 read -r -d '' STANDING <<INSTRUCTIONS
 ---
 Standing instructions from Drella (always follow these):
-- You are in a clone of https://github.com/$DRELLA_REPO. Its default branch is $DEFAULT_BRANCH.
+- You are in a clone of https://github.com/$REPO. Its default branch is $DEFAULT_BRANCH.
 - Do the work on a new branch named $BRANCH. Never commit to or push $DEFAULT_BRANCH.
 - Commit your changes and push the branch to origin early and often.
 - When the work is done, open a pull request against $DEFAULT_BRANCH with
   \`gh pr create\`, with a clear title and a description of what you changed.
 - git and gh are already authenticated. Nobody can answer questions: decide for yourself.
 INSTRUCTIONS
+else
+read -r -d '' STANDING <<INSTRUCTIONS
+---
+Standing instructions from Drella (always follow these):
+- You are in an empty working directory. There is no repository for this job.
+- Write your results as files in $OUT. Anything outside $OUT is thrown away.
+- Nobody can answer questions: decide for yourself.
+INSTRUCTIONS
+fi
 
 log "running opencode with drella/$DRELLA_MODEL at $DRELLA_ENDPOINT"
 # Runs unattended in a throwaway pod, so it may use its tools without asking.
@@ -116,23 +133,27 @@ log "opencode exited with $rc"
 session=$(opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
 [ -n "$session" ] && opencode export "$session" >"$OUT/session.json" 2>/dev/null
 
-# Everything that changed since the clone, committed or not.
-git add -A -N
-git diff --binary "$BASE" >"$OUT/diff.patch"
-
-branch=$(git branch --show-current)
 pr=""
-for b in "$BRANCH" "$branch"; do
-  [ -n "$b" ] && [ "$b" != "$DEFAULT_BRANCH" ] || continue
-  pr=$(gh pr list --repo "$DRELLA_REPO" --head "$b" --state all --json url --jq '.[0].url // empty' 2>/dev/null)
-  [ -n "$pr" ] && break
-done
-[ -n "$pr" ] && echo "$pr" >"$OUT/pr-url.txt"
+if [ -n "$REPO" ]; then
+  # Everything that changed since the clone, committed or not.
+  git add -A -N
+  git diff --binary "$BASE" >"$OUT/diff.patch"
+
+  branch=$(git branch --show-current)
+  for b in "$BRANCH" "$branch"; do
+    [ -n "$b" ] && [ "$b" != "$DEFAULT_BRANCH" ] || continue
+    pr=$(gh pr list --repo "$REPO" --head "$b" --state all --json url --jq '.[0].url // empty' 2>/dev/null)
+    [ -n "$pr" ] && break
+  done
+  [ -n "$pr" ] && echo "$pr" >"$OUT/pr-url.txt"
+fi
 
 # -- 5. report -----------------------------------------------------------------
 
 if [ "$rc" -ne 0 ]; then
   finish failed "opencode exited with $rc"
+elif [ -z "$REPO" ]; then
+  finish succeeded "done"
 elif [ -z "$pr" ]; then
   finish failed "the agent didn't open a pull request"
 else
