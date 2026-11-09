@@ -20,7 +20,7 @@ from drella.runner import JOB_TOKEN_KEY, JobSpec, KubernetesRunner, LogsUnavaila
 
 JOB_ID = "abc123"
 NAME = "drella-job-abc123"
-SPEC = JobSpec(JOB_ID, "realitydevices/drella", "qwen", "http://ollama:11434/v1", "do it")
+SPEC = JobSpec(JOB_ID, "octo/widgets", "some-model", "http://ollama:11434/v1", "do it")
 
 
 @pytest.fixture
@@ -150,7 +150,7 @@ def test_cleanup_ignores_already_deleted(k8s):
 
 def test_launch_without_repo_omits_drella_repo(k8s):
     r, batch, _ = k8s
-    r.launch(JobSpec(JOB_ID, None, "qwen", "http://ollama:11434/v1", "summarise"))
+    r.launch(JobSpec(JOB_ID, None, "some-model", "http://ollama:11434/v1", "summarise"))
     _, job = batch.create_namespaced_job.call_args.args
     (c,) = job["spec"]["template"]["spec"]["containers"]
     assert "DRELLA_REPO" not in {e["name"] for e in c["env"]}
@@ -184,6 +184,7 @@ def test_job_pod_is_hardened_and_has_a_deadline(k8s):
     deadline = int(env["DRELLA_DEADLINE"])
     assert abs(deadline - (time.time() + 3600)) < 60
     assert env["DRELLA_AGENT_GRACE"] == "300"
+    assert env["DRELLA_TERM_GRACE"] == "120"
 
 
 def test_job_secrets_lists_secrets_by_job_id(k8s):

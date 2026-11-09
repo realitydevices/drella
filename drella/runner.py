@@ -156,6 +156,8 @@ class KubernetesRunner:
         # (activeDeadlineSeconds), which runs from roughly now.
         env["DRELLA_DEADLINE"] = str(int(time.time()) + s.job_timeout_seconds)
         env["DRELLA_AGENT_GRACE"] = str(s.agent_grace_seconds)
+        # Once told to stop, the wrapper has this long to report before it's killed.
+        env["DRELLA_TERM_GRACE"] = str(s.job_termination_grace_seconds)
         return {
             "apiVersion": "batch/v1",
             "kind": "Job",
