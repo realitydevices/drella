@@ -248,7 +248,7 @@ reason=$(failure)
 session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
 [ -n "$session" ] && within 20 opencode export "$session" >"$OUT/session.json" 2>/dev/null
 
-pr="" diff_note=""
+pr="" diff_note="" pr_lookup_failed=""
 if [ -n "$REPO" ]; then
   # Everything that changed since the clone, committed or not.
   within 30 git add -A -N
