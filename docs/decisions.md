@@ -77,8 +77,9 @@ one. When a decision changes, edit it here first.
     - **Status:** reported to the API using a token scoped to that one job.
     - **On exit:** the wrapper uploads `/out` and memory.
     - **Logs** come straight from Kubernetes. The API follows the pod's logs for live tail
-      (`GET /jobs/{id}/logs?follow=1`). When a job finishes, Drella copies the full log to
-      object storage, because pod logs disappear with the pod.
+      (`GET /jobs/{id}/logs?follow=1`). Drella copies the log to object storage while the
+      job runs and when it finishes, because pod logs disappear with the pod (limits in
+      [v0.md](v0.md#time-limits-and-logs)).
     - **If the agent is killed,** its unsaved work may be lost, but the log survives, which
       is enough to diagnose and fix. Coding agents push their branch early and often.
 22. **Queues:** endpoints and models belong to **queue groups**, each with its own

@@ -7,11 +7,12 @@ It's a page, not a script: run the steps yourself and adapt them to your host.
 
 - A Linux host with a few GB of RAM and disk. Each job gets up to 2 GB of RAM, and
   v0 runs one job at a time.
-- Network access from the host to your model endpoint, e.g. Ollama on the LAN at
-  `http://192.168.50.73:11434`. Check it from the host:
+- A model endpoint the host can reach: an OpenAI-compatible API that needs no API
+  key, such as Ollama on your LAN. (v0 passes no model credentials to jobs, so hosted
+  APIs that need a key don't work yet.) Check it from the host:
 
   ```sh
-  curl http://192.168.50.73:11434/v1/models
+  curl http://<ollama-host>:11434/v1/models
   ```
 
 - `kubectl` on your laptop.
@@ -41,6 +42,10 @@ kubectl get nodes
 
 ## Deploy
 
+The manifests pin a released image (see **Versions** below), so deploy from a release:
+the first is `v0.1.0`. Images on `main` are published too, as `:main` and
+`:sha-<commit>`, for testing.
+
 From a checkout of this repo:
 
 ```sh
@@ -59,8 +64,10 @@ logs in that namespace. The images come from GHCR: `ghcr.io/realitydevices/drell
 change `newTag` and apply again.
 
 **Job network:** job pods can reach DNS, the Drella API, the public internet, and port
-11434 (Ollama's default) on private networks, and nothing else on your LAN. If your
-model endpoint uses a different port, edit the last rule in `job-network.yaml`.
+11434 (Ollama's default) on private networks outside the cluster, and nothing else on
+your LAN or in the cluster. If your model endpoint uses a different port, edit the last
+rule in `job-network.yaml`. That policy assumes k3s's default pod and service ranges
+(`10.42.0.0/16`, `10.43.0.0/16`); change them there if yours differ.
 
 The Postgres password is set in `deploy/kustomization.yaml`. Only the Drella pod can
 reach Postgres, but you can change it before your first deploy.
@@ -109,19 +116,22 @@ With `DRELLA=http://localhost:8000` and `TOKEN` set to your token:
 auth="Authorization: Bearer $TOKEN"
 
 # 1. Store a GitHub credential (needed only for jobs with a repo): a fine-grained
-#    PAT for the target repo with Contents and Pull requests read/write. Don't give
-#    it the Workflows permission: without it, an agent can't change CI.
+#    PAT for the target repo only, with Contents and Pull requests read/write. Don't
+#    give it the Workflows permission: without it, an agent can't change CI. The agent
+#    holds this token and has internet access, so treat it as exposed to whatever the
+#    agent reads (see Security in docs/v0.md).
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "github_pat_..."}' $DRELLA/credentials/github
 
-# 2. Create a job. `endpoint` is an OpenAI-compatible base URL; for Ollama, add /v1.
+# 2. Create a job. `endpoint` is an OpenAI-compatible base URL that needs no API key;
+#    for Ollama, add /v1. `model` is a model the endpoint serves (`ollama list`).
 #    Leave out "repo" for a job with no repo: it opens no PR, and its results are
 #    whatever the agent writes to /out.
 curl -X POST -H "$auth" -H 'Content-Type: application/json' -d '{
   "prompt": "add a CHANGELOG.md",
-  "repo": "realitydevices/drella",
-  "model": "qwen3.6:35b-a3b-coding",
-  "endpoint": "http://192.168.50.73:11434/v1"
+  "repo": "<owner>/<repo>",
+  "model": "<model>",
+  "endpoint": "http://<ollama-host>:11434/v1"
 }' $DRELLA/jobs
 
 # 3. Follow its logs (add -H 'Accept: text/event-stream' for server-sent events).
@@ -134,7 +144,9 @@ curl -H "$auth" $DRELLA/jobs/<id>/outputs/diff.patch
 curl -H "$auth" $DRELLA/jobs/<id>/outputs/transcript.txt
 ```
 
-A job succeeds when the agent has opened a pull request. Jobs time out after an hour.
+A job with a repo succeeds when the agent has opened a pull request; a job without one
+succeeds when the agent finishes cleanly. Jobs time out after an hour; the agent is
+stopped five minutes before that, so its work so far is uploaded.
 
 **Ollama's context window:** OpenCode's prompts are long. If the model loses track,
 raise Ollama's context length on the Ollama host (e.g. `OLLAMA_CONTEXT_LENGTH=32768`).

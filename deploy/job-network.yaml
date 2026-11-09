@@ -4,11 +4,15 @@
 #   - DNS;
 #   - the Drella API;
 #   - the public internet (GitHub, package registries), but no private,
-#     link-local or carrier-grade NAT ranges, so nothing on your LAN, the node
-#     or the cluster;
-#   - the model endpoint: on private ranges only port 11434 (Ollama's
-#     default). If your model endpoint uses another port or a hosted API, edit
-#     the last rule.
+#     link-local or carrier-grade NAT ranges;
+#   - port 11434 (Ollama's default) on private ranges outside the cluster, for
+#     the model endpoint. Pods and services in the cluster are excluded,
+#     assuming k3s's default ranges (10.42.0.0/16 pods, 10.43.0.0/16
+#     services); change them below if your cluster uses others. If your model
+#     endpoint uses another port, edit the last rule.
+# So a job can't reach other services on your LAN, the cluster, or the node,
+# except on port 11434. v0 supports model endpoints that need no API key, so
+# hosted APIs aren't a target yet.
 # k3s enforces NetworkPolicy out of the box.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -46,7 +50,11 @@ spec:
               - 169.254.0.0/16
               - 100.64.0.0/10
     - to:
-        - ipBlock: { cidr: 10.0.0.0/8 }
+        - ipBlock:
+            cidr: 10.0.0.0/8
+            except:
+              - 10.42.0.0/16 # k3s pods
+              - 10.43.0.0/16 # k3s services
         - ipBlock: { cidr: 172.16.0.0/12 }
         - ipBlock: { cidr: 192.168.0.0/16 }
       ports:
