@@ -60,7 +60,7 @@ class Queue:
         self._thread: threading.Thread | None = None
         self._last_tick = time.monotonic()
         self._last_snapshot: dict[str, float] = {}
-        self._last_reap = 0.0
+        self._last_reap: float | None = None  # None: never
 
     # -- loop ----------------------------------------------------------------
 
@@ -111,7 +111,7 @@ class Queue:
                     break
                 self._launch(s, job)
                 running += 1
-            if time.monotonic() - self._last_reap >= REAP_EVERY:
+            if self._last_reap is None or time.monotonic() - self._last_reap >= REAP_EVERY:
                 self._last_reap = time.monotonic()
                 try:
                     self._reap_secrets(s)
@@ -160,7 +160,8 @@ class Queue:
 
     def _snapshot_log(self, job_id: str) -> None:
         now = time.monotonic()
-        if now - self._last_snapshot.get(job_id, 0) < self.log_snapshot_seconds:
+        last = self._last_snapshot.get(job_id)
+        if last is not None and now - last < self.log_snapshot_seconds:
             return
         self._last_snapshot[job_id] = now
         self._archive_log(job_id)

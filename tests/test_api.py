@@ -218,7 +218,7 @@ def test_leftover_secrets_are_reaped(client, auth, job, queue, runner):
     old = runner.secret_created[job["id"]] - timedelta(hours=1)
     runner.secret_created = {job["id"]: old, queued["id"]: old, "gone": old, "young": runner.secret_created[queued["id"]]}
     del runner.cleanup  # back to the real fake
-    queue._last_reap = 0
+    queue._last_reap = None
     queue.concurrency = 0  # keep the second job queued
     queue.tick()
     assert set(runner.cleaned) == {job["id"], "gone"}
