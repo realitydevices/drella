@@ -18,7 +18,8 @@ rules:
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "get", "patch", "delete"]
+    # list: to find job Secrets left behind by a failed launch or cleanup.
+    verbs: ["create", "get", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
@@ -88,8 +89,6 @@ spec:
                   fieldPath: metadata.namespace
             - name: DRELLA_API_URL
               value: http://drella:8000
-            - name: DRELLA_JOB_IMAGE
-              value: ghcr.io/realitydevices/drella-job:latest
           ports:
             - name: http
               containerPort: 8000
@@ -98,6 +97,14 @@ spec:
               path: /healthz
               port: http
             periodSeconds: 5
+          # Fails if the queue loop has stalled, so Kubernetes restarts Drella.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
           resources:
             requests:
               memory: 128Mi

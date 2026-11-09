@@ -52,7 +52,15 @@ kubectl -n drella rollout status deployment/drella
 This creates the `drella` namespace with Postgres, the Drella API, a 10 GB volume for
 job logs and outputs, and a ServiceAccount that can create Jobs and Secrets and read pod
 logs in that namespace. The images come from GHCR: `ghcr.io/realitydevices/drella` and
-`ghcr.io/realitydevices/drella-job`.
+`ghcr.io/realitydevices/drella-job`. Both are public, so no pull secret is needed.
+
+**Versions:** `kustomization.yaml` pins the `drella` image to a release tag (e.g.
+`v0.1.0`), and Drella launches the `drella-job` image with the same tag. To upgrade,
+change `newTag` and apply again.
+
+**Job network:** job pods can reach DNS, the Drella API, the public internet, and port
+11434 (Ollama's default) on private networks, and nothing else on your LAN. If your
+model endpoint uses a different port, edit the last rule in `job-network.yaml`.
 
 The Postgres password is set in `deploy/kustomization.yaml`. Only the Drella pod can
 reach Postgres, but you can change it before your first deploy.
@@ -101,7 +109,8 @@ With `DRELLA=http://localhost:8000` and `TOKEN` set to your token:
 auth="Authorization: Bearer $TOKEN"
 
 # 1. Store a GitHub credential (needed only for jobs with a repo): a fine-grained
-#    PAT for the target repo with Contents and Pull requests read/write.
+#    PAT for the target repo with Contents and Pull requests read/write. Don't give
+#    it the Workflows permission: without it, an agent can't change CI.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "github_pat_..."}' $DRELLA/credentials/github
 

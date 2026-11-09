@@ -8,12 +8,15 @@ resources:
   - namespace.yaml
   - postgres.yaml
   - drella.yaml
+  - job-network.yaml
 secretGenerator:
   # Postgres is only reachable from the drella pod (see the NetworkPolicy in
   # postgres.yaml). Change the password here before deploying if you like.
   - name: postgres
     literals:
       - password=drella
+# Pinned to a release. The drella image launches the drella-job image with the
+# same tag, so pinning this one pins both.
 images:
   - name: ghcr.io/realitydevices/drella
-    newTag: latest
+    newTag: v0.1.0

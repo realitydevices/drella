@@ -11,6 +11,11 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY drella ./drella
 RUN uv sync --frozen --no-dev
 
+# The image's version (a release tag like v0.1.0, or main / sha-<commit>). Drella
+# launches the drella-job image with the same tag.
+ARG DRELLA_VERSION=main
+ENV DRELLA_VERSION=$DRELLA_VERSION
+
 RUN useradd --uid 1000 --create-home drella && mkdir -p /data && chown drella /data
 USER 1000
 ENV PATH=/app/.venv/bin:$PATH DRELLA_STORAGE_PATH=/data PYTHONUNBUFFERED=1
