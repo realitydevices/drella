@@ -134,12 +134,15 @@ curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
   "interface": "openai-compatible",
   "base_url": "http://<ollama-host>:11434/v1",
   "model_id": "<ollama model>",
-  "context_length": 65536
+  "context_length": 65536,
+  "max_output_tokens": 8192
 }' $DRELLA/models/local
 
 #    A hosted model that needs an API key: store the key as a credential, and name
-#    the credential in the model. Each caller uses their own key. Use a key you can
-#    revoke, with a spending limit: the agent can read it.
+#    the credential in the model. Each caller uses their own key, and only the token
+#    that registered a model can change it. A model with a key needs an https:// base
+#    URL. Use a key you can revoke, with a spending limit: the agent can read it, and
+#    using a model means trusting its base URL with your key.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "<anthropic api key>"}' $DRELLA/credentials/anthropic-key
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
@@ -177,4 +180,6 @@ uploaded.
 
 **Ollama's context window:** OpenCode's prompts are long. If the model loses track,
 raise Ollama's context length on the Ollama host (e.g. `OLLAMA_CONTEXT_LENGTH=65536`),
-and set the model's `context_length` to match.
+and set the model's `context_length` to match. OpenCode takes a model's limits only as a
+pair, so Drella passes them only when both `context_length` and `max_output_tokens` are
+set.
