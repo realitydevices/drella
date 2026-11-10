@@ -1,9 +1,10 @@
-"""Model adapters, one per interface [27] (docs/v0.2.md#adapters).
+"""Model adapters, one per interface [27, 28] (docs/v0.2.md#adapters, docs/v0.3.md).
 
 An adapter turns a model (interface, base URL, model ID, ...) into what the job needs
-to use it: OpenCode's provider config, and a preflight check the wrapper runs before
-starting the agent. Adding a provider type means adding an adapter here; adding a model
-is just a row in the models table.
+to use it: which agent runs (OpenCode, or Claude Code for the `claude-code` interface),
+OpenCode's provider config, and a preflight check the wrapper runs before starting the
+agent. Adding a provider type means adding an adapter here; adding a model is just a
+row in the models table.
 
 The API key never appears in what's rendered here. OpenCode's config refers to it as
 {env:DRELLA_LLM_KEY}, and preflight headers as {key}; the wrapper fills both in from the
@@ -29,6 +30,20 @@ PROVIDER = "drella"
 class Interface(StrEnum):
     OPENAI_COMPATIBLE = "openai-compatible"
     ANTHROPIC = "anthropic"
+    # Claude Code with a subscription OAuth token (`claude setup-token`) [28]. No base
+    # URL: Claude Code talks to Anthropic itself.
+    CLAUDE_CODE = "claude-code"
+
+
+class Agent(StrEnum):
+    """The agent the job runs."""
+
+    OPENCODE = "opencode"
+    CLAUDE_CODE = "claude-code"
+
+
+def agent(m: "ModelSpec") -> Agent:
+    return Agent.CLAUDE_CODE if m.interface == Interface.CLAUDE_CODE else Agent.OPENCODE
 
 
 @dataclass(frozen=True)
@@ -37,7 +52,7 @@ class ModelSpec:
 
     alias: str
     interface: Interface
-    base_url: str
+    base_url: str | None  # None for claude-code
     model_id: str
     has_key: bool = False
     context_length: int | None = None
@@ -59,6 +74,8 @@ _NPM = {
 
 def opencode_config(m: ModelSpec) -> dict:
     """OpenCode's config for the job: one provider, one model."""
+    if agent(m) != Agent.OPENCODE or not m.base_url:
+        raise ValueError(f"{m.interface} models don't run OpenCode")
     options: dict = {"baseURL": m.base_url}
     if m.has_key:
         options["apiKey"] = "{env:%s}" % LLM_KEY_ENV
@@ -83,8 +100,14 @@ def opencode_config(m: ModelSpec) -> dict:
     }
 
 
-def preflight(m: ModelSpec) -> Preflight:
-    """A cheap request that fails fast if the URL is wrong or the key is rejected."""
+def preflight(m: ModelSpec) -> Preflight | None:
+    """A cheap request that fails fast if the URL is wrong or the key is rejected.
+
+    None for claude-code: an OAuth token can't be checked with a cheap request, and
+    Claude Code itself fails within seconds on a bad token (the wrapper reports it).
+    """
+    if agent(m) == Agent.CLAUDE_CODE or not m.base_url:
+        return None
     url = m.base_url.rstrip("/") + "/models"
     if m.interface == Interface.ANTHROPIC:
         headers = ("anthropic-version: 2023-06-01",)

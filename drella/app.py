@@ -74,6 +74,18 @@ class CredentialIn(BaseModel):
             raise ValueError("the credential is empty")
         return v
 
+    @field_validator("value")
+    @classmethod
+    def _no_null(cls, v):
+        _no_null(v)
+        return v
+
+
+def _no_null(v: str) -> str:
+    if "\x00" in v:
+        raise ValueError("value must not contain NUL characters")
+    return v
+
 
 class JobIn(BaseModel):
     # Unknown fields are an error, so an old client still sending `endpoint` is told.
@@ -87,6 +99,11 @@ class JobIn(BaseModel):
     )
     model: str = Field(pattern=NAME_RE, description="A registered model alias (PUT /models)")
 
+    @field_validator("prompt")
+    @classmethod
+    def _no_null(cls, v):
+        return _no_null(v)
+
 
 def check_model_credential(name: str | None) -> None:
     """A model's key can't be the GitHub credential: a model row would otherwise send
@@ -99,7 +116,8 @@ class ModelIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     interface: Interface
-    base_url: str = Field(pattern=BASE_URL_RE, max_length=500)
+    # Required, except for claude-code models, which have none [28].
+    base_url: str | None = Field(default=None, pattern=BASE_URL_RE, max_length=500)
     model_id: str = Field(pattern=MODEL_ID_RE, max_length=200)
     credential: str | None = Field(
         default=None,
@@ -111,6 +129,13 @@ class ModelIn(BaseModel):
     cost_in_per_mtok: Decimal | None = Field(default=None, ge=0, le=MAX_COST, decimal_places=4)
     cost_out_per_mtok: Decimal | None = Field(default=None, ge=0, le=MAX_COST, decimal_places=4)
     notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("notes")
+    @classmethod
+    def _no_null(cls, v):
+        if v is not None:
+            _no_null(v)
+        return v
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -125,7 +150,18 @@ class ModelIn(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _https_for_keys(self):
+    def _per_interface(self):
+        if self.interface == Interface.CLAUDE_CODE:
+            # Claude Code talks to Anthropic itself, with the OAuth token [28].
+            if self.base_url is not None:
+                raise ValueError("a claude-code model has no base_url (Claude Code talks to"
+                                 " Anthropic itself)")
+            if not self.credential:
+                raise ValueError("a claude-code model needs a credential (the OAuth token from"
+                                 " `claude setup-token`)")
+            return self
+        if self.base_url is None:
+            raise ValueError(f"a {self.interface.value} model needs a base_url")
         # Never send a key in the clear.
         if self.credential and not self.base_url.startswith("https://"):
             raise ValueError("a model with a credential needs an https:// base_url")
@@ -138,7 +174,7 @@ class ModelOut(BaseModel):
 
     alias: str
     interface: str
-    base_url: str
+    base_url: str | None
     model_id: str
     credential: str | None
     context_length: int | None
@@ -155,7 +191,7 @@ class JobModelOut(BaseModel):
 
     alias: str
     interface: str
-    base_url: str
+    base_url: str | None
     model_id: str
     credential: str | None
     context_length: int | None
@@ -180,6 +216,13 @@ class JobOut(BaseModel):
 class StatusIn(BaseModel):
     status: Literal["succeeded", "failed"]
     message: str | None = None
+
+    @field_validator("message")
+    @classmethod
+    def _no_null(cls, v):
+        if v is not None:
+            _no_null(v)
+        return v
 
 
 def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:

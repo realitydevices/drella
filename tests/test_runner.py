@@ -228,3 +228,28 @@ def test_launch_maps_the_model_key_from_the_secret(k8s):
     )
     # The key itself is never in the manifest.
     assert "sk-" not in json.dumps(job)
+
+
+def test_launch_with_claude_code(k8s):
+    r, batch, _ = k8s
+    cc = ModelSpec("cc", Interface.CLAUDE_CODE, None, "sonnet", has_key=True)
+    r.launch(JobSpec(JOB_ID, "octo/widgets", cc, "do it"))
+    _, job = batch.create_namespaced_job.call_args.args
+    (c,) = job["spec"]["template"]["spec"]["containers"]
+    env = {e["name"]: e for e in c["env"]}
+    assert env["DRELLA_AGENT"]["value"] == "claude-code"
+    assert env["DRELLA_AGENT_MODEL"]["value"] == "sonnet"
+    # The OAuth token comes from the Secret, like any model key; never in the manifest.
+    assert env["DRELLA_LLM_KEY"]["valueFrom"]["secretKeyRef"] == {"name": NAME, "key": "_llm-key"}
+    assert "sk-" not in json.dumps(job)
+    # No OpenCode config or preflight for Claude Code.
+    assert not {"DRELLA_OPENCODE_CONFIG", "DRELLA_PREFLIGHT_URL"} & set(env)
+
+
+def test_opencode_jobs_name_their_agent(k8s):
+    r, batch, _ = k8s
+    r.launch(SPEC)
+    _, job = batch.create_namespaced_job.call_args.args
+    (c,) = job["spec"]["template"]["spec"]["containers"]
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    assert env["DRELLA_AGENT"] == "opencode" and "DRELLA_OPENCODE_CONFIG" in env

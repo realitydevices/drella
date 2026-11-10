@@ -2,10 +2,12 @@
 # Drella job wrapper [21]. Runs inside the job pod:
 #   1. with a repo (DRELLA_REPO): clones it with the GitHub credential (/creds/github).
 #      Without one: starts in an empty working directory;
-#   2. checks the model endpoint and writes OpenCode's config, both rendered by Drella
-#      for the job's model (DRELLA_PREFLIGHT_*, DRELLA_OPENCODE_CONFIG; docs/v0.2.md);
-#   3. runs `opencode run` with the prompt and standing instructions: with a repo,
-#      work on a branch, push it and open a PR with gh; without one, write results to /out;
+#   2. sets up the agent Drella chose for the job's model (DRELLA_AGENT): OpenCode,
+#      after checking the model endpoint and writing OpenCode's config, both rendered
+#      by Drella (DRELLA_PREFLIGHT_*, DRELLA_OPENCODE_CONFIG; docs/v0.2.md); or Claude
+#      Code with the model's OAuth token (DRELLA_AGENT_MODEL; docs/v0.3.md);
+#   3. runs the agent with the prompt and standing instructions: with a repo, work on
+#      a branch, push it and open a PR with gh; without one, write results to /out;
 #   4. collects /out (transcript, plus diff and PR URL for a repo job);
 #   5. reports the final status with the job-scoped token, then uploads /out to the
 #      Drella API. A repo job succeeds only if a PR exists; a job without a repo
@@ -21,9 +23,21 @@
 # reach the Drella API (less if the provisional report used it up).
 set -uo pipefail
 
-: "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}"
-: "${DRELLA_OPENCODE_CONFIG:?}" "${DRELLA_PREFLIGHT_URL:?}" "${DRELLA_PROMPT:?}"
-MODEL_LABEL=${DRELLA_MODEL_LABEL:-$DRELLA_PREFLIGHT_URL}
+: "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}" "${DRELLA_PROMPT:?}"
+AGENT=${DRELLA_AGENT:-opencode}
+# A mismatch between Drella and this image (an unknown agent, or its settings
+# missing) is reported as the job's failure once the API helpers exist, below.
+setup_error=""
+case $AGENT in
+  opencode)
+    [ -n "${DRELLA_OPENCODE_CONFIG:-}" ] && [ -n "${DRELLA_PREFLIGHT_URL:-}" ] \
+      || setup_error="this job image is missing OpenCode's settings (DRELLA_OPENCODE_CONFIG, DRELLA_PREFLIGHT_URL); is the image the same version as Drella?" ;;
+  claude-code)
+    [ -n "${DRELLA_AGENT_MODEL:-}" ] \
+      || setup_error="this job image is missing Claude Code's model (DRELLA_AGENT_MODEL); is the image the same version as Drella?" ;;
+  *) setup_error="this job image doesn't know the agent '${AGENT:0:40}'; is the image the same version as Drella?" ;;
+esac
+MODEL_LABEL=${DRELLA_MODEL_LABEL:-${DRELLA_PREFLIGHT_URL:-$AGENT}}
 OUT=${DRELLA_OUT:-/out}
 WORK=${DRELLA_WORK:-/work}
 CREDS=${DRELLA_CREDS:-/creds}
@@ -154,6 +168,7 @@ on_term() {
   esac
 }
 trap on_term TERM INT
+[ -z "$setup_error" ] || finish failed "$setup_error"
 
 # -- 1. workspace -------------------------------------------------------------
 
@@ -186,8 +201,9 @@ else
   mkdir -p "$WORK/space" && cd "$WORK/space" || finish failed "no working directory"
 fi
 
-# -- 2. configure OpenCode -----------------------------------------------------
+# -- 2. configure the agent ----------------------------------------------------
 
+setup_opencode() {
 # OpenCode retries an unreachable endpoint until the job times out, so check first.
 # Drella's adapter for the model says what to call and with which headers; header
 # values refer to the API key as {key}. The headers go through a private file, so the
@@ -220,6 +236,28 @@ export OPENCODE_CONFIG="$WORK/opencode.json"
 printf '%s\n' "$DRELLA_OPENCODE_CONFIG" >"$OPENCODE_CONFIG"
 AGENT_MODEL=$(jq -er .model "$OPENCODE_CONFIG") \
   || finish failed "the job's OpenCode config names no model"
+}
+
+# Claude Code [28] logs in with the model's OAuth token (from `claude setup-token`),
+# given to it as CLAUDE_CODE_OAUTH_TOKEN when it runs. There's no preflight check: an
+# OAuth token can't be checked with a cheap request, and Claude Code fails within
+# seconds on a bad one (the job's message then says why).
+# Claude Code would otherwise load settings from the repo (.claude/settings.json,
+# .claude/settings.local.json) and its MCP servers (.mcp.json): hooks that run any
+# command, env vars (ANTHROPIC_BASE_URL, to send the token elsewhere), an
+# apiKeyHelper. So it runs with --setting-sources user (no project or local
+# settings) and --strict-mcp-config (no MCP servers), and the image's managed
+# settings turn hooks off as well. That also stops it loading the repo's CLAUDE.md,
+# which the standing instructions tell the agent to read itself.
+setup_claude_code() {
+  [ -n "${DRELLA_LLM_KEY:-}" ] || finish failed "a claude-code model needs its OAuth token (the model's credential)"
+  AGENT_MODEL=$DRELLA_AGENT_MODEL
+}
+
+case $AGENT in
+  opencode) setup_opencode ;;
+  claude-code) setup_claude_code ;;
+esac
 
 # -- 3. run the agent ----------------------------------------------------------
 
@@ -248,26 +286,58 @@ INSTRUCTIONS
 fi
 
 # The message starts with a fixed line, so a prompt beginning with "-" can't be
-# read as an OpenCode option.
+# read as an option.
 MESSAGE="Task from Drella:"$'\n'"$DRELLA_PROMPT"$'\n\n'"$STANDING"
 
 # The soft limit: stop the agent AGENT_GRACE seconds before the hard limit.
 budget=$((DEADLINE - AGENT_GRACE - $(date +%s)))
 [ "$budget" -gt 60 ] || finish failed "no time left to run the agent (the deadline is too close)"
 
-log "running opencode with $MODEL_LABEL (stops after ${budget}s)"
-# Runs unattended in a throwaway pod, so it may use its tools without asking. It runs
-# in the background so the TERM trap can fire while it works; the inner shell records
-# the agent's pid and exit code.
+# Runs unattended in a throwaway pod, so the agent may use its tools without asking.
+case $AGENT in
+  opencode)
+    agent_cmd=(opencode run --dangerously-skip-permissions --model "$AGENT_MODEL" "$MESSAGE") ;;
+  claude-code)
+    agent_cmd=(claude -p --model="$AGENT_MODEL" --output-format stream-json --verbose
+      --dangerously-skip-permissions --setting-sources user --strict-mcp-config "$MESSAGE") ;;
+esac
+
+# The transcript: OpenCode's output as it is; Claude Code's stream of JSON events
+# (kept whole as session.jsonl) turned into readable lines. Lines that aren't JSON
+# pass through.
+render() {
+  if [ "$AGENT" != claude-code ]; then cat; return; fi
+  jq -Rr --unbuffered '. as $line | try (fromjson |
+    if .type == "system" and .subtype == "init" then
+      "[claude] session \(.session_id), model \(.model)"
+    elif .type == "assistant" then
+      (.message.content[]? |
+        if .type == "text" then .text
+        elif .type == "tool_use" then "-> \(.name) \(.input | tostring | .[0:300])"
+        else empty end)
+    elif .type == "user" then
+      (.message.content[]? | select(.type == "tool_result") |
+        "<- " + ((.content | if type == "string" then . else (map(.text? // "") | join(" ")) end) | .[0:300]))
+    elif .type == "result" then
+      "[claude] \(if .is_error then "error" else .subtype end): \(.num_turns // "?") turns, \(((.duration_ms // 0) / 1000) | floor)s"
+        + (if .is_error then ": \(.result // "error")" else "" end)
+    else empty end) catch $line'
+}
+
+log "running $AGENT with $MODEL_LABEL (stops after ${budget}s)"
+# The agent runs in the background so the TERM trap can fire while it works; the inner
+# shell records the agent's pid and exit code.
 phase=agent
 agent_started=$(date +%s)
 {
-  timeout --signal=TERM --kill-after=30 "$budget" \
-    opencode run --dangerously-skip-permissions --model "$AGENT_MODEL" "$MESSAGE" &
+  # Claude Code's token, for the agent only: set in this subshell, so it's never on a
+  # command line.
+  [ "$AGENT" = claude-code ] && export CLAUDE_CODE_OAUTH_TOKEN=$DRELLA_LLM_KEY
+  timeout --signal=TERM --kill-after=30 "$budget" "${agent_cmd[@]}" &
   echo $! >"$WORK/agent.pid"
   wait $!
   echo $? >"$WORK/agent.rc"
-} 2>&1 | redact | tee "$OUT/transcript.txt" &
+} 2>&1 | redact | tee "$WORK/agent.out" | render | tee "$OUT/transcript.txt" &
 pipe_pid=$!
 for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
 agent_pid=$(cat "$WORK/agent.pid" 2>/dev/null)
@@ -279,7 +349,17 @@ phase=collect
 rc=$(cat "$WORK/agent.rc" 2>/dev/null)
 [[ "$rc" =~ ^[0-9]+$ ]] || rc=1  # no exit code recorded: treat as a failure
 elapsed=$(($(date +%s) - agent_started))
-log "opencode exited with $rc after ${elapsed}s"
+log "$AGENT exited with $rc after ${elapsed}s"
+
+# The agent's raw output, as recorded. The agent runs as the same user and could swap
+# $WORK/agent.out for a symlink (e.g. to /creds/github) or a FIFO, so it's read only if
+# it's a regular file, never through a symlink (dd's nofollow), for a bounded time, and
+# redacted again on the way out.
+agent_out() {
+  local f="$WORK/agent.out"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  timeout --kill-after=2 20 dd if="$f" iflag=nofollow status=none 2>/dev/null | redact
+}
 
 # Why the job has failed, if it already has. Reported straight away, so the status
 # doesn't depend on step 4; the final report adds the PR, if there is one.
@@ -292,7 +372,10 @@ failure() {
   elif [ "$rc" -eq 137 ]; then
     echo "the agent was killed (exit 137, possibly out of memory)"
   elif [ "$rc" -ne 0 ]; then
-    echo "opencode exited with $rc"
+    # Claude Code's own reason, if it gave one (already redacted).
+    local why=""
+    [ "$AGENT" = claude-code ] && why=$(agent_out | jq -Rr 'try (fromjson | select(.type == "result" and .is_error) | .result // empty) catch empty' 2>/dev/null | tail -n 1 | cut -c1-200)
+    echo "$AGENT exited with $rc${why:+: $why}"
   fi
 }
 reason=$(failure)
@@ -301,8 +384,15 @@ reason=$(failure)
 # -- 4. collect outputs --------------------------------------------------------
 
 # Each step is bounded, so a hung tool can't use up the time left for reporting.
-session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
-[ -n "$session" ] && within 20 opencode export "$session" 2>/dev/null | redact >"$OUT/session.json"
+if [ "$AGENT" = claude-code ]; then
+  # Claude Code's stream of events is its session record: redacted as it's recorded,
+  # and again as it's copied (see agent_out).
+  agent_out >"$OUT/session.jsonl"
+  [ -s "$OUT/session.jsonl" ] || rm -f "$OUT/session.jsonl"
+else
+  session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
+  [ -n "$session" ] && within 20 opencode export "$session" 2>/dev/null | redact >"$OUT/session.json"
+fi
 
 pr="" diff_note="" pr_lookup_failed=""
 if [ -n "$REPO" ]; then
@@ -338,7 +428,7 @@ elif [ -z "$REPO" ]; then
   results=0
   for f in "$OUT"/*; do
     is_output "$f" || continue
-    case ${f##*/} in transcript.txt|session.json) ;; *) results=$((results + 1)) ;; esac
+    case ${f##*/} in transcript.txt|session.json|session.jsonl) ;; *) results=$((results + 1)) ;; esac
   done
   if [ "$results" -gt 0 ]; then
     finish succeeded "done"

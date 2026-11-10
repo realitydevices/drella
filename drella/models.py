@@ -62,7 +62,7 @@ class Job(Base):
     # [27], so later changes to the model don't rewrite the job's history.
     model: Mapped[str] = mapped_column(String(200))  # the alias
     interface: Mapped[str] = mapped_column(String(32))
-    base_url: Mapped[str] = mapped_column(String(500))
+    base_url: Mapped[str | None] = mapped_column(String(500))  # None for claude-code
     model_id: Mapped[str] = mapped_column(String(200))
     credential: Mapped[str | None] = mapped_column(String(200))  # name, not the key
     context_length: Mapped[int | None]
@@ -93,7 +93,7 @@ class Model(Base):
     owner_token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"))
     alias: Mapped[str] = mapped_column(String(63))
     interface: Mapped[str] = mapped_column(String(32))
-    base_url: Mapped[str] = mapped_column(String(500))
+    base_url: Mapped[str | None] = mapped_column(String(500))  # None for claude-code
     model_id: Mapped[str] = mapped_column(String(200))
     # Name of the caller's credential holding the API key, if the model needs one.
     credential: Mapped[str | None] = mapped_column(String(63))

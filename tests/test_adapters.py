@@ -1,4 +1,6 @@
-from drella.adapters import Interface, ModelSpec, opencode_config, preflight
+import pytest
+
+from drella.adapters import Agent, Interface, ModelSpec, agent, opencode_config, preflight
 
 LOCAL = ModelSpec("local", Interface.OPENAI_COMPATIBLE, "http://ollama:11434/v1", "some-model")
 
@@ -50,3 +52,21 @@ def test_limits_are_passed_only_as_a_pair():
     # invent one.
     m = ModelSpec("local", Interface.OPENAI_COMPATIBLE, "http://x/v1", "m", context_length=65536)
     assert "limit" not in opencode_config(m)["provider"]["drella"]["models"]["m"]
+
+
+# -- claude-code [28] -----------------------------------------------------------
+
+CC = ModelSpec("cc", Interface.CLAUDE_CODE, None, "sonnet", has_key=True)
+
+
+def test_the_agent_comes_from_the_interface():
+    assert agent(CC) == Agent.CLAUDE_CODE
+    assert agent(LOCAL) == Agent.OPENCODE
+    anthropic = ModelSpec("a", Interface.ANTHROPIC, "https://api.anthropic.com/v1", "x")
+    assert agent(anthropic) == Agent.OPENCODE
+
+
+def test_claude_code_has_no_opencode_config_or_preflight():
+    assert preflight(CC) is None
+    with pytest.raises(ValueError):
+        opencode_config(CC)
