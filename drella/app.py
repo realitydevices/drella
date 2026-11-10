@@ -87,6 +87,13 @@ class JobIn(BaseModel):
     )
     model: str = Field(pattern=NAME_RE, description="A registered model alias (PUT /models)")
 
+    @field_validator("prompt")
+    @classmethod
+    def _no_null(cls, v):
+        if "\x00" in v:
+            raise ValueError("prompt must not contain NUL characters")
+        return v
+
 
 def check_model_credential(name: str | None) -> None:
     """A model's key can't be the GitHub credential: a model row would otherwise send
@@ -111,6 +118,13 @@ class ModelIn(BaseModel):
     cost_in_per_mtok: Decimal | None = Field(default=None, ge=0, le=MAX_COST, decimal_places=4)
     cost_out_per_mtok: Decimal | None = Field(default=None, ge=0, le=MAX_COST, decimal_places=4)
     notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("notes")
+    @classmethod
+    def _no_null(cls, v):
+        if v is not None and "\x00" in v:
+            raise ValueError("notes must not contain NUL characters")
+        return v
 
     @field_validator("base_url", mode="before")
     @classmethod
