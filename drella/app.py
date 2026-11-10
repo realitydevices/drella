@@ -657,6 +657,10 @@ def put_model(
     fields["interface"] = body.interface.value
     m = own_model(alias, c, db)
     if m is None:
+        # Lock the caller's token row to serialise concurrent creates by the same token.
+        # On Postgres this prevents two PUTs at 199 both passing the check; on SQLite
+        # FOR UPDATE is ignored (SQLite allows only one writer at a time).
+        db.execute(select(Token).where(Token.id == c.token.id).with_for_update())
         count = db.scalar(
             select(func.count()).select_from(Model).where(Model.owner_token_id == c.token.id)
         )
