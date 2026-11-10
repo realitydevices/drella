@@ -74,6 +74,18 @@ class CredentialIn(BaseModel):
             raise ValueError("the credential is empty")
         return v
 
+    @field_validator("value")
+    @classmethod
+    def _no_null(cls, v):
+        _no_null(v)
+        return v
+
+
+def _no_null(v: str) -> str:
+    if "\x00" in v:
+        raise ValueError("value must not contain NUL characters")
+    return v
+
 
 class JobIn(BaseModel):
     # Unknown fields are an error, so an old client still sending `endpoint` is told.
@@ -90,9 +102,7 @@ class JobIn(BaseModel):
     @field_validator("prompt")
     @classmethod
     def _no_null(cls, v):
-        if "\x00" in v:
-            raise ValueError("prompt must not contain NUL characters")
-        return v
+        return _no_null(v)
 
 
 def check_model_credential(name: str | None) -> None:
@@ -122,8 +132,8 @@ class ModelIn(BaseModel):
     @field_validator("notes")
     @classmethod
     def _no_null(cls, v):
-        if v is not None and "\x00" in v:
-            raise ValueError("notes must not contain NUL characters")
+        if v is not None:
+            _no_null(v)
         return v
 
     @field_validator("base_url", mode="before")
@@ -194,6 +204,13 @@ class JobOut(BaseModel):
 class StatusIn(BaseModel):
     status: Literal["succeeded", "failed"]
     message: str | None = None
+
+    @field_validator("message")
+    @classmethod
+    def _no_null(cls, v):
+        if v is not None:
+            _no_null(v)
+        return v
 
 
 def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
