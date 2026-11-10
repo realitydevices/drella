@@ -14,8 +14,9 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from drella import crypto
@@ -35,6 +36,14 @@ OUTPUT_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 REPO_RE = r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
 MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 GITHUB_CREDENTIAL = "github"
+# Model rows end up in OpenCode's config, which substitutes {env:...} and {file:...}
+# anywhere in its raw text, so "{" and "}" are never allowed (docs/v0.2.md#security).
+# No whitespace or control characters either.
+BASE_URL_RE = r"^https?://[^\x00-\x20\x7f{}]+$"
+MODEL_ID_RE = r"^[^\x00-\x20\x7f{}]+$"
+# An API key is substituted into OpenCode's JSON config as raw text, so it can't hold
+# anything that would break the JSON (and print the config, key included, to the log).
+BAD_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f"\\]')
 
 
 # -- schemas -----------------------------------------------------------------
@@ -43,8 +52,21 @@ GITHUB_CREDENTIAL = "github"
 class CredentialIn(BaseModel):
     value: str = Field(min_length=1)
 
+    @field_validator("value")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        # A key read from a file usually ends with a newline. Surrounding whitespace
+        # is never part of a credential.
+        v = v.strip()
+        if not v:
+            raise ValueError("the credential is empty")
+        return v
+
 
 class JobIn(BaseModel):
+    # Unknown fields are an error, so an old client still sending `endpoint` is told.
+    model_config = ConfigDict(extra="forbid")
+
     prompt: str = Field(min_length=1)
     repo: str | None = Field(
         default=None,
@@ -54,23 +76,47 @@ class JobIn(BaseModel):
     model: str = Field(pattern=NAME_RE, description="A registered model alias (PUT /models)")
 
 
+def check_model_credential(name: str | None) -> None:
+    """A model's key can't be the GitHub credential: a model row would otherwise send
+    the caller's GitHub token to its base URL."""
+    if name == GITHUB_CREDENTIAL:
+        raise ValueError(f"'{GITHUB_CREDENTIAL}' is reserved; it can't be a model's API key")
+
+
 class ModelIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     interface: Interface
-    base_url: str = Field(pattern=r"^https?://", max_length=500)
-    model_id: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(pattern=BASE_URL_RE, max_length=500)
+    model_id: str = Field(pattern=MODEL_ID_RE, max_length=200)
     credential: str | None = Field(
         default=None,
         pattern=NAME_RE,
         description="Name of the caller's credential holding the API key, if needed",
     )
     context_length: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0)
     cost_in_per_mtok: Decimal | None = Field(default=None, ge=0)
     cost_out_per_mtok: Decimal | None = Field(default=None, ge=0)
-    notes: str | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("credential")
+    @classmethod
+    def _not_reserved(cls, v: str | None) -> str | None:
+        check_model_credential(v)
+        return v
+
+    @model_validator(mode="after")
+    def _https_for_keys(self):
+        # Never send a key in the clear.
+        if self.credential and not self.base_url.startswith("https://"):
+            raise ValueError("a model with a credential needs an https:// base_url")
+        return self
 
 
 class ModelOut(ModelIn):
     alias: str
+    owner: str  # the name of the token that created it; only it can change the model
     created_at: datetime
     updated_at: datetime
 
@@ -84,6 +130,7 @@ class JobModelOut(BaseModel):
     model_id: str
     credential: str | None
     context_length: int | None
+    max_output_tokens: int | None
     cost_in_per_mtok: Decimal | None
     cost_out_per_mtok: Decimal | None
 
@@ -119,6 +166,7 @@ def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
             model_id=job.model_id,
             credential=job.credential,
             context_length=job.context_length,
+            max_output_tokens=job.max_output_tokens,
             cost_in_per_mtok=job.cost_in_per_mtok,
             cost_out_per_mtok=job.cost_out_per_mtok,
         ),
@@ -301,10 +349,15 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     # Only a job with a repo needs git access.
     if body.repo and GITHUB_CREDENTIAL not in creds:
         raise HTTPException(422, f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential")
-    if model.credential and model.credential not in creds:
-        raise HTTPException(
-            422, f"model '{model.alias}' needs a '{model.credential}' credential (its API key)"
-        )
+    if model.credential:
+        try:
+            check_model_credential(model.credential)
+        except ValueError as e:
+            raise HTTPException(422, f"model '{model.alias}': {e}") from None
+        if model.credential not in creds:
+            raise HTTPException(
+                422, f"model '{model.alias}' needs a '{model.credential}' credential (its API key)"
+            )
     # The request carries the token, so this is when credentials are decrypted
     # [19]. They go straight into the job's Secret, never into the database. A job
     # gets only what it needs [10]: the GitHub credential for a repo job, and its
@@ -314,7 +367,15 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
 
     secrets = {GITHUB_CREDENTIAL: decrypt(GITHUB_CREDENTIAL)} if body.repo else {}
     if model.credential:
-        secrets[LLM_KEY_SECRET] = decrypt(model.credential)
+        key = decrypt(model.credential)
+        # Never echo the key, not even in an error.
+        if BAD_KEY_CHARS.search(key):
+            raise HTTPException(
+                422,
+                f"the '{model.credential}' credential can't be used as an API key: it contains"
+                " control characters, quotes or backslashes",
+            )
+        secrets[LLM_KEY_SECRET] = key
     job_token = crypto.new_token(crypto.JOB_TOKEN_PREFIX)
     secrets[JOB_TOKEN_KEY] = job_token
     job = Job(
@@ -328,6 +389,7 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         model_id=model.model_id,
         credential=model.credential,
         context_length=model.context_length,
+        max_output_tokens=model.max_output_tokens,
         cost_in_per_mtok=model.cost_in_per_mtok,
         cost_out_per_mtok=model.cost_out_per_mtok,
         job_token_hash=crypto.lookup_hash(job_token),
@@ -354,23 +416,33 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
 
 
 # -- models [27] ---------------------------------------------------------------
-# Global: any valid token can manage them until owners exist (O2).
+# Any token can list and use a model; only the token that created it can change or
+# delete it.
 
 
-def model_out(m: Model) -> ModelOut:
-    return ModelOut(
+def model_out(m: Model, db: Session) -> ModelOut:
+    owner = db.get(Token, m.owner_token_id)
+    return ModelOut.model_construct(
         alias=m.alias,
+        owner=owner.name if owner else "",
         interface=Interface(m.interface),
         base_url=m.base_url,
         model_id=m.model_id,
         credential=m.credential,
         context_length=m.context_length,
+        max_output_tokens=m.max_output_tokens,
         cost_in_per_mtok=m.cost_in_per_mtok,
         cost_out_per_mtok=m.cost_out_per_mtok,
         notes=m.notes,
         created_at=m.created_at,
         updated_at=m.updated_at,
     )
+
+
+def _owned(m: Model, c: Caller) -> Model:
+    if m.owner_token_id != c.token.id:
+        raise HTTPException(403, f"model '{m.alias}' belongs to another token")
+    return m
 
 
 @router.put("/models/{alias}")
@@ -382,19 +454,29 @@ def put_model(
     fields["base_url"] = body.base_url.rstrip("/")
     m = db.get(Model, alias)
     if m is None:
-        m = Model(alias=alias, **fields)
-        db.add(m)
-    else:
+        db.add(Model(alias=alias, owner_token_id=c.token.id, **fields))
+        try:
+            db.commit()
+        except IntegrityError:
+            # Another request created it first: this becomes an update of that row
+            # (if the caller owns it).
+            db.rollback()
+            m = db.get(Model, alias)
+            if m is None:
+                raise
+    if m is not None:
+        _owned(m, c)
         for k, v in fields.items():
             setattr(m, k, v)
-    db.commit()
+        db.commit()
+    m = db.get(Model, alias)
     db.refresh(m)
-    return model_out(m)
+    return model_out(m, db)
 
 
 @router.get("/models")
 def list_models(c: CallerDep, db: DbDep) -> list[ModelOut]:
-    return [model_out(m) for m in db.scalars(select(Model).order_by(Model.alias))]
+    return [model_out(m, db) for m in db.scalars(select(Model).order_by(Model.alias))]
 
 
 @router.get("/models/{alias}")
@@ -402,7 +484,7 @@ def get_model(alias: str, c: CallerDep, db: DbDep) -> ModelOut:
     m = db.get(Model, alias)
     if m is None:
         raise HTTPException(404, "model not found")
-    return model_out(m)
+    return model_out(m, db)
 
 
 @router.delete("/models/{alias}", status_code=204)
@@ -410,7 +492,7 @@ def delete_model(alias: str, c: CallerDep, db: DbDep) -> Response:
     m = db.get(Model, alias)
     if m is None:
         raise HTTPException(404, "model not found")
-    db.delete(m)
+    db.delete(_owned(m, c))
     db.commit()
     return Response(status_code=204)
 

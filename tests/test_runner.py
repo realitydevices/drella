@@ -79,7 +79,11 @@ def test_launch_creates_job_with_limits_and_hands_it_the_secret(k8s):
     # No key for this model, so none is mapped in.
     assert "DRELLA_LLM_KEY" not in env
     assert env["DRELLA_JOB_TOKEN"]["valueFrom"]["secretKeyRef"] == {"name": NAME, "key": JOB_TOKEN_KEY}
-    assert {"name": "creds", "secret": {"secretName": NAME}} in pod_spec["volumes"]
+    # Only the GitHub credential is a file; the job token and model key are env vars.
+    assert {
+        "name": "creds",
+        "secret": {"secretName": NAME, "items": [{"key": "github", "path": "github"}]},
+    } in pod_spec["volumes"]
 
     # The Secret is owned by the Job, so it's deleted with it.
     name, ns, patch = core.patch_namespaced_secret.call_args.args
@@ -163,6 +167,9 @@ def test_launch_without_repo_omits_drella_repo(k8s):
     _, job = batch.create_namespaced_job.call_args.args
     (c,) = job["spec"]["template"]["spec"]["containers"]
     assert "DRELLA_REPO" not in {e["name"] for e in c["env"]}
+    # No repo, so no GitHub credential and nothing mounted at /creds.
+    assert "creds" not in {v["name"] for v in job["spec"]["template"]["spec"]["volumes"]}
+    assert "/creds" not in {m["mountPath"] for m in c["volumeMounts"]}
 
 
 def test_launch_adopts_a_job_that_already_exists(k8s):

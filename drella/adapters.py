@@ -8,6 +8,10 @@ is just a row in the models table.
 The API key never appears in what's rendered here. OpenCode's config refers to it as
 {env:DRELLA_LLM_KEY}, and preflight headers as {key}; the wrapper fills both in from the
 environment.
+
+OpenCode substitutes {env:...} and {file:...} anywhere in its config's raw text, so
+nothing from a model row may contain "{" or "}" (the API rejects them), or a model row
+could read the pod's environment or files.
 """
 
 from dataclasses import dataclass
@@ -37,6 +41,7 @@ class ModelSpec:
     model_id: str
     has_key: bool = False
     context_length: int | None = None
+    max_output_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -58,8 +63,10 @@ def opencode_config(m: ModelSpec) -> dict:
     if m.has_key:
         options["apiKey"] = "{env:%s}" % LLM_KEY_ENV
     model: dict = {"name": m.model_id}
-    if m.context_length:
-        model["limit"] = {"context": m.context_length, "output": min(m.context_length // 4, 32768)}
+    # OpenCode takes a model's limits only as a pair (it rejects a context limit with
+    # no output limit), so they're passed only when both are known.
+    if m.context_length and m.max_output_tokens:
+        model["limit"] = {"context": m.context_length, "output": m.max_output_tokens}
     return {
         "$schema": "https://opencode.ai/config.json",
         "provider": {

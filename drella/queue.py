@@ -20,8 +20,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job
 from drella.adapters import Interface, ModelSpec
+from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState
 from drella.storage import CHUNK, NotFound, Storage
 
@@ -74,6 +74,7 @@ def model_spec(job: Job) -> ModelSpec:
         model_id=job.model_id,
         has_key=job.credential is not None,
         context_length=job.context_length,
+        max_output_tokens=job.max_output_tokens,
     )
 
 

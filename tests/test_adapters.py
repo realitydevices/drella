@@ -14,15 +14,15 @@ def test_openai_compatible_without_a_key():
     assert p.url == "http://ollama:11434/v1/models" and p.headers == ()
 
 
-def test_openai_compatible_with_a_key_and_context_length():
+def test_openai_compatible_with_a_key_and_limits():
     m = ModelSpec(
         "hosted", Interface.OPENAI_COMPATIBLE, "https://example.com/api/v1/", "org/model",
-        has_key=True, context_length=65536,
+        has_key=True, context_length=65536, max_output_tokens=8192,
     )
     provider = opencode_config(m)["provider"]["drella"]
     # The key is referenced, never embedded.
     assert provider["options"]["apiKey"] == "{env:DRELLA_LLM_KEY}"
-    assert provider["models"]["org/model"]["limit"] == {"context": 65536, "output": 16384}
+    assert provider["models"]["org/model"]["limit"] == {"context": 65536, "output": 8192}
     p = preflight(m)
     assert p.url == "https://example.com/api/v1/models"
     assert p.headers == ("Authorization: Bearer {key}",)
@@ -43,3 +43,10 @@ def test_anthropic():
     p = preflight(m)
     assert p.url == "https://api.anthropic.com/v1/models"
     assert p.headers == ("x-api-key: {key}", "anthropic-version: 2023-06-01")
+
+
+def test_limits_are_passed_only_as_a_pair():
+    # OpenCode rejects a context limit without an output limit, and Drella doesn't
+    # invent one.
+    m = ModelSpec("local", Interface.OPENAI_COMPATIBLE, "http://x/v1", "m", context_length=65536)
+    assert "limit" not in opencode_config(m)["provider"]["drella"]["models"]["m"]

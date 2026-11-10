@@ -9,7 +9,6 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
-
 from drella import adapters
 from drella.adapters import ModelSpec
 from drella.config import Settings
@@ -210,15 +209,15 @@ class KubernetesRunner:
                                         "ephemeral-storage": s.job_disk,
                                     },
                                 },
-                                "volumeMounts": [
-                                    {"name": "creds", "mountPath": "/creds", "readOnly": True},
+                                "volumeMounts": self._creds_mount(spec)
+                                + [
                                     {"name": "out", "mountPath": "/out"},
                                     {"name": "work", "mountPath": "/work"},
                                 ],
                             }
                         ],
-                        "volumes": [
-                            {"name": "creds", "secret": {"secretName": name}},
+                        "volumes": self._creds_volume(name, spec)
+                        + [
                             {"name": "out", "emptyDir": {"sizeLimit": "1Gi"}},
                             {"name": "work", "emptyDir": {"sizeLimit": s.job_disk}},
                         ],
@@ -226,6 +225,25 @@ class KubernetesRunner:
                 },
             },
         }
+
+    # Only the GitHub credential is a file (/creds/github), and only for a repo job.
+    # The job token and the model's key reach the pod as env vars, not files.
+    @staticmethod
+    def _creds_mount(spec: JobSpec) -> list[dict]:
+        if not spec.repo:
+            return []
+        return [{"name": "creds", "mountPath": "/creds", "readOnly": True}]
+
+    @staticmethod
+    def _creds_volume(name: str, spec: JobSpec) -> list[dict]:
+        if not spec.repo:
+            return []
+        return [
+            {
+                "name": "creds",
+                "secret": {"secretName": name, "items": [{"key": "github", "path": "github"}]},
+            }
+        ]
 
     @staticmethod
     def _secret_env(name: str, spec: JobSpec) -> list[dict]:

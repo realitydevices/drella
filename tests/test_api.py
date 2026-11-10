@@ -406,8 +406,25 @@ def test_models_api(client, auth):
 
 @pytest.mark.parametrize(
     "bad",
-    [{"interface": "carrier-pigeon"}, {"base_url": "ftp://x"}, {"model_id": ""},
-     {"credential": "_llm-key"}, {"context_length": 0}, {"cost_in_per_mtok": "-1"}],
+    [
+        {"interface": "carrier-pigeon"}, {"base_url": "ftp://x"}, {"model_id": ""},
+        {"credential": "_llm-key"}, {"context_length": 0}, {"cost_in_per_mtok": "-1"},
+        {"max_output_tokens": 0}, {"notes": "x" * 2001},
+        # A model's key can't be the GitHub credential.
+        {"credential": "github"},
+        # A key is never sent in the clear.
+        {"base_url": "http://api.example.com/v1"},
+        # OpenCode substitutes {env:...} and {file:...} in its config, so a model row
+        # could read the pod's secrets.
+        {"base_url": "https://evil.example/{env:GH_TOKEN}/v1"},
+        {"base_url": "https://evil.example/{file:/creds/github}"},
+        {"model_id": "m{env:GH_TOKEN}"},
+        # No whitespace or control characters.
+        {"base_url": "https://api.example.com/v1\nx"}, {"base_url": "https://a b/v1"},
+        {"model_id": "a b"},
+        # Unknown fields.
+        {"endpoint": "http://x"},
+    ],
 )
 def test_models_are_validated(client, auth, bad):
     assert client.put("/models/claude", json=CLAUDE | bad, headers=auth).status_code == 422
@@ -465,3 +482,87 @@ def test_a_job_keeps_its_model_snapshot(client, auth, runner, queue):
     assert (spec.model.model_id, spec.model.interface, spec.model.has_key) == (
         "claude-x", "anthropic", True
     )
+
+
+def test_only_the_owner_can_change_or_delete_a_model(client, auth, settings):
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    other = {"Authorization": f"Bearer {create_token(settings, 'mallory')}"}
+    # Mallory can see and use it...
+    assert client.get("/models/claude", headers=other).json()["owner"] == "alice"
+    # ...but can't repoint it (e.g. at her own URL) or delete it.
+    evil = CLAUDE | {"base_url": "https://evil.example/v1"}
+    assert client.put("/models/claude", json=evil, headers=other).status_code == 403
+    assert client.delete("/models/claude", headers=other).status_code == 403
+    assert client.get("/models/claude", headers=auth).json()["base_url"] == "https://api.anthropic.com/v1"
+    # Her own new alias is hers.
+    r = client.put("/models/mine", json=LOCAL, headers=other)
+    assert r.status_code == 200 and r.json()["owner"] == "mallory"
+
+
+def test_a_job_refuses_a_model_that_names_the_github_credential(client, auth, runner):
+    # Rows can't be created like this through the API; this covers rows that are.
+    from drella.models import Model
+
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    with client.app.state.deps.sessions() as s:
+        s.get(Model, "claude").credential = "github"
+        s.commit()
+    client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
+    r = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth)
+    assert r.status_code == 422 and "reserved" in r.json()["detail"]
+    assert runner.secrets == {}
+
+
+def test_credentials_are_stripped(client, auth, runner):
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    client.put("/credentials/anthropic-key", json={"value": "  sk-x\n"}, headers=auth)
+    job = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth).json()
+    assert runner.secrets[job["id"]]["_llm-key"] == "sk-x"
+    assert client.put("/credentials/empty", json={"value": " \n"}, headers=auth).status_code == 422
+
+
+@pytest.mark.parametrize("key", ['sk-a"b', "sk-a\\b", "sk-a\nb", "sk-a\tb", "sk-a\x7fb"])
+def test_a_model_key_that_would_break_the_config_is_rejected_without_echoing_it(
+    client, auth, runner, key
+):
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    client.put("/credentials/anthropic-key", json={"value": key}, headers=auth)
+    r = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth)
+    assert r.status_code == 422
+    assert "anthropic-key" in r.json()["detail"] and key.strip() not in r.text
+    assert runner.secrets == {}
+
+
+def test_jobs_reject_unknown_fields(client, auth):
+    r = client.post(
+        "/jobs", json={"prompt": "x", "model": "local", "endpoint": "http://x"}, headers=auth
+    )
+    assert r.status_code == 422 and "endpoint" in r.text
+
+
+def test_put_model_race_on_a_new_alias(client, auth, monkeypatch):
+    # Another request creates the alias between our read and our insert.
+    from sqlalchemy.orm import Session
+
+    from drella.models import Model, Token
+
+    deps = client.app.state.deps
+    real_get = Session.get
+    raced = {"done": False}
+
+    def get(self, cls, key, *a, **kw):
+        row = real_get(self, cls, key, *a, **kw)
+        if cls is Model and key == "racy" and not raced["done"]:
+            raced["done"] = True
+            with deps.sessions() as other:
+                owner = other.scalars(__import__("sqlalchemy").select(Token)).first()
+                other.add(Model(alias="racy", owner_token_id=owner.id, interface="openai-compatible",
+                                base_url="http://x/v1", model_id="first"))
+                other.commit()
+            return None
+        return row
+
+    monkeypatch.setattr(Session, "get", get)
+    r = client.put("/models/racy", json=LOCAL, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["model_id"] == "some-model"

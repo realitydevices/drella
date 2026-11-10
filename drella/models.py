@@ -66,6 +66,7 @@ class Job(Base):
     model_id: Mapped[str] = mapped_column(String(200))
     credential: Mapped[str | None] = mapped_column(String(200))  # name, not the key
     context_length: Mapped[int | None]
+    max_output_tokens: Mapped[int | None]
     cost_in_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     cost_out_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     status: Mapped[str] = mapped_column(String(16), default=QUEUED, index=True)
@@ -81,19 +82,22 @@ class Job(Base):
 
 
 class Model(Base):
-    """A model jobs can use, by alias [27]. Global until owners exist (O2)."""
+    """A model jobs can use, by alias [27]. Any token can use it; only the token that
+    created it can change or delete it."""
 
     __tablename__ = "models"
 
     alias: Mapped[str] = mapped_column(String(63), primary_key=True)
+    owner_token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"))
     interface: Mapped[str] = mapped_column(String(32))
     base_url: Mapped[str] = mapped_column(String(500))
     model_id: Mapped[str] = mapped_column(String(200))
     # Name of the caller's credential holding the API key, if the model needs one.
     credential: Mapped[str | None] = mapped_column(String(63))
     context_length: Mapped[int | None]
+    max_output_tokens: Mapped[int | None]
     cost_in_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     cost_out_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
-    notes: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(String(2000))
     created_at: Mapped[datetime] = mapped_column(default=_now)
     updated_at: Mapped[datetime] = mapped_column(default=_now, onupdate=_now)
