@@ -65,6 +65,32 @@ api() {
     --retry-connrefused -m 120 -H "Authorization: Bearer $DRELLA_JOB_TOKEN" "$@"
 }
 
+# Replace the job's secrets (the model's API key and the GitHub token) with
+# [redacted] in a stream, line by line. The agent can read both from its environment;
+# this keeps them out of the transcript, the session record and the archived log if it
+# prints them. Best effort: a secret split across lines, or encoded, gets through.
+# Values come from ENVIRON and are matched as fixed strings, so any character is safe.
+redact() {
+  awk 'BEGIN {
+      n = 0
+      if (length(ENVIRON["DRELLA_LLM_KEY"]) >= 8) k[++n] = ENVIRON["DRELLA_LLM_KEY"]
+      if (length(ENVIRON["GH_TOKEN"]) >= 8) k[++n] = ENVIRON["GH_TOKEN"]
+    }
+    {
+      line = $0
+      for (i = 1; i <= n; i++) {
+        out = ""
+        while ((p = index(line, k[i])) > 0) {
+          out = out substr(line, 1, p - 1) "[redacted]"
+          line = substr(line, p + length(k[i]))
+        }
+        line = out line
+      }
+      print line
+      fflush()
+    }'
+}
+
 upload_outputs() {
   local f
   # Most useful first, in case time runs out.
@@ -156,7 +182,8 @@ fi
 headers="$WORK/preflight-headers"
 (umask 077; : >"$headers")
 while IFS= read -r h; do
-  [ -n "$h" ] && printf '%s\n' "${h//'{key}'/${DRELLA_LLM_KEY:-}}" >>"$headers"
+  # The replacement is quoted, so "&" in a key isn't expanded (bash 5.2 patsub).
+  [ -n "$h" ] && printf '%s\n' "${h//'{key}'/"${DRELLA_LLM_KEY:-}"}" >>"$headers"
 done <<<"${DRELLA_PREFLIGHT_HEADERS:-}"
 code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H @"$headers" "$DRELLA_PREFLIGHT_URL")
 rm -f "$headers"
@@ -217,7 +244,7 @@ agent_started=$(date +%s)
   echo $! >"$WORK/agent.pid"
   wait $!
   echo $? >"$WORK/agent.rc"
-} 2>&1 | tee "$OUT/transcript.txt" &
+} 2>&1 | redact | tee "$OUT/transcript.txt" &
 pipe_pid=$!
 for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
 agent_pid=$(cat "$WORK/agent.pid" 2>/dev/null)
@@ -252,7 +279,7 @@ reason=$(failure)
 
 # Each step is bounded, so a hung tool can't use up the time left for reporting.
 session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
-[ -n "$session" ] && within 20 opencode export "$session" >"$OUT/session.json" 2>/dev/null
+[ -n "$session" ] && within 20 opencode export "$session" 2>/dev/null | redact >"$OUT/session.json"
 
 pr="" diff_note="" pr_lookup_failed=""
 if [ -n "$REPO" ]; then
