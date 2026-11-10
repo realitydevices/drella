@@ -678,3 +678,44 @@ def test_model_keys_are_stripped_when_read(client, auth, runner):
         s.commit()
     job = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth).json()
     assert runner.secrets[job["id"]]["_llm-key"] == "sk-old"
+
+
+# -- claude-code [28] -----------------------------------------------------------
+
+CLAUDE_CODE = {"interface": "claude-code", "model_id": "sonnet", "credential": "claude-oauth"}
+
+
+def test_claude_code_models_have_no_base_url_and_need_a_credential(client, auth):
+    assert client.put("/models/cc", json=CLAUDE_CODE, headers=auth).status_code == 200
+    got = client.get("/models/cc", headers=auth).json()
+    assert got["base_url"] is None and got["interface"] == "claude-code"
+    bad = [
+        {**CLAUDE_CODE, "base_url": "https://api.anthropic.com/v1"},  # not used: refused
+        {k: v for k, v in CLAUDE_CODE.items() if k != "credential"},  # needs the token
+        {**CLAUDE_CODE, "credential": "github"},  # never the GitHub token
+    ]
+    for body in bad:
+        assert client.put("/models/cc2", json=body, headers=auth).status_code == 422, body
+    # Every other interface still needs a base_url.
+    no_url = {"interface": "anthropic", "model_id": "x", "credential": "k"}
+    assert client.put("/models/a", json=no_url, headers=auth).status_code == 422
+
+
+def test_claude_code_job_gets_the_oauth_token_and_github_only(client, auth, runner):
+    client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
+    client.put("/credentials/claude-oauth", json={"value": "sk-ant-oat01-x\n"}, headers=auth)
+    client.put("/credentials/other", json={"value": "nope"}, headers=auth)
+    client.put("/models/cc", json=CLAUDE_CODE, headers=auth)
+    r = client.post("/jobs", json={**JOB, "model": "cc"}, headers=auth)
+    assert r.status_code == 201, r.text
+    job = r.json()
+    assert job["model"]["interface"] == "claude-code" and job["model"]["base_url"] is None
+    secret = runner.secrets[job["id"]]
+    assert set(secret) == {"github", "_llm-key", JOB_TOKEN_KEY}
+    assert secret["_llm-key"] == "sk-ant-oat01-x"
+
+
+def test_claude_code_job_needs_its_token(client, auth):
+    client.put("/models/cc", json=CLAUDE_CODE, headers=auth)
+    r = client.post("/jobs", json={**JOB, "repo": None, "model": "cc"}, headers=auth)
+    assert r.status_code == 422 and "claude-oauth" in r.json()["detail"]
