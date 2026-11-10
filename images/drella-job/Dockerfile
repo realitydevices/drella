@@ -28,8 +28,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /usr/local/bin/uv
 # Python 3.13, installed into a shared directory so all users can use it
 ENV UV_PYTHON_INSTALL_DIR=/usr/share/python
 RUN uv python install 3.13 \
- && PYTHONDIR=$(find /usr/share/python -mindepth 1 -maxdepth 1 -type d -name '3.13-*' | head -1) \
- && ln -sf "$PYTHONDIR/python3" /usr/local/bin/python3 \
+ && ln -sf "$(uv python find 3.13)" /usr/local/bin/python3 \
  && ln -sf /usr/local/bin/python3 /usr/local/bin/python
 
 # OpenCode, from the same release artifacts its install script uses
@@ -63,7 +62,7 @@ COPY drella-job /usr/local/bin/drella-job
 
 RUN useradd --uid 1000 --create-home drella && mkdir -p /work /out && chown drella /work /out \
  && mkdir -p /home/drella/.cache/uv /home/drella/.local/share/uv \
- && chown -R drella /home/drella/.cache/uv /home/drella/.local/share/uv
+ && chown -R drella:drella /home/drella/.cache /home/drella/.local
 USER 1000
 WORKDIR /work
 ENV UV_CACHE_DIR=/home/drella/.cache/uv
