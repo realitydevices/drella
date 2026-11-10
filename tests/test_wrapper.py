@@ -28,3 +28,7 @@ def test_git_sends_the_github_token_only_to_github():
 def test_agent_output_is_never_read_through_a_symlink():
     assert "iflag=nofollow" in WRAPPER
     assert 'cp "$WORK/agent.out"' not in WRAPPER
+
+
+def test_wrapper_turns_on_auto_merge_on_success():
+    assert 'gh pr merge "$pr" --auto --squash' in WRAPPER
