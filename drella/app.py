@@ -74,6 +74,18 @@ class CredentialIn(BaseModel):
             raise ValueError("the credential is empty")
         return v
 
+    @field_validator("value")
+    @classmethod
+    def _no_null(cls, v):
+        _no_null(v)
+        return v
+
+
+def _no_null(v: str) -> str:
+    if "\x00" in v:
+        raise ValueError("value must not contain NUL characters")
+    return v
+
 
 class JobIn(BaseModel):
     # Unknown fields are an error, so an old client still sending `endpoint` is told.
@@ -86,6 +98,11 @@ class JobIn(BaseModel):
         description="GitHub repo as owner/name. Leave it out for a job with no repo (no PR).",
     )
     model: str = Field(pattern=NAME_RE, description="A registered model alias (PUT /models)")
+
+    @field_validator("prompt")
+    @classmethod
+    def _no_null(cls, v):
+        return _no_null(v)
 
 
 def check_model_credential(name: str | None) -> None:
@@ -112,6 +129,13 @@ class ModelIn(BaseModel):
     cost_in_per_mtok: Decimal | None = Field(default=None, ge=0, le=MAX_COST, decimal_places=4)
     cost_out_per_mtok: Decimal | None = Field(default=None, ge=0, le=MAX_COST, decimal_places=4)
     notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("notes")
+    @classmethod
+    def _no_null(cls, v):
+        if v is not None:
+            _no_null(v)
+        return v
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -192,6 +216,13 @@ class JobOut(BaseModel):
 class StatusIn(BaseModel):
     status: Literal["succeeded", "failed"]
     message: str | None = None
+
+    @field_validator("message")
+    @classmethod
+    def _no_null(cls, v):
+        if v is not None:
+            _no_null(v)
+        return v
 
 
 def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:

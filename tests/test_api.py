@@ -651,6 +651,34 @@ def test_listing_models_survives_a_row_that_predates_a_rule(client, auth):
     assert {m["alias"]: m["base_url"] for m in r.json()}["claude"] == "https:"
 
 
+@pytest.mark.parametrize("value", [
+    "hello\x00world",
+    "line1\n\x00\nline3",
+])
+def test_jobs_reject_null_in_prompt(client, auth, runner, value):
+    r = client.post("/jobs", json={"prompt": value, "model": "local"}, headers=auth)
+    assert r.status_code == 422
+    assert "NUL" in r.text
+    assert runner.secrets == {}
+
+
+@pytest.mark.parametrize("notes", ["no\x00null", "x\x00"])
+def test_models_reject_null_in_notes(client, auth, notes):
+    r = client.put("/models/with-null", json=LOCAL | {"notes": notes}, headers=auth)
+    assert r.status_code == 422
+    assert "NUL" in r.text
+
+
+@pytest.mark.parametrize("message", ["ok\x00", "sta\x00ted"])
+def test_status_reject_null_in_message(client, auth, runner, queue, message):
+    job = client.post("/jobs", json={"prompt": "test", "model": "local"}, headers=auth).json()
+    queue.tick()
+    ja = job_auth(runner, job["id"])
+    r = client.post(f"/jobs/{job['id']}/status", json={"status": "succeeded", "message": message}, headers=ja)
+    assert r.status_code == 422
+    assert "NUL" in r.text
+
+
 def test_credentials_must_be_valid_text(client, auth):
     # A lone surrogate, as JSON allows it; it can't be encrypted or used as text.
     body = '{"value": "\\ud800abc"}'
