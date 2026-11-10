@@ -27,8 +27,9 @@ here, the plan is for Drella to build itself from these docs. To try it, start w
 - **Access:** token-based HTTP API, a web UI, and an MCP server so other agents
   (Claude, Hermes, …) can hand out work and check on it.
 - **Credentials:** stored encrypted, per token.
-- **Models:** any LLM endpoint: local (Ollama) or hosted (Claude). v0 supports
-  endpoints that need no API key, such as Ollama.
+- **Models:** any LLM endpoint: local (Ollama) or hosted (e.g. Anthropic, or any
+  OpenAI-compatible API), registered once and named by alias. API keys are stored
+  like any other credential.
 - **Runs on:** Kubernetes (k3s is fine), Postgres, and object storage (in v0, a
   volume on the cluster).
 

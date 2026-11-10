@@ -1,5 +1,6 @@
 """The job launcher [18]. Kubernetes is the only implementation."""
 
+import json
 import logging
 import time
 from collections.abc import Iterator
@@ -8,6 +9,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
+from drella import adapters
+from drella.adapters import ModelSpec
 from drella.config import Settings
 
 log = logging.getLogger(__name__)
@@ -20,8 +23,7 @@ JOB_TOKEN_KEY = "_job-token"
 class JobSpec:
     job_id: str
     repo: str | None
-    model: str
-    endpoint: str
+    model: ModelSpec
     prompt: str
 
 
@@ -146,10 +148,16 @@ class KubernetesRunner:
         env = {
             "DRELLA_API_URL": s.api_url,
             "DRELLA_JOB_ID": spec.job_id,
-            "DRELLA_MODEL": spec.model,
-            "DRELLA_ENDPOINT": spec.endpoint,
             "DRELLA_PROMPT": spec.prompt,
         }
+        # The job's model, rendered by its adapter [27]. The wrapper has no
+        # provider-specific code: it writes the config and runs the check.
+        m = spec.model
+        check = adapters.preflight(m)
+        env["DRELLA_MODEL_LABEL"] = f"{m.alias} ({m.model_id} at {m.base_url})"
+        env["DRELLA_OPENCODE_CONFIG"] = json.dumps(adapters.opencode_config(m))
+        env["DRELLA_PREFLIGHT_URL"] = check.url
+        env["DRELLA_PREFLIGHT_HEADERS"] = "\n".join(check.headers)
         if spec.repo:
             env["DRELLA_REPO"] = spec.repo
         # The soft limit: the wrapper stops the agent this long before the hard limit
@@ -185,14 +193,7 @@ class KubernetesRunner:
                                 "name": "job",
                                 "image": s.job_image,
                                 "env": [{"name": k, "value": v} for k, v in env.items()]
-                                + [
-                                    {
-                                        "name": "DRELLA_JOB_TOKEN",
-                                        "valueFrom": {
-                                            "secretKeyRef": {"name": name, "key": JOB_TOKEN_KEY}
-                                        },
-                                    }
-                                ],
+                                + self._secret_env(name, spec),
                                 "securityContext": {
                                     "allowPrivilegeEscalation": False,
                                     "capabilities": {"drop": ["ALL"]},
@@ -208,15 +209,15 @@ class KubernetesRunner:
                                         "ephemeral-storage": s.job_disk,
                                     },
                                 },
-                                "volumeMounts": [
-                                    {"name": "creds", "mountPath": "/creds", "readOnly": True},
+                                "volumeMounts": self._creds_mount(spec)
+                                + [
                                     {"name": "out", "mountPath": "/out"},
                                     {"name": "work", "mountPath": "/work"},
                                 ],
                             }
                         ],
-                        "volumes": [
-                            {"name": "creds", "secret": {"secretName": name}},
+                        "volumes": self._creds_volume(name, spec)
+                        + [
                             {"name": "out", "emptyDir": {"sizeLimit": "1Gi"}},
                             {"name": "work", "emptyDir": {"sizeLimit": s.job_disk}},
                         ],
@@ -224,6 +225,36 @@ class KubernetesRunner:
                 },
             },
         }
+
+    # Only the GitHub credential is a file (/creds/github), and only for a repo job.
+    # The job token and the model's key reach the pod as env vars, not files.
+    @staticmethod
+    def _creds_mount(spec: JobSpec) -> list[dict]:
+        if not spec.repo:
+            return []
+        return [{"name": "creds", "mountPath": "/creds", "readOnly": True}]
+
+    @staticmethod
+    def _creds_volume(name: str, spec: JobSpec) -> list[dict]:
+        if not spec.repo:
+            return []
+        return [
+            {
+                "name": "creds",
+                "secret": {"secretName": name, "items": [{"key": "github", "path": "github"}]},
+            }
+        ]
+
+    @staticmethod
+    def _secret_env(name: str, spec: JobSpec) -> list[dict]:
+        """Env vars from the job's Secret: its token, and its model's key if any."""
+        pairs = [("DRELLA_JOB_TOKEN", JOB_TOKEN_KEY)]
+        if spec.model.has_key:
+            pairs.append((adapters.LLM_KEY_ENV, adapters.LLM_KEY_SECRET))
+        return [
+            {"name": env, "valueFrom": {"secretKeyRef": {"name": name, "key": key}}}
+            for env, key in pairs
+        ]
 
     # -- status / logs / cleanup ----------------------------------------------
 

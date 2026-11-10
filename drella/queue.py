@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from drella.adapters import Interface, ModelSpec
 from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState
 from drella.storage import CHUNK, NotFound, Storage
@@ -62,6 +63,19 @@ def archived_log(storage: Storage, job_id: str) -> Iterator[bytes]:
 
 def output_prefix(job_id: str) -> str:
     return f"jobs/{job_id}/outputs/"
+
+
+def model_spec(job: Job) -> ModelSpec:
+    """The job's model, from its snapshot."""
+    return ModelSpec(
+        alias=job.model,
+        interface=Interface(job.interface),
+        base_url=job.base_url,
+        model_id=job.model_id,
+        has_key=job.credential is not None,
+        context_length=job.context_length,
+        max_output_tokens=job.max_output_tokens,
+    )
 
 
 class Queue:
@@ -147,7 +161,7 @@ class Queue:
         self._last_tick = time.monotonic()
 
     def _launch(self, s: Session, job: Job) -> None:
-        spec = JobSpec(job.id, job.repo, job.model, job.endpoint, job.prompt)
+        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt)
         try:
             self.runner.launch(spec)
         except Exception as e:
