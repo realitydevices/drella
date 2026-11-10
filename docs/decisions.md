@@ -103,13 +103,15 @@ one. When a decision changes, edit it here first.
     picks an **adapter** in code, which renders the agent's provider config and the
     preflight check; adding a provider type is code, adding a model is a row. The key
     comes from the caller's own credentials [19] and reaches the pod only as an env var.
-    Each job keeps a snapshot of its model. Any token can list a model; only the token
-    that registered it can change or delete it. A key goes wherever the model's base URL
-    points, so until O2 a model **with a credential** can be used only by the token that
-    owns it (a model without one, e.g. local Ollama, is anyone's to use). A model can't
-    name the `github` credential, a model with a key needs `https`, and nothing in a
-    model row may contain `{` or `}` (OpenCode substitutes `{env:…}` and `{file:…}` in
-    its config). OpenCode never reads config from the repo. Admin roles come with O2.
+    Each job keeps a snapshot of its model. **Models are per token until O2:** a token
+    sees, changes, deletes and uses only the models it registered, and two tokens can
+    each have their own model with the same alias. Whoever controls a model's endpoint
+    controls the agent, which holds the job's GitHub token, so a shared model would hand
+    another token's jobs to its owner. Shared ("house") models come with O2's roles. A
+    model can't name the `github` credential, a model with a key needs `https`, and
+    `base_url` and `model_id` are printable ASCII with no `{` or `}` (OpenCode
+    substitutes `{env:…}` and `{file:…}` in its config); a stored model is checked again
+    when a job uses it. OpenCode never reads config from the repo.
 
 ## Open
 

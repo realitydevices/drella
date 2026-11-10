@@ -127,7 +127,8 @@ auth="Authorization: Bearer $TOKEN"
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "github_pat_..."}' $DRELLA/credentials/github
 
-# 2. Register the models jobs can use (docs/v0.2.md). Jobs name them by alias.
+# 2. Register the models your jobs can use (docs/v0.2.md). Jobs name them by alias.
+#    Models are per token: each token registers its own, and sees and uses only those.
 #    A local Ollama model: an OpenAI-compatible API with no key. Add /v1 to the
 #    base URL; `model_id` is what `ollama list` shows.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
@@ -139,11 +140,9 @@ curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
 }' $DRELLA/models/local
 
 #    A hosted model that needs an API key: store the key as a credential, and name
-#    the credential in the model. A model with a key can be used only by the token
-#    that registered it, so your key only goes to a base URL you chose; anyone can use
-#    a model without a key, like the local one above. A model with a key needs an
-#    https:// base URL. Use a key you can revoke, with a spending limit: the agent can
-#    read it.
+#    the credential in the model. Your key only goes to a base URL you set. A model
+#    with a key needs an https:// base URL. Use a key you can revoke, with a spending
+#    limit: the agent can read it.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "<anthropic api key>"}' $DRELLA/credentials/anthropic-key
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
@@ -154,7 +153,7 @@ curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
 }' $DRELLA/models/claude
 
 #    Other hosted APIs (e.g. OpenRouter) use "openai-compatible" with their base URL
-#    and a credential. `GET /models` lists what's registered.
+#    and a credential. `GET /models` lists your models.
 
 # 3. Create a job, naming a model by alias. Leave out "repo" for a job with no
 #    repo: it opens no PR, and its results are whatever the agent writes to /out.
