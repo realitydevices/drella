@@ -13,7 +13,9 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, Response
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -39,11 +41,16 @@ GITHUB_CREDENTIAL = "github"
 # Model rows end up in OpenCode's config, which substitutes {env:...} and {file:...}
 # anywhere in its raw text, so "{" and "}" are never allowed (docs/v0.2.md#security).
 # No whitespace or control characters either.
-BASE_URL_RE = r"^https?://[^\x00-\x20\x7f{}]+$"
+# "[" and "]" are refused too: curl would read them as URL ranges in the preflight.
+BASE_URL_RE = r"^https?://[^\x00-\x20\x7f{}\[\]]+$"
 MODEL_ID_RE = r"^[^\x00-\x20\x7f{}]+$"
 # An API key is substituted into OpenCode's JSON config as raw text, so it can't hold
-# anything that would break the JSON (and print the config, key included, to the log).
-BAD_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f"\\]')
+# anything that would break the JSON (and print the config, key included, to the log),
+# nor "{" or "}", which OpenCode would substitute again ({file:/creds/github}).
+BAD_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f"\\{}]')
+# Limits that fit the database columns (Integer, Numeric(12, 4)).
+MAX_TOKENS = 10_000_000
+MAX_COST = 100_000
 
 
 # -- schemas -----------------------------------------------------------------
@@ -94,11 +101,17 @@ class ModelIn(BaseModel):
         pattern=NAME_RE,
         description="Name of the caller's credential holding the API key, if needed",
     )
-    context_length: int | None = Field(default=None, gt=0)
-    max_output_tokens: int | None = Field(default=None, gt=0)
-    cost_in_per_mtok: Decimal | None = Field(default=None, ge=0)
-    cost_out_per_mtok: Decimal | None = Field(default=None, ge=0)
+    context_length: int | None = Field(default=None, gt=0, le=MAX_TOKENS)
+    max_output_tokens: int | None = Field(default=None, gt=0, le=MAX_TOKENS)
+    cost_in_per_mtok: Decimal | None = Field(default=None, ge=0, le=MAX_COST, decimal_places=4)
+    cost_out_per_mtok: Decimal | None = Field(default=None, ge=0, le=MAX_COST, decimal_places=4)
     notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def _no_trailing_slash(cls, v):
+        # Normalised before it's checked, so what's stored is exactly what passed.
+        return v.rstrip("/") if isinstance(v, str) else v
 
     @field_validator("credential")
     @classmethod
@@ -114,9 +127,21 @@ class ModelIn(BaseModel):
         return self
 
 
-class ModelOut(ModelIn):
+class ModelOut(BaseModel):
+    """A stored model. Plain fields, no validation rules: a row that predates a rule
+    is still listed rather than breaking GET /models for everyone."""
+
     alias: str
     owner: str  # the name of the token that created it; only it can change the model
+    interface: str
+    base_url: str
+    model_id: str
+    credential: str | None
+    context_length: int | None
+    max_output_tokens: int | None
+    cost_in_per_mtok: Decimal | None
+    cost_out_per_mtok: Decimal | None
+    notes: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -226,6 +251,14 @@ def create_app(
     )
     app.state.deps = Deps(settings, sessions, runner, storage, queue)
     app.include_router(router)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default 422 echoes each bad value ("input"). Never do that: the value
+        # may be a credential, and one that isn't valid text (a lone surrogate) can't
+        # even be encoded, which turned the 422 into a 500.
+        errors = [{k: v for k, v in e.items() if k != "input"} for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
     return app
 
 
@@ -354,6 +387,15 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
             check_model_credential(model.credential)
         except ValueError as e:
             raise HTTPException(422, f"model '{model.alias}': {e}") from None
+        # Until owners and roles exist (O2), a key is only sent to a URL its owner
+        # chose: a model with a credential can be used only by the token that owns it.
+        # Otherwise the model's owner could repoint it and receive other tokens' keys.
+        if model.owner_token_id != c.token.id:
+            raise HTTPException(
+                403,
+                f"model '{model.alias}' uses an API key and belongs to another token;"
+                " register your own model (PUT /models) to use it with your key",
+            )
         if model.credential not in creds:
             raise HTTPException(
                 422, f"model '{model.alias}' needs a '{model.credential}' credential (its API key)"
@@ -363,7 +405,8 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     # gets only what it needs [10]: the GitHub credential for a repo job, and its
     # model's API key, if the model has one [27].
     def decrypt(name: str) -> str:
-        return crypto.decrypt(c.secret, c.token.salt, creds[name].ciphertext)
+        # Stripped on read too, so credentials stored before stripping was added work.
+        return crypto.decrypt(c.secret, c.token.salt, creds[name].ciphertext).strip()
 
     secrets = {GITHUB_CREDENTIAL: decrypt(GITHUB_CREDENTIAL)} if body.repo else {}
     if model.credential:
@@ -373,7 +416,7 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
             raise HTTPException(
                 422,
                 f"the '{model.credential}' credential can't be used as an API key: it contains"
-                " control characters, quotes or backslashes",
+                " control characters, quotes, backslashes or braces",
             )
         secrets[LLM_KEY_SECRET] = key
     job_token = crypto.new_token(crypto.JOB_TOKEN_PREFIX)
@@ -422,10 +465,10 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
 
 def model_out(m: Model, db: Session) -> ModelOut:
     owner = db.get(Token, m.owner_token_id)
-    return ModelOut.model_construct(
+    return ModelOut(
         alias=m.alias,
         owner=owner.name if owner else "",
-        interface=Interface(m.interface),
+        interface=m.interface,
         base_url=m.base_url,
         model_id=m.model_id,
         credential=m.credential,
@@ -451,7 +494,6 @@ def put_model(
 ) -> ModelOut:
     fields = body.model_dump()
     fields["interface"] = body.interface.value
-    fields["base_url"] = body.base_url.rstrip("/")
     m = db.get(Model, alias)
     if m is None:
         db.add(Model(alias=alias, owner_token_id=c.token.id, **fields))

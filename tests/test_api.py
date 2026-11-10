@@ -424,6 +424,13 @@ def test_models_api(client, auth):
         {"model_id": "a b"},
         # Unknown fields.
         {"endpoint": "http://x"},
+        # Normalised before validation: "https:///" is "https:", which isn't a URL.
+        {"base_url": "https:///"},
+        # curl would read [..] as a range in the preflight.
+        {"base_url": "https://x.example/[1-100000]"},
+        # Values that wouldn't fit the database columns.
+        {"context_length": 2**40}, {"max_output_tokens": 10_000_001},
+        {"cost_in_per_mtok": "1e12"}, {"cost_out_per_mtok": "0.00001"},
     ],
 )
 def test_models_are_validated(client, auth, bad):
@@ -487,7 +494,7 @@ def test_a_job_keeps_its_model_snapshot(client, auth, runner, queue):
 def test_only_the_owner_can_change_or_delete_a_model(client, auth, settings):
     client.put("/models/claude", json=CLAUDE, headers=auth)
     other = {"Authorization": f"Bearer {create_token(settings, 'mallory')}"}
-    # Mallory can see and use it...
+    # Mallory can see it...
     assert client.get("/models/claude", headers=other).json()["owner"] == "alice"
     # ...but can't repoint it (e.g. at her own URL) or delete it.
     evil = CLAUDE | {"base_url": "https://evil.example/v1"}
@@ -521,7 +528,12 @@ def test_credentials_are_stripped(client, auth, runner):
     assert client.put("/credentials/empty", json={"value": " \n"}, headers=auth).status_code == 422
 
 
-@pytest.mark.parametrize("key", ['sk-a"b', "sk-a\\b", "sk-a\nb", "sk-a\tb", "sk-a\x7fb"])
+@pytest.mark.parametrize(
+    "key",
+    ['sk-a"b', "sk-a\\b", "sk-a\nb", "sk-a\tb", "sk-a\x7fb",
+     # OpenCode would substitute these again, e.g. sending the GitHub token.
+     "{file:/creds/github}", "sk-{env:GH_TOKEN}"],
+)
 def test_a_model_key_that_would_break_the_config_is_rejected_without_echoing_it(
     client, auth, runner, key
 ):
@@ -566,3 +578,62 @@ def test_put_model_race_on_a_new_alias(client, auth, monkeypatch):
     r = client.put("/models/racy", json=LOCAL, headers=auth)
     assert r.status_code == 200, r.text
     assert r.json()["model_id"] == "some-model"
+
+
+def test_a_model_with_a_key_is_usable_only_by_its_owner(client, auth, runner, settings):
+    # Otherwise its owner could repoint it later and receive other tokens' keys.
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    other = {"Authorization": f"Bearer {create_token(settings, 'mallory')}"}
+    client.put("/credentials/anthropic-key", json={"value": "sk-mallory"}, headers=other)
+    r = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=other)
+    assert r.status_code == 403 and "register your own model" in r.json()["detail"]
+    assert runner.secrets == {}
+    # A model without a key is anyone's to use.
+    r = client.post("/jobs", json={"prompt": "x", "model": "local"}, headers=other)
+    assert r.status_code == 201
+    # With her own model, Mallory's key goes where she chose.
+    client.put("/models/mine", json=CLAUDE, headers=other)
+    job = client.post("/jobs", json={"prompt": "x", "model": "mine"}, headers=other).json()
+    assert runner.secrets[job["id"]]["_llm-key"] == "sk-mallory"
+
+
+def test_listing_models_survives_a_row_that_predates_a_rule(client, auth, settings):
+    from drella.models import Model
+
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    with client.app.state.deps.sessions() as s:
+        s.get(Model, "claude").base_url = "https:"
+        s.commit()
+    other = {"Authorization": f"Bearer {create_token(settings, 'bob')}"}
+    r = client.get("/models", headers=other)
+    assert r.status_code == 200
+    assert {m["alias"]: m["base_url"] for m in r.json()}["claude"] == "https:"
+
+
+def test_credentials_must_be_valid_text(client, auth):
+    # A lone surrogate, as JSON allows it; it can't be encrypted or used as text.
+    body = '{"value": "\\ud800abc"}'
+    r = client.put("/credentials/k", content=body,
+                   headers=auth | {"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+def test_validation_errors_never_echo_the_value(client, auth):
+    r = client.put("/credentials/k", json={"value": 12345678}, headers=auth)
+    assert r.status_code == 422 and "12345678" not in r.text
+
+
+def test_model_keys_are_stripped_when_read(client, auth, runner):
+    # A credential stored before stripping existed still works as a key.
+    from drella import crypto
+    from drella.models import Credential, Token
+
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    raw = auth["Authorization"].removeprefix("Bearer ")
+    with client.app.state.deps.sessions() as s:
+        tok = s.scalars(__import__("sqlalchemy").select(Token)).first()
+        s.add(Credential(token_id=tok.id, name="anthropic-key",
+                         ciphertext=crypto.encrypt(raw, tok.salt, "sk-old\n")))
+        s.commit()
+    job = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth).json()
+    assert runner.secrets[job["id"]]["_llm-key"] == "sk-old"
