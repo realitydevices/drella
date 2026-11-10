@@ -140,7 +140,8 @@ curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
 }' $DRELLA/models/local
 
 #    A hosted model that needs an API key: store the key as a credential, and name
-#    the credential in the model. Your key only goes to a base URL you set. A model
+#    the credential in the model. Drella sends your key only to a base URL you set, but
+#    the agent and anything it runs can read it (see Security in docs/v0.2.md). A model
 #    with a key needs an https:// base URL. Use a key you can revoke, with a spending
 #    limit: the agent can read it.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
