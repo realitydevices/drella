@@ -118,8 +118,10 @@ one. When a decision changes, edit it here first.
     it has no base URL. Every other model runs OpenCode. Both agents are in the one job
     image [20] and follow the same job rules. Claude Code never loads settings or MCP
     servers from the repo (`--setting-sources user`, `--strict-mcp-config`), and the
-    image turns hooks off. The subscription token is for personal, low-volume use;
-    heavy use goes through an API key and the `anthropic` interface.
+    image turns hooks off. A caller stores only their own subscription token, for their
+    own jobs (per-token models and credentials); a Drella hosted for other people uses
+    API keys (the `anthropic` interface) or the Commercial Terms, per Anthropic's terms
+    (see v0.3, Terms).
 
 ## Open
 

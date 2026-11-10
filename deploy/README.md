@@ -159,7 +159,8 @@ curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
 #    Claude Code with your Claude subscription (docs/v0.3.md): store the OAuth token
 #    from `claude setup-token` as a credential. The model has no base_url; `model_id`
 #    is what `claude --model` takes (e.g. sonnet, opus). Jobs count against your
-#    plan's usage limits: for heavy use, prefer an API key and "anthropic".
+#    plan's usage limits. Only your own token, for your own jobs: if you host Drella
+#    for other people, they use API keys ("anthropic"). See Terms in docs/v0.3.md.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "<oauth token>"}' $DRELLA/credentials/claude-oauth
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
