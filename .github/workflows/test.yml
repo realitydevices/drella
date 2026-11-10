@@ -54,3 +54,30 @@ jobs:
           push: false
           cache-from: type=gha,scope=${{ matrix.file }}
           cache-to: type=gha,mode=max,scope=${{ matrix.file }}
+
+  job-image-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: images/drella-job
+          file: images/drella-job/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: drella-job:smoke
+          cache-from: type=gha,scope=images/drella-job/Dockerfile
+      - name: smoke test
+        run: |
+          docker run --rm --user 1000 --entrypoint bash drella-job:smoke -euo pipefail -c '
+            mkdir -p "$HOME/.local/share/opencode" "$HOME/.cache/opencode" "$HOME/.config/opencode"
+            python3 --version
+            uv --version
+            opencode --version
+            claude --version
+            cd "$(mktemp -d)" && uv init -q smoke && cd smoke && uv run -q python -c "print(\"ok\")"
+          '
+      - name: wrapper parses
+        run: docker run --rm --user 1000 --entrypoint bash drella-job:smoke -c 'bash -n /usr/local/bin/drella-job'
