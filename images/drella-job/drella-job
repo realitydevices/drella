@@ -68,8 +68,12 @@ api() {
 # Replace the job's secrets (the model's API key and the GitHub token) with
 # [redacted] in a stream, line by line. The agent can read both from its environment;
 # this keeps them out of the transcript, the session record and the archived log if it
-# prints them. Best effort: a secret split across lines, or encoded, gets through.
+# prints them. Best effort: a secret split across lines, or encoded, gets through, and
+# so does anything the agent writes to other files in /out, sends to the Drella API
+# with the job token, or writes straight to the pod's log (docs/v0.2.md#security).
 # Values come from ENVIRON and are matched as fixed strings, so any character is safe.
+# A single huge line full of secrets is slow to filter (each match copies the rest of
+# the line); only an agent printing them on purpose produces that.
 redact() {
   awk 'BEGIN {
       n = 0
@@ -91,11 +95,17 @@ redact() {
     }'
 }
 
+# An output is a regular file at the top level of /out whose name Drella accepts
+# (letters, digits, ".", "_", "-"; not starting with "."). Nothing else is uploaded.
+is_output() {
+  [ -f "$1" ] && [[ ${1##*/} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
 upload_outputs() {
   local f
   # Most useful first, in case time runs out.
   for f in "$OUT/pr-url.txt" "$OUT/diff.patch" "$OUT/transcript.txt" "$OUT"/*; do
-    [ -f "$f" ] || continue
+    is_output "$f" || continue
     case " $uploaded " in *" $f "*) continue ;; esac
     uploaded="$uploaded $f"
     log "uploading $(basename "$f")"
@@ -185,7 +195,8 @@ while IFS= read -r h; do
   # The replacement is quoted, so "&" in a key isn't expanded (bash 5.2 patsub).
   [ -n "$h" ] && printf '%s\n' "${h//'{key}'/"${DRELLA_LLM_KEY:-}"}" >>"$headers"
 done <<<"${DRELLA_PREFLIGHT_HEADERS:-}"
-code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H @"$headers" "$DRELLA_PREFLIGHT_URL")
+# -g: the URL is used as is ("[" and "]" are never ranges).
+code=$(curl -gsS -m 20 -o /dev/null -w '%{http_code}' -H @"$headers" "$DRELLA_PREFLIGHT_URL")
 rm -f "$headers"
 case $code in
   2??) ;;
@@ -196,6 +207,11 @@ esac
 
 # OpenCode's config, as rendered by Drella. The API key, if any, stays in the
 # environment: the config refers to it as {env:DRELLA_LLM_KEY}.
+# OpenCode would otherwise also load config and plugins from the repo (opencode.json,
+# .opencode/), and project config wins: a repo could point the provider at its own URL
+# and receive the key, or run a plugin. So project config is off for every opencode
+# call below. Instructions in the repo (AGENTS.md and the like) still apply.
+export OPENCODE_DISABLE_PROJECT_CONFIG=1
 export OPENCODE_CONFIG="$WORK/opencode.json"
 printf '%s\n' "$DRELLA_OPENCODE_CONFIG" >"$OPENCODE_CONFIG"
 AGENT_MODEL=$(jq -er .model "$OPENCODE_CONFIG") \
@@ -311,7 +327,12 @@ if [ -n "$reason" ]; then
   finish failed "$reason${pr:+; PR: $pr}$diff_note"
 elif [ -z "$REPO" ]; then
   # The agent's results are files in /out; the transcript and session are ours.
-  results=$(find "$OUT" -maxdepth 1 -type f ! -name transcript.txt ! -name session.json | wc -l)
+  # Counts exactly what upload_outputs uploads (is_output).
+  results=0
+  for f in "$OUT"/*; do
+    is_output "$f" || continue
+    case ${f##*/} in transcript.txt|session.json) ;; *) results=$((results + 1)) ;; esac
+  done
   if [ "$results" -gt 0 ]; then
     finish succeeded "done"
   else
