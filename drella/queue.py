@@ -10,6 +10,7 @@ v0 has one queue group with concurrency 1. Each tick:
 3. now and then, deletes job Secrets whose job has finished or doesn't exist.
 """
 
+import dataclasses
 import itertools
 import logging
 import threading
@@ -21,7 +22,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from drella.adapters import Interface, ModelSpec
-from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job
+from drella.github import PROFILES, GitHubApp, GitHubAppError
+from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, Token
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState
 from drella.storage import CHUNK, NotFound, Storage
 
@@ -30,6 +32,10 @@ log = logging.getLogger(__name__)
 # A Secret younger than this is never reaped: its job may not be committed yet.
 SECRET_MIN_AGE = timedelta(minutes=10)
 REAP_EVERY = 60  # seconds
+# Minting a GitHub token: up to this many attempts, waiting these seconds between them,
+# and only for failures that may pass (GitHub 5xx, 429, network errors).
+MINT_ATTEMPTS = 3
+MINT_BACKOFF = (0.5, 1.0)
 
 
 def log_key(job_id: str) -> str:
@@ -88,6 +94,8 @@ class Queue:
         interval: float = 5,
         log_snapshot_seconds: float = 30,
         stall_seconds: float = 300,
+        github_app: GitHubApp | None = None,
+        sleep=time.sleep,
     ):
         self.sessions = sessions
         self.runner = runner
@@ -96,6 +104,8 @@ class Queue:
         self.interval = interval
         self.log_snapshot_seconds = log_snapshot_seconds
         self.stall_seconds = stall_seconds
+        self.github_app = github_app
+        self._sleep = sleep  # injectable, so tests don't wait
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -163,8 +173,13 @@ class Queue:
     def _launch(self, s: Session, job: Job) -> None:
         spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt)
         try:
+            if job.github_app and job.repo:
+                spec = self._mint_github_token(s, job, spec)
             self.runner.launch(spec)
         except Exception as e:
+            # A failed mint fails the job rather than leaving it queued: the queue
+            # always takes the oldest queued job, so one that can't launch would block
+            # every job behind it. GitHubAppError messages carry no secrets.
             log.exception("launching job %s failed", job.id)
             self._finish(s, job, FAILED, f"launch failed: {e}")
             self._cleanup(job.id)
@@ -173,6 +188,45 @@ class Queue:
         job.started_at = datetime.now(UTC)
         s.commit()
         log.info("job %s launched", job.id)
+
+    def _mint_github_token(self, s: Session, job: Job, spec: JobSpec) -> JobSpec:
+        """The job's GitHub token, minted at dispatch rather than at job creation: a
+        queued job can wait longer than a token lasts (an hour). Its permissions are its
+        Drella token's GitHub profile, read now, so a profile an admin has narrowed
+        applies to jobs still queued. It goes into the job's Secret where a caller's
+        `github` credential would be, and never into the database. The job's deadline is
+        capped at the token's expiry, so the token outlasts everything the job does."""
+        if self.github_app is None:
+            raise RuntimeError(
+                "the job needs a token from Drella's GitHub App, which is no longer"
+                " configured (DRELLA_GITHUB_APP_ID)"
+            )
+        token_row = s.get(Token, job.token_id)
+        profile = PROFILES.get(token_row.github_profile) if token_row else None
+        if profile is None:
+            raise RuntimeError("the job's Drella token has no known GitHub profile")
+        for attempt in range(MINT_ATTEMPTS):
+            try:
+                token = self.github_app.token(job.repo, profile)
+                break
+            except GitHubAppError as e:
+                if not e.transient or attempt == MINT_ATTEMPTS - 1:
+                    raise
+                log.warning("minting a GitHub token for job %s failed (%s); retrying", job.id, e)
+                self._sleep(MINT_BACKOFF[attempt])
+        try:
+            self.runner.add_secrets(job.id, {"github": token.token})
+        except Exception as e:
+            # Don't pass on the cluster's error text: it may quote the request.
+            log.error("adding the GitHub token to job %s's Secret failed (%s)", job.id,
+                      type(e).__name__)
+            raise RuntimeError("couldn't add the GitHub token to the job's Secret") from None
+        log.info(
+            "minted a GitHub App token for job %s (%s, profile %s)", job.id, job.repo, profile.name
+        )
+        return dataclasses.replace(
+            spec, opens_prs=profile.opens_prs, github_token_expires=token.expires
+        )
 
     def _check(self, s: Session, job: Job) -> None:
         st = self.runner.status(job.id)

@@ -115,6 +115,16 @@ def test_list_and_get_jobs(client, auth, job):
     assert got["repo"] == JOB["repo"] and got["outputs"] == []
 
 
+def test_a_credential_can_be_deleted_only_by_its_token(client, settings, auth):
+    client.put("/credentials/github", json={"value": "x"}, headers=auth)
+    other = {"Authorization": f"Bearer {create_token(settings, 'bob')}"}
+    assert client.delete("/credentials/github", headers=other).status_code == 404
+    assert client.get("/credentials", headers=auth).json() == ["github"]
+    assert client.delete("/credentials/github").status_code == 401
+    assert client.delete("/credentials/github", headers=auth).status_code == 204
+    assert client.get("/credentials", headers=auth).json() == []
+
+
 def test_jobs_are_private_to_their_token(client, settings, job):
     other = {"Authorization": f"Bearer {create_token(settings, 'bob')}"}
     assert client.get("/jobs", headers=other).json() == []

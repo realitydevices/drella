@@ -89,6 +89,18 @@ spec:
                   fieldPath: metadata.namespace
             - name: DRELLA_API_URL
               value: http://drella:8000
+            # Drella's GitHub App, which mints repo jobs' GitHub tokens
+            # (deploy/README.md). Both come from the optional drella-github-app
+            # Secret: without it, Drella still starts, and repo jobs need the
+            # caller's own `github` credential.
+            - name: DRELLA_GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: drella-github-app
+                  key: app-id
+                  optional: true
+            - name: DRELLA_GITHUB_APP_KEY_FILE
+              value: /etc/drella/github-app/private-key.pem
           ports:
             - name: http
               containerPort: 8000
@@ -113,10 +125,22 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: github-app
+              mountPath: /etc/drella/github-app
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: drella-data
+        - name: github-app
+          secret:
+            secretName: drella-github-app
+            optional: true
+            items:
+              - key: private-key.pem
+                path: private-key.pem
+            # Readable by Drella (fsGroup 1000) only.
+            defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service

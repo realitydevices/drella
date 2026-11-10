@@ -76,11 +76,155 @@ reach Postgres, but you can change it before your first deploy.
 Then create the first token:
 
 ```sh
-kubectl -n drella exec deploy/drella -- drella token create --name <your name>
+kubectl -n drella exec deploy/drella -- drella token create --name <your name> \
+  --github-profile builder
 ```
 
 It's printed once. Drella keeps only its hash, and the credentials you store are
-encrypted with it, so keep it somewhere safe.
+encrypted with it, so keep it somewhere safe. `--github-profile` says what its jobs can
+do on GitHub when Drella mints their tokens (see **GitHub profiles** below); leave it
+out for a read-only token.
+
+## GitHub tokens from a GitHub App (optional)
+
+A job with a repo needs a GitHub token. Either each caller stores their own `github`
+credential (see **Run a job**), or Drella holds a GitHub App's private key and mints a
+token for each repo job itself. Installation tokens last an hour, so nobody has to keep
+storing fresh ones. A caller's own `github` credential still wins if they store one.
+
+**Rollout order:** merge, then set the branch protection and rulesets listed under
+**Approvals and branch protection** below on every repo the App will be installed on,
+and only then configure the App key in Drella (step 3). Until the protection is in
+place, App tokens can write to those repos' default branches.
+
+1. **Create the App** (GitHub → Settings → Developer settings → GitHub Apps → New).
+   It needs no webhook. Repository permissions: **Contents** read and write, **Pull
+   requests** read and write, **Issues** read-only (Metadata read-only is automatic).
+   Leave out **Workflows**, so jobs can't edit `.github/workflows`. Note its **App
+   ID**, and generate a **private key** (a `.pem` file).
+   Keep the App private ("Only on this account"), so nobody else can install it.
+2. **Install it only on the repos Drella's jobs may change** ("Only select
+   repositories"). Drella can write to every repo the App is installed on (see the
+   security note in [docs/v0.md](../docs/v0.md#security)). Protect those repos as in
+   **Approvals and branch protection** below.
+3. **Create the Secret** from the `.pem`:
+
+   ```sh
+   kubectl -n drella create secret generic drella-github-app \
+     --from-file=private-key.pem=<path to the .pem> \
+     --from-literal=app-id=<App ID>
+   kubectl -n drella rollout restart deployment/drella
+   ```
+
+   Or generate it in your own kustomize overlay, next to the `.pem` (there's an
+   example in `kustomization.yaml`). Don't put the key in this checkout.
+
+The deployment (`drella.yaml`) reads both from that Secret: `DRELLA_GITHUB_APP_ID` from
+`app-id`, and the key as a file, `DRELLA_GITHUB_APP_KEY_FILE`
+(`/etc/drella/github-app/private-key.pem`). The Secret is optional: without it Drella
+starts as before, and repo jobs need a `github` credential. With it, Drella checks the
+key at startup and refuses to start if it can't read it. The key is read again for
+every token, so a rotated key takes effect without a restart (a new App ID needs one).
+Neither the key nor any token is stored in the database.
+
+For each repo job without a `github` credential, Drella mints a token when it launches
+the job (not when it's queued: a queued job can wait longer than an hour). The token is
+for the job's repo only, with the permissions of the job's Drella token's GitHub
+profile (below). If the App isn't installed on the repo, or minting fails for any other
+reason (GitHub down, say), the job fails at launch and says why. Transient failures
+(GitHub 5xx or 429, network errors) are retried first, up to 3 attempts in all. The
+token is the job's only one: there's no way to ask for another. Instead, the job's
+deadline is capped at the token's expiry, so the wrapper has finished everything (the
+PR check, auto-merge, the final report) while the token is still valid.
+
+A caller who stored a `github` credential before the App was set up has to delete it
+(`DELETE /credentials/github`) to get App tokens: a stored one always wins.
+
+By default the agent commits as "Drella agent" (an installation token can't
+read the App's own user), and PRs are opened by `<app name>[bot]`.
+
+### GitHub profiles
+
+Each Drella token has a GitHub profile, which decides what the App tokens minted for its
+jobs may do. Profiles are a fixed set in code (`PROFILES` in `drella/github.py`):
+
+| Profile | Contents | Pull requests | Issues | The job |
+|---|---|---|---|---|
+| `builder` | write | write | read | pushes a branch and opens a PR (drella-bot's normal use) |
+| `reader` | read | read | read | can't push or open PRs; writes its results (a review, a report) to `/out` and succeeds if it wrote any |
+
+Only an admin sets a token's profile, with the CLI inside Drella's pod. A caller can't
+choose one, and can't ask for permissions per job:
+
+```sh
+kubectl -n drella exec deploy/drella -- drella token create --name <name> --github-profile builder
+kubectl -n drella exec deploy/drella -- drella token list                    # id, profile, name
+kubectl -n drella exec deploy/drella -- drella token set-profile <id> reader
+```
+
+A new token is a `reader` unless you say otherwise. Tokens that existed before profiles
+(migration 0005) became `builder`s, so they work as before. The profile is read when a
+job's token is minted, so changing it also changes the token's queued jobs. It only
+applies to App tokens: a caller's own `github` credential can do whatever it can do.
+
+A profile only limits the tokens Drella mints from the App. If a Drella token stores its
+own `github` credential, that credential takes precedence: its jobs get whatever that
+credential can do on GitHub, and the profile doesn't apply.
+
+To add a profile (say a `reviewer` that comments on PRs), add it to `PROFILES`. Anything
+with Pull requests write can also approve PRs; see below for why that approval mustn't
+count.
+
+### Approvals and branch protection
+
+GitHub permissions can't separate opening a PR from approving one: both are Pull
+requests write. So a `builder` job's token (or a prompt-injected agent holding it) can
+submit an approving review. What stops that mattering:
+
+- GitHub never lets a PR's author approve it. Every drella-bot PR is authored by
+  `drella-bot[bot]`, so drella-bot can't approve its own PRs, including other jobs'.
+- It **can** approve a PR someone else opened (e.g. one of yours), and an App's
+  approval may count towards "required approvals". So require a **code owner's**
+  review: `.github/CODEOWNERS` names `@realitydevices` for every file, and an App can't
+  be a code owner. A PR that changes CODEOWNERS needs the current code owner's review
+  too.
+- Contents write can also push to any branch that isn't protected (including your own
+  open PR branches), and push tags. Pushing a `v*` tag publishes release images
+  (`images.yml`).
+
+Settings for each repo the App is installed on (GitHub → the repo → Settings). For
+this repo, merge the PR that adds `.github/CODEOWNERS` first: it only takes effect
+from the default branch.
+
+1. **Branches → branch protection rule for `main`** (or a ruleset targeting the default
+   branch):
+   - Require a pull request before merging: on.
+   - Required approvals: 1.
+   - Dismiss stale pull request approvals when new commits are pushed: on.
+   - **Require review from Code Owners: on** (new).
+   - Require approval of the most recent reviewable push: on (optional; it stops a
+     push after your approval being merged on it, which the previous setting already
+     covers, and it stops you approving a PR you last pushed to).
+   - **Require status checks to pass: on, with `pytest`** (new; today nothing is
+     required, so an approved PR auto-merges even with CI failing).
+   - Allow force pushes, allow deletions: off.
+   - Don't add drella-bot to any bypass list ("Allow specified actors to bypass").
+     Whether you enforce the rule for admins is up to you: if you don't, you can merge
+     your own PRs (which nobody else can approve) with the admin override, as now.
+2. **Rules → Rulesets → New branch ruleset** "Only drella/ branches for the bot":
+   target all branches except `main` and `drella/**`; rules: Restrict creations,
+   Restrict updates, Restrict deletions, Block force pushes; bypass list: Repository
+   admin. Then the bot can only push `drella/*` branches (which is where the wrapper
+   tells the agent to work), and can't rewrite your PR branches.
+3. **Rules → Rulesets → New tag ruleset** "Release tags": target `v*`; rules: Restrict
+   creations, Restrict updates, Restrict deletions; bypass list: Repository admin. Then
+   a job can't publish a release image.
+4. **General → Pull Requests → Allow auto-merge: on** (already on here). The wrapper
+   turns on auto-merge (`gh pr merge --auto --squash`) for every PR a job opens. With
+   the rules above, auto-merge only queues the merge: GitHub merges once a code owner
+   has approved and `pytest` has passed, and a new push dismisses the approval. Without
+   a required review, auto-merge has nothing to wait for, and a job's PR can merge with
+   no human looking at it.
 
 ## Reaching Drella
 
@@ -116,7 +260,9 @@ With `DRELLA=http://localhost:8000` and `TOKEN` set to your token:
 ```sh
 auth="Authorization: Bearer $TOKEN"
 
-# 1. Store a GitHub credential (needed only for jobs with a repo): a fine-grained
+# 1. Store a GitHub credential (needed only for jobs with a repo, and not at all if
+#    Drella has a GitHub App; see above. A stored one wins over the App: remove it
+#    with DELETE $DRELLA/credentials/github): a fine-grained
 #    PAT for the target repo only, with Contents and Pull requests read/write, and
 #    without the Workflows permission (so it can't edit .github/workflows). Protect
 #    the repo's default branch for everyone, admins included: pull requests only,

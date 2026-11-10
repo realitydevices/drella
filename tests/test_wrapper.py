@@ -139,3 +139,22 @@ def test_claude_code_without_a_result_has_no_usage(tmp_path, lines):
 def test_wrapper_sends_usage_only_as_an_object():
     assert "usage-opencode.jq" in WRAPPER and "usage-claude-code.jq" in WRAPPER
     assert "type == \"object\"" in WRAPPER
+
+
+def test_the_github_token_is_redacted():
+    assert 'k[++n] = ENVIRON["GH_TOKEN"]' in WRAPPER
+
+
+def test_a_read_only_repo_job_writes_results_instead_of_a_pr():
+    # A read-only GitHub token (the reader profile) can't push or open a PR, so the
+    # agent is told so, the job succeeds on its outputs, and auto-merge isn't touched.
+    assert '[ "${DRELLA_REPO_READ_ONLY:-}" = 1 ] && READ_ONLY=1' in WRAPPER
+    assert "Your GitHub access is read-only" in WRAPPER
+    assert 'if [ -n "$REPO" ] && [ -z "$READ_ONLY" ]; then' in WRAPPER
+    assert 'elif [ -z "$REPO" ] || [ -n "$READ_ONLY" ]; then' in WRAPPER
+
+
+def test_the_wrapper_never_asks_drella_for_another_github_token():
+    # The token minted at dispatch is the job's only one: its deadline is capped at the
+    # token's expiry instead (test_runner.py).
+    assert "github-token" not in WRAPPER

@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     LargeBinary,
@@ -34,6 +35,9 @@ class Token(Base):
     lookup_hash: Mapped[str] = mapped_column(String(64), unique=True)
     # Per-token salt for deriving the credential key.
     salt: Mapped[bytes] = mapped_column(LargeBinary(16))
+    # What the GitHub App tokens minted for this token's jobs may do: a name in
+    # drella.github.PROFILES. Set by an admin with the CLI, never through the API.
+    github_profile: Mapped[str] = mapped_column(String(32), default="reader")
     created_at: Mapped[datetime] = mapped_column(default=_now)
 
 
@@ -70,6 +74,10 @@ class Job(Base):
     max_output_tokens: Mapped[int | None]
     cost_in_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     cost_out_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    # True: the job's GitHub token is minted by Drella's GitHub App at launch, with
+    # the permissions of its token's GitHub profile (as it is at launch), because the
+    # caller stored no `github` credential. The token itself is never stored.
+    github_app: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(16), default=QUEUED, index=True)
     # What the job reported via POST /jobs/{id}/status. It becomes `status` once
     # the Kubernetes Job has finished and its log is archived.
