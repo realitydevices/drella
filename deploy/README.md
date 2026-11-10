@@ -7,9 +7,9 @@ It's a page, not a script: run the steps yourself and adapt them to your host.
 
 - A Linux host with a few GB of RAM and disk. Each job gets up to 2 GB of RAM, and
   v0 runs one job at a time.
-- A model endpoint the host can reach: an OpenAI-compatible API that needs no API
-  key, such as Ollama on your LAN. (v0 passes no model credentials to jobs, so hosted
-  APIs that need a key don't work yet.) Check it from the host:
+- A model endpoint the host can reach: Ollama on your LAN, a hosted OpenAI-compatible
+  API, or Anthropic's API. Models that need an API key are fine: the key is stored as
+  a credential. For a local endpoint, check it from the host:
 
   ```sh
   curl http://<ollama-host>:11434/v1/models
@@ -127,21 +127,61 @@ auth="Authorization: Bearer $TOKEN"
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "github_pat_..."}' $DRELLA/credentials/github
 
-# 2. Create a job. `endpoint` is an OpenAI-compatible base URL that needs no API key;
-#    for Ollama, add /v1. `model` is a model the endpoint serves (`ollama list`).
-#    Leave out "repo" for a job with no repo: it opens no PR, and its results are
-#    whatever the agent writes to /out.
+# 2. Register the models your jobs can use (docs/v0.2.md). Jobs name them by alias.
+#    Models are per token: each token registers its own, and sees and uses only those.
+#    A local Ollama model: an OpenAI-compatible API with no key. Add /v1 to the
+#    base URL; `model_id` is what `ollama list` shows.
+curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
+  "interface": "openai-compatible",
+  "base_url": "http://<ollama-host>:11434/v1",
+  "model_id": "<ollama model>",
+  "context_length": 65536,
+  "max_output_tokens": 8192
+}' $DRELLA/models/local
+
+#    A hosted model that needs an API key: store the key as a credential, and name
+#    the credential in the model. Drella sends your key only to a base URL you set, but
+#    the agent and anything it runs can read it (see Security in docs/v0.2.md). A model
+#    with a key needs an https:// base URL. Use a key you can revoke, with a spending
+#    limit: the agent can read it.
+curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
+  -d '{"value": "<anthropic api key>"}' $DRELLA/credentials/anthropic-key
+curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
+  "interface": "anthropic",
+  "base_url": "https://api.anthropic.com/v1",
+  "model_id": "<anthropic model id>",
+  "credential": "anthropic-key"
+}' $DRELLA/models/claude
+
+#    Other hosted APIs (e.g. OpenRouter) use "openai-compatible" with their base URL
+#    and a credential.
+#
+#    Claude Code with your Claude subscription (docs/v0.3.md): store the OAuth token
+#    from `claude setup-token` as a credential. The model has no base_url; `model_id`
+#    is what `claude --model` takes (e.g. sonnet, opus). Jobs count against your
+#    plan's usage limits. Only your own token, for your own jobs: if you host Drella
+#    for other people, they use API keys ("anthropic"). See Terms in docs/v0.3.md.
+curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
+  -d '{"value": "<oauth token>"}' $DRELLA/credentials/claude-oauth
+curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
+  "interface": "claude-code",
+  "model_id": "sonnet",
+  "credential": "claude-oauth"
+}' $DRELLA/models/claude-code
+#    `GET /models` lists your models.
+
+# 3. Create a job, naming a model by alias. Leave out "repo" for a job with no
+#    repo: it opens no PR, and its results are whatever the agent writes to /out.
 curl -X POST -H "$auth" -H 'Content-Type: application/json' -d '{
   "prompt": "add a CHANGELOG.md",
   "repo": "<owner>/<repo>",
-  "model": "<model>",
-  "endpoint": "http://<ollama-host>:11434/v1"
+  "model": "local"
 }' $DRELLA/jobs
 
-# 3. Follow its logs (add -H 'Accept: text/event-stream' for server-sent events).
+# 4. Follow its logs (add -H 'Accept: text/event-stream' for server-sent events).
 curl -N -H "$auth" "$DRELLA/jobs/<id>/logs?follow=1"
 
-# 4. Check the result and download its outputs.
+# 5. Check the result and download its outputs.
 curl -H "$auth" $DRELLA/jobs/<id>
 curl -H "$auth" $DRELLA/jobs/<id>/outputs/pr-url.txt
 curl -H "$auth" $DRELLA/jobs/<id>/outputs/diff.patch
@@ -149,8 +189,12 @@ curl -H "$auth" $DRELLA/jobs/<id>/outputs/transcript.txt
 ```
 
 A job with a repo succeeds when the agent has opened a pull request; a job without one
-succeeds when the agent finishes cleanly. Jobs time out after an hour; the agent is
-stopped five minutes before that, so its work so far is uploaded.
+succeeds when the agent finishes cleanly and has written at least one output. Jobs time
+out after an hour; the agent is stopped five minutes before that, so its work so far is
+uploaded.
 
 **Ollama's context window:** OpenCode's prompts are long. If the model loses track,
-raise Ollama's context length on the Ollama host (e.g. `OLLAMA_CONTEXT_LENGTH=32768`).
+raise Ollama's context length on the Ollama host (e.g. `OLLAMA_CONTEXT_LENGTH=65536`),
+and set the model's `context_length` to match. OpenCode takes a model's limits only as a
+pair, so Drella passes them only when both `context_length` and `max_output_tokens` are
+set.

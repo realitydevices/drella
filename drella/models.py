@@ -2,8 +2,17 @@
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, LargeBinary, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    LargeBinary,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -49,8 +58,17 @@ class Job(Base):
     token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"))
     prompt: Mapped[str] = mapped_column(Text)
     repo: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    model: Mapped[str] = mapped_column(String(200))
-    endpoint: Mapped[str] = mapped_column(String(500))
+    # The job's model, snapshotted from the models table when the job was created
+    # [27], so later changes to the model don't rewrite the job's history.
+    model: Mapped[str] = mapped_column(String(200))  # the alias
+    interface: Mapped[str] = mapped_column(String(32))
+    base_url: Mapped[str | None] = mapped_column(String(500))  # None for claude-code
+    model_id: Mapped[str] = mapped_column(String(200))
+    credential: Mapped[str | None] = mapped_column(String(200))  # name, not the key
+    context_length: Mapped[int | None]
+    max_output_tokens: Mapped[int | None]
+    cost_in_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    cost_out_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     status: Mapped[str] = mapped_column(String(16), default=QUEUED, index=True)
     # What the job reported via POST /jobs/{id}/status. It becomes `status` once
     # the Kubernetes Job has finished and its log is archived.
@@ -61,3 +79,28 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(default=_now, index=True)
     started_at: Mapped[datetime | None]
     finished_at: Mapped[datetime | None]
+
+
+class Model(Base):
+    """A model a token's jobs can use, by alias [27]. Models are per token until owners
+    and roles exist (O2): only the token that registered a model can see, change, delete
+    or use it, and two tokens can each have their own model with the same alias."""
+
+    __tablename__ = "models"
+    __table_args__ = (UniqueConstraint("owner_token_id", "alias"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"))
+    alias: Mapped[str] = mapped_column(String(63))
+    interface: Mapped[str] = mapped_column(String(32))
+    base_url: Mapped[str | None] = mapped_column(String(500))  # None for claude-code
+    model_id: Mapped[str] = mapped_column(String(200))
+    # Name of the caller's credential holding the API key, if the model needs one.
+    credential: Mapped[str | None] = mapped_column(String(63))
+    context_length: Mapped[int | None]
+    max_output_tokens: Mapped[int | None]
+    cost_in_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    cost_out_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    notes: Mapped[str | None] = mapped_column(String(2000))
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+    updated_at: Mapped[datetime] = mapped_column(default=_now, onupdate=_now)

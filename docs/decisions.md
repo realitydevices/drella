@@ -95,6 +95,34 @@ one. When a decision changes, edit it here first.
     repo) → OpenCode against a local model → log + output artifact. No UI, schedules,
     memory or MCP yet. From then on Drella builds itself from these docs.
 
+### Models
+
+27. **Models are registered, and jobs name them by alias** ([v0.2](v0.2.md)). One table:
+    alias, interface, base URL, model ID, an optional credential name for the API key,
+    context length and costs. The **interface** (e.g. `openai-compatible`, `anthropic`)
+    picks an **adapter** in code, which renders the agent's provider config and the
+    preflight check; adding a provider type is code, adding a model is a row. The key
+    comes from the caller's own credentials [19] and reaches the pod only as an env var.
+    Each job keeps a snapshot of its model. **Models are per token until O2:** a token
+    sees, changes, deletes and uses only the models it registered, and two tokens can
+    each have their own model with the same alias. Whoever controls a model's endpoint
+    controls the agent, which holds the job's GitHub token, so a shared model would hand
+    another token's jobs to its owner. Shared ("house") models come with O2's roles. A
+    model can't name the `github` credential, a model with a key needs `https`, and
+    `base_url` and `model_id` are printable ASCII with no `{` or `}` (OpenCode
+    substitutes `{env:…}` and `{file:…}` in its config); a stored model is checked again
+    when a job uses it. OpenCode never reads config from the repo.
+28. **Claude Code is a second agent, chosen by the model's interface** ([v0.3](v0.3.md)).
+    A model with the `claude-code` interface runs Claude Code, logged in with a Claude
+    subscription's OAuth token (`claude setup-token`) held as the model's credential;
+    it has no base URL. Every other model runs OpenCode. Both agents are in the one job
+    image [20] and follow the same job rules. Claude Code never loads settings or MCP
+    servers from the repo (`--setting-sources user`, `--strict-mcp-config`), and the
+    image turns hooks off. A caller stores only their own subscription token, for their
+    own jobs (per-token models and credentials); a Drella hosted for other people uses
+    API keys (the `anthropic` interface) or the Commercial Terms, per Anthropic's terms
+    (see v0.3, Terms).
+
 ## Open
 
 - **O1. Retention:** how long job logs, artifacts and memory versions are kept.

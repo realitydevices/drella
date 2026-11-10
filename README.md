@@ -20,15 +20,16 @@ here, the plan is for Drella to build itself from these docs. To try it, start w
 ## The idea
 
 - **Jobs:** a prompt (from a template or ad hoc) plus input artifacts, run as a
-  Kubernetes Job by an agent (OpenCode for coding, Hermes for everything else),
-  producing output artifacts and a session record.
+  Kubernetes Job by an agent (OpenCode or Claude Code for coding, Hermes for
+  everything else), producing output artifacts and a session record.
 - **Agents:** a token, a prompt, a place to keep memory and a schedule. A CronJob
   wakes the agent and it picks up where it left off.
 - **Access:** token-based HTTP API, a web UI, and an MCP server so other agents
   (Claude, Hermes, …) can hand out work and check on it.
 - **Credentials:** stored encrypted, per token.
-- **Models:** any LLM endpoint: local (Ollama) or hosted (Claude). v0 supports
-  endpoints that need no API key, such as Ollama.
+- **Models:** any LLM endpoint: local (Ollama) or hosted (e.g. Anthropic, or any
+  OpenAI-compatible API), registered once and named by alias. API keys are stored
+  like any other credential.
 - **Runs on:** Kubernetes (k3s is fine), Postgres, and object storage (in v0, a
   volume on the cluster).
 
