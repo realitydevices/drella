@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# Drella job wrapper [21]. Runs inside the job pod:
+#   1. with a repo (DRELLA_REPO): clones it with the GitHub credential (/creds/github).
+#      Without one: starts in an empty working directory;
+#   2. configures OpenCode for the job's endpoint and model;
+#   3. runs `opencode run` with the prompt and standing instructions: with a repo,
+#      work on a branch, push it and open a PR with gh; without one, write results to /out;
+#   4. collects /out (transcript, plus diff and PR URL for a repo job);
+#   5. reports the final status with the job-scoped token, then uploads /out to the
+#      Drella API. A repo job succeeds only if a PR exists; a job without a repo
+#      succeeds if the agent exits cleanly.
+#
+# Time limits (docs/v0.md): the agent runs under a timer that stops it
+# DRELLA_AGENT_GRACE seconds before DRELLA_DEADLINE (the Job's hard limit). If the pod
+# is told to stop (TERM), the agent is stopped too. Either way, everything after the
+# agent shares whatever time is left: until the deadline, or until the pod's grace
+# period (DRELLA_TERM_GRACE) ends. If the job has already failed when the agent ends
+# (stopped, out of time, killed), that status is reported straight away, before
+# step 4. Step 4 stops RESERVE seconds early, leaving the final status that long to
+# reach the Drella API (less if the provisional report used it up).
+set -uo pipefail
+
+: "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}"
+: "${DRELLA_MODEL:?}" "${DRELLA_ENDPOINT:?}" "${DRELLA_PROMPT:?}"
+OUT=${DRELLA_OUT:-/out}
+WORK=${DRELLA_WORK:-/work}
+CREDS=${DRELLA_CREDS:-/creds}
+REPO=${DRELLA_REPO:-}
+BRANCH="drella/${DRELLA_JOB_ID:0:8}"
+STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+NOW=$(date +%s)
+DEADLINE=${DRELLA_DEADLINE:-$((NOW + 3600))}
+AGENT_GRACE=${DRELLA_AGENT_GRACE:-300}
+TERM_GRACE=${DRELLA_TERM_GRACE:-120}
+MARGIN=10   # stop this long before being killed
+RESERVE=30  # step 4 leaves this long for the final status report
+
+# Everything has to be done by FINISH_BY: the hard deadline, or the end of the grace
+# period once the pod has been told to stop.
+FINISH_BY=$((DEADLINE - MARGIN))
+left() { echo $((FINISH_BY - $(date +%s))); }
+# within MAX CMD...: run a step-4 command for at most MAX seconds, and never into the
+# time reserved for the final status report.
+within() {
+  local t
+  t=$(($(left) - RESERVE))
+  [ "$t" -gt "$1" ] && t=$1
+  [ "$t" -ge 1 ] || return 124
+  shift
+  timeout --kill-after=2 "$t" "$@"
+}
+
+log() { echo "[drella] $*"; }
+
+# Calls to the Drella API. Drella may be restarting (e.g. an upgrade), so retry,
+# including refused connections, for as long as there's time left. The calls are
+# idempotent.
+api() {
+  local t
+  t=$(left)
+  [ "$t" -ge 5 ] || { log "no time left to call the Drella API"; return 1; }
+  timeout "$t" curl -fsS --retry 1000 --retry-delay 5 --retry-max-time "$t" \
+    --retry-connrefused -m 120 -H "Authorization: Bearer $DRELLA_JOB_TOKEN" "$@"
+}
+
+upload_outputs() {
+  local f
+  # Most useful first, in case time runs out.
+  for f in "$OUT/pr-url.txt" "$OUT/diff.patch" "$OUT/transcript.txt" "$OUT"/*; do
+    [ -f "$f" ] || continue
+    case " $uploaded " in *" $f "*) continue ;; esac
+    uploaded="$uploaded $f"
+    log "uploading $(basename "$f")"
+    api -T "$f" "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/outputs/$(basename "$f")" \
+      || log "upload of $(basename "$f") failed"
+  done
+}
+
+# report STATUS MESSAGE: tell Drella the job's status. Drella keeps the latest report
+# while the job runs, so a provisional status can be replaced by a final one.
+report() {
+  log "$1: $2"
+  api -X POST -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg s "$1" --arg m "$2" '{status: $s, message: $m}')" \
+    "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/status" \
+    || log "reporting status failed"
+}
+
+# finish STATUS MESSAGE: report, upload outputs, exit. The status goes first: it
+# matters most, and Drella accepts outputs until the pod has exited.
+uploaded=""
+finish() {
+  phase=finishing
+  report "$1" "$2"
+  upload_outputs
+  [ "$1" = succeeded ]
+  exit
+}
+
+# Where the wrapper is: setup (steps 1-2), agent (3), collect (4), finishing (5).
+phase=setup agent_pid="" stopped=""
+# Told to stop (pod deleted, evicted, node drained). The pod is killed when its grace
+# period ends, so everything left has to fit in it.
+on_term() {
+  [ -n "$stopped" ] && return
+  stopped=1
+  local by=$(($(date +%s) + TERM_GRACE - MARGIN))
+  [ "$by" -lt "$FINISH_BY" ] && FINISH_BY=$by
+  log "told to stop during $phase; finishing within $(left)s"
+  case $phase in
+    setup) finish failed "the job was stopped before the agent started" ;;
+    # Stop the agent. If its pid isn't known yet, that happens as soon as it is.
+    agent) [ -n "$agent_pid" ] && kill -TERM "$agent_pid" 2>/dev/null ;;
+    # collect, finishing: carry on within the shorter time; the result says "stopped".
+  esac
+}
+trap on_term TERM INT
+
+# -- 1. workspace -------------------------------------------------------------
+
+export GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0
+if [ -s "$CREDS/github" ]; then
+  export GH_TOKEN
+  GH_TOKEN=$(<"$CREDS/github")
+  # git authenticates with the same token, for the clone and the agent's pushes.
+  git config --global credential.helper \
+    '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+  if user=$(gh api user --jq '"\(.login) \(.id)"' 2>/dev/null); then
+    read -r login id <<<"$user"
+    git config --global user.name "$login"
+    git config --global user.email "$id+$login@users.noreply.github.com"
+  fi
+fi
+git config --global user.name >/dev/null || git config --global user.name "Drella agent"
+git config --global user.email >/dev/null || git config --global user.email "drella@users.noreply.github.com"
+
+if [ -n "$REPO" ]; then
+  [ -s "$CREDS/github" ] || finish failed "a job with a repo needs a github credential"
+  log "cloning $REPO"
+  git clone "https://github.com/$REPO.git" "$WORK/repo" || finish failed "clone failed"
+  cd "$WORK/repo" || finish failed "no checkout"
+  BASE=$(git rev-parse HEAD)
+  DEFAULT_BRANCH=$(git branch --show-current)
+else
+  mkdir -p "$WORK/space" && cd "$WORK/space" || finish failed "no working directory"
+fi
+
+# -- 2. configure OpenCode -----------------------------------------------------
+
+# OpenCode retries an unreachable endpoint until the job times out, so check first.
+curl -fsS -m 20 -o /dev/null "$DRELLA_ENDPOINT/models" \
+  || finish failed "model endpoint $DRELLA_ENDPOINT is unreachable"
+
+# A custom OpenAI-compatible provider (Ollama serves one at <host>:11434/v1).
+export OPENCODE_CONFIG="$WORK/opencode.json"
+jq -n --arg url "$DRELLA_ENDPOINT" --arg model "$DRELLA_MODEL" '{
+  "$schema": "https://opencode.ai/config.json",
+  provider: {
+    drella: {
+      npm: "@ai-sdk/openai-compatible",
+      name: "Drella endpoint",
+      options: {baseURL: $url},
+      models: {($model): {name: $model}}
+    }
+  },
+  model: "drella/\($model)",
+  autoupdate: false,
+  share: "disabled"
+}' >"$OPENCODE_CONFIG"
+
+# -- 3. run the agent ----------------------------------------------------------
+
+if [ -n "$REPO" ]; then
+read -r -d '' STANDING <<INSTRUCTIONS
+---
+Standing instructions from Drella (always follow these):
+- You are in a clone of https://github.com/$REPO. Its default branch is $DEFAULT_BRANCH.
+- Do the work on a new branch named $BRANCH. Never commit to or push $DEFAULT_BRANCH.
+- Commit your changes and push the branch to origin early and often.
+- When the work is done, open a pull request against $DEFAULT_BRANCH with
+  \`gh pr create\`, with a clear title and a description of what you changed.
+- git and gh are already authenticated. Nobody can answer questions: decide for yourself.
+INSTRUCTIONS
+else
+read -r -d '' STANDING <<INSTRUCTIONS
+---
+Standing instructions from Drella (always follow these):
+- You are in an empty working directory. There is no repository for this job.
+- Write your results as files in $OUT. Anything outside $OUT is thrown away.
+- Nobody can answer questions: decide for yourself.
+INSTRUCTIONS
+fi
+
+# The message starts with a fixed line, so a prompt beginning with "-" can't be
+# read as an OpenCode option.
+MESSAGE="Task from Drella:"$'\n'"$DRELLA_PROMPT"$'\n\n'"$STANDING"
+
+# The soft limit: stop the agent AGENT_GRACE seconds before the hard limit.
+budget=$((DEADLINE - AGENT_GRACE - $(date +%s)))
+[ "$budget" -gt 60 ] || finish failed "no time left to run the agent (the deadline is too close)"
+
+log "running opencode with drella/$DRELLA_MODEL at $DRELLA_ENDPOINT (stops after ${budget}s)"
+# Runs unattended in a throwaway pod, so it may use its tools without asking. It runs
+# in the background so the TERM trap can fire while it works; the inner shell records
+# the agent's pid and exit code.
+phase=agent
+agent_started=$(date +%s)
+{
+  timeout --signal=TERM --kill-after=30 "$budget" \
+    opencode run --dangerously-skip-permissions --model "drella/$DRELLA_MODEL" "$MESSAGE" &
+  echo $! >"$WORK/agent.pid"
+  wait $!
+  echo $? >"$WORK/agent.rc"
+} 2>&1 | tee "$OUT/transcript.txt" &
+pipe_pid=$!
+for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
+agent_pid=$(cat "$WORK/agent.pid" 2>/dev/null)
+# Told to stop before the pid was known.
+[ -n "$stopped" ] && [ -n "$agent_pid" ] && kill -TERM "$agent_pid" 2>/dev/null
+# `wait` returns early when the trap fires, so keep waiting until the agent is done.
+while kill -0 "$pipe_pid" 2>/dev/null; do wait "$pipe_pid"; done
+phase=collect
+rc=$(cat "$WORK/agent.rc" 2>/dev/null)
+[[ "$rc" =~ ^[0-9]+$ ]] || rc=1  # no exit code recorded: treat as a failure
+elapsed=$(($(date +%s) - agent_started))
+log "opencode exited with $rc after ${elapsed}s"
+
+# Why the job has failed, if it already has. Reported straight away, so the status
+# doesn't depend on step 4; the final report adds the PR, if there is one.
+failure() {
+  if [ -n "$stopped" ]; then
+    echo "the job was stopped (pod deleted, evicted or drained)"
+  elif [ "$rc" -ne 0 ] && [ "$elapsed" -ge "$budget" ]; then
+    # Stopped by the timer (124, or 137 if it had to be killed).
+    echo "the agent ran out of time (stopped after ${budget}s)"
+  elif [ "$rc" -eq 137 ]; then
+    echo "the agent was killed (exit 137, possibly out of memory)"
+  elif [ "$rc" -ne 0 ]; then
+    echo "opencode exited with $rc"
+  fi
+}
+reason=$(failure)
+[ -n "$reason" ] && report failed "$reason"
+
+# -- 4. collect outputs --------------------------------------------------------
+
+# Each step is bounded, so a hung tool can't use up the time left for reporting.
+session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
+[ -n "$session" ] && within 20 opencode export "$session" >"$OUT/session.json" 2>/dev/null
+
+pr="" diff_note="" pr_lookup_failed=""
+if [ -n "$REPO" ]; then
+  # Everything that changed since the clone, committed or not.
+  within 30 git add -A -N
+  if ! within 30 git diff --binary "$BASE" >"$OUT/diff.patch"; then
+    diff_note="; diff.patch is incomplete (git diff failed or timed out)"
+  fi
+
+  branch=$(git branch --show-current)
+  pr_lookup_failed=""
+  for b in "$BRANCH" "$branch"; do
+    [ -n "$b" ] && [ "$b" != "$DEFAULT_BRANCH" ] || continue
+    # Only a PR opened by this job counts, not an older one on a reused branch.
+    if ! pr=$(within 20 gh pr list --repo "$REPO" --head "$b" --state all --json url,createdAt \
+      --jq "[.[] | select(.createdAt >= \"$STARTED\")][0].url // empty" 2>/dev/null); then
+      pr="" pr_lookup_failed=1
+    fi
+    [ -n "$pr" ] && break
+  done
+  [ -n "$pr" ] && echo "$pr" >"$OUT/pr-url.txt"
+fi
+
+# -- 5. report -----------------------------------------------------------------
+
+# Told to stop during step 4 counts too: the job didn't get to finish normally.
+reason=$(failure)
+if [ -n "$reason" ]; then
+  finish failed "$reason${pr:+; PR: $pr}$diff_note"
+elif [ -z "$REPO" ]; then
+  finish succeeded "done"
+elif [ -z "$pr" ] && [ -n "$pr_lookup_failed" ]; then
+  finish failed "couldn't check for a pull request (gh pr list failed or timed out)$diff_note"
+elif [ -z "$pr" ]; then
+  finish failed "the agent didn't open a pull request$diff_note"
+else
+  finish succeeded "$pr$diff_note"
+fi
