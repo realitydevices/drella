@@ -56,6 +56,7 @@ BAD_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f"\\{}]')
 # Limits that fit the database columns (Integer, Numeric(12, 4)).
 MAX_TOKENS = 10_000_000
 MAX_COST = 100_000
+MAX_USAGE_TOKENS = 10**13
 
 
 # -- schemas -----------------------------------------------------------------
@@ -200,6 +201,18 @@ class JobModelOut(BaseModel):
     cost_out_per_mtok: Decimal | None
 
 
+class UsageOut(BaseModel):
+    """What the job's agent used. Any count may be null: a job whose agent reported no
+    usage has none of these."""
+
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
+    peak_context_tokens: int | None
+    cost_usd: Decimal | None
+
+
 class JobOut(BaseModel):
     id: str
     status: str
@@ -207,15 +220,32 @@ class JobOut(BaseModel):
     repo: str | None
     model: JobModelOut
     message: str | None
+    usage: UsageOut | None = None
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
     outputs: list[str] | None = None
 
 
+class UsageIn(BaseModel):
+    """Token usage summed by the wrapper from the agent's session record [46]. Strict:
+    "5" or 1.5 isn't a token count."""
+
+    model_config = ConfigDict(strict=True)
+
+    input_tokens: int = Field(ge=0, le=MAX_USAGE_TOKENS)
+    output_tokens: int = Field(ge=0, le=MAX_USAGE_TOKENS)
+    cache_read_tokens: int = Field(default=0, ge=0, le=MAX_USAGE_TOKENS)
+    cache_write_tokens: int = Field(default=0, ge=0, le=MAX_USAGE_TOKENS)
+    peak_context_tokens: int | None = Field(default=None, ge=0, le=MAX_USAGE_TOKENS)
+    # What the agent says the job cost; computed from the model's prices if absent.
+    cost_usd: float | None = Field(default=None, ge=0, le=MAX_COST)
+
+
 class StatusIn(BaseModel):
     status: Literal["succeeded", "failed"]
     message: str | None = None
+    usage: UsageIn | None = None
 
     @field_validator("message")
     @classmethod
@@ -223,6 +253,25 @@ class StatusIn(BaseModel):
         if v is not None:
             _no_null(v)
         return v
+
+
+def record_usage(job: Job, u: UsageIn) -> None:
+    """Store the job's usage. Without a cost from the agent, price input and output
+    tokens at the job's model snapshot (cache tokens aren't priced); with no prices
+    either, the cost stays null."""
+    job.input_tokens = u.input_tokens
+    job.output_tokens = u.output_tokens
+    job.cache_read_tokens = u.cache_read_tokens
+    job.cache_write_tokens = u.cache_write_tokens
+    job.peak_context_tokens = u.peak_context_tokens
+    if u.cost_usd is not None:
+        job.cost_usd = Decimal(str(u.cost_usd))
+    elif job.cost_in_per_mtok is not None and job.cost_out_per_mtok is not None:
+        job.cost_usd = (
+            u.input_tokens * job.cost_in_per_mtok + u.output_tokens * job.cost_out_per_mtok
+        ) / 1_000_000
+    else:
+        job.cost_usd = None
 
 
 def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
@@ -243,6 +292,14 @@ def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
             cost_out_per_mtok=job.cost_out_per_mtok,
         ),
         message=job.message,
+        usage=None if job.input_tokens is None else UsageOut(
+            input_tokens=job.input_tokens,
+            output_tokens=job.output_tokens,
+            cache_read_tokens=job.cache_read_tokens,
+            cache_write_tokens=job.cache_write_tokens,
+            peak_context_tokens=job.peak_context_tokens,
+            cost_usd=job.cost_usd,
+        ),
         created_at=job.created_at,
         started_at=job.started_at,
         finished_at=job.finished_at,
@@ -727,6 +784,8 @@ def report_status(
     # log has been archived.
     job.reported_status = body.status
     job.message = body.message
+    if body.usage is not None:
+        record_usage(job, body.usage)
     db.commit()
     return Response(status_code=204)
 

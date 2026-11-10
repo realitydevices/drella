@@ -747,3 +747,74 @@ def test_claude_code_job_needs_its_token(client, auth):
     client.put("/models/cc", json=CLAUDE_CODE, headers=auth)
     r = client.post("/jobs", json={**JOB, "repo": None, "model": "cc"}, headers=auth)
     assert r.status_code == 422 and "claude-oauth" in r.json()["detail"]
+
+
+# -- usage [46] ------------------------------------------------------------------
+
+
+USAGE = {"input_tokens": 1000, "output_tokens": 500, "cache_read_tokens": 200,
+         "cache_write_tokens": 30, "peak_context_tokens": 1230}
+
+
+def _report(client, jid, ja, usage):
+    return client.post(f"/jobs/{jid}/status", json={"status": "succeeded", "usage": usage}, headers=ja)
+
+
+def test_job_without_usage_shows_none(client, auth, job):
+    assert client.get(f"/jobs/{job['id']}", headers=auth).json()["usage"] is None
+
+
+def test_usage_is_stored_and_listed_with_the_reported_cost(client, auth, job, queue, runner):
+    queue.tick()
+    jid = job["id"]
+    assert _report(client, jid, job_auth(runner, jid), USAGE | {"cost_usd": 0.25}).status_code == 204
+    want = USAGE | {"cost_usd": "0.250000"}
+    assert client.get(f"/jobs/{jid}", headers=auth).json()["usage"] == want
+    listed = client.get("/jobs", headers=auth).json()
+    assert [j["usage"] for j in listed] == [want]
+
+
+def test_cost_is_computed_from_the_model_snapshot(client, auth, queue, runner):
+    client.put("/models/priced", json=LOCAL | {"cost_in_per_mtok": "3", "cost_out_per_mtok": "15"}, headers=auth)
+    client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
+    job = client.post("/jobs", json=JOB | {"model": "priced"}, headers=auth).json()
+    # Changing the model's prices afterwards doesn't change the job's.
+    client.put("/models/priced", json=LOCAL | {"cost_in_per_mtok": "100", "cost_out_per_mtok": "100"}, headers=auth)
+    queue.tick()
+    jid = job["id"]
+    usage = {"input_tokens": 2_000_000, "output_tokens": 100_000}
+    assert _report(client, jid, job_auth(runner, jid), usage).status_code == 204
+    got = client.get(f"/jobs/{jid}", headers=auth).json()["usage"]
+    assert float(got["cost_usd"]) == 7.5  # 2 * 3 + 0.1 * 15
+    assert got["cache_read_tokens"] == 0 and got["peak_context_tokens"] is None
+
+
+def test_cost_stays_empty_without_a_report_or_prices(client, auth, job, queue, runner):
+    queue.tick()
+    jid = job["id"]
+    assert _report(client, jid, job_auth(runner, jid), USAGE).status_code == 204
+    assert client.get(f"/jobs/{jid}", headers=auth).json()["usage"]["cost_usd"] is None
+
+
+def test_later_status_without_usage_keeps_earlier_usage(client, auth, job, queue, runner):
+    queue.tick()
+    jid, ja = job["id"], job_auth(runner, job["id"])
+    assert _report(client, jid, ja, USAGE).status_code == 204
+    assert client.post(f"/jobs/{jid}/status", json={"status": "failed"}, headers=ja).status_code == 204
+    assert client.get(f"/jobs/{jid}", headers=auth).json()["usage"]["input_tokens"] == 1000
+
+
+@pytest.mark.parametrize("bad", [
+    {"input_tokens": -1, "output_tokens": 0}, {"input_tokens": 1.5, "output_tokens": 0},
+    {"input_tokens": "5", "output_tokens": 0}, {"input_tokens": 1},
+    {"input_tokens": 1, "output_tokens": 1, "cost_usd": -0.01},
+    {"input_tokens": 1, "output_tokens": 1, "cost_usd": "lots"},
+    {"input_tokens": 1, "output_tokens": 1, "cache_read_tokens": -5},
+    {"input_tokens": 1, "output_tokens": 1, "peak_context_tokens": -5},
+    {"input_tokens": 10**15, "output_tokens": 1},
+])
+def test_bad_usage_is_rejected(client, auth, job, queue, runner, bad):
+    queue.tick()
+    jid = job["id"]
+    assert _report(client, jid, job_auth(runner, jid), bad).status_code == 422
+    assert client.get(f"/jobs/{jid}", headers=auth).json()["usage"] is None
