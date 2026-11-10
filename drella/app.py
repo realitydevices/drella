@@ -25,7 +25,7 @@ from drella import crypto
 from drella.adapters import LLM_KEY_SECRET, Interface
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
-from drella.github import GitHubApp, GitHubAppError
+from drella.github import GitHubApp
 from drella.models import QUEUED, RUNNING, TERMINAL, Credential, Job, Model, Token
 from drella.queue import Queue, archived_log, output_prefix
 from drella.runner import JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
@@ -104,6 +104,14 @@ class JobIn(BaseModel):
     @classmethod
     def _no_null(cls, v):
         return _no_null(v)
+
+    @field_validator("repo")
+    @classmethod
+    def _no_dot_names(cls, v: str | None) -> str | None:
+        # "." and ".." are never owner or repo names; they'd end up in URL paths.
+        if v is not None and any(part in (".", "..") for part in v.split("/")):
+            raise ValueError("not a GitHub repo (owner/name)")
+        return v
 
 
 def check_model_credential(name: str | None) -> None:
@@ -212,11 +220,6 @@ class JobOut(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     outputs: list[str] | None = None
-
-
-class GitHubTokenOut(BaseModel):
-    token: str
-    expires_at: str | None
 
 
 class StatusIn(BaseModel):
@@ -413,6 +416,22 @@ def put_credential(
         db.add(Credential(token_id=c.token.id, name=name, ciphertext=ciphertext))
     else:
         cred.ciphertext = ciphertext
+    db.commit()
+    return Response(status_code=204)
+
+
+@router.delete("/credentials/{name}", status_code=204)
+def delete_credential(
+    name: Annotated[str, Path(pattern=NAME_RE)], c: CallerDep, db: DbDep
+) -> Response:
+    """E.g. a stored `github` credential, which otherwise always wins over Drella's
+    GitHub App. Jobs already created keep the credentials they were given."""
+    cred = db.scalar(
+        select(Credential).where(Credential.token_id == c.token.id, Credential.name == name)
+    )
+    if cred is None:
+        raise HTTPException(404, "no such credential")
+    db.delete(cred)
     db.commit()
     return Response(status_code=204)
 
@@ -770,22 +789,3 @@ async def put_output(
         key = output_prefix(job.id) + name
         await run_in_threadpool(deps.storage.put, key, iter(lambda: f.read(CHUNK), b""))
     return Response(status_code=204)
-
-
-@router.post("/jobs/{job_id}/github-token")
-def github_token(job: Annotated[Job, Depends(job_itself)], deps: DepsDep) -> GitHubTokenOut:
-    """A fresh GitHub token for the job's own repo, for a job whose token comes from
-    Drella's GitHub App. The token minted at launch lasts an hour, which a job that
-    runs to its time limit can outlive before it checks for its PR."""
-    if not job.repo:
-        raise HTTPException(409, "the job has no repo")
-    if not job.github_app:
-        raise HTTPException(409, "the job uses its caller's github credential")
-    if deps.github_app is None:
-        raise HTTPException(409, "this Drella has no GitHub App")
-    try:
-        token = deps.github_app.token(job.repo)
-    except GitHubAppError as e:
-        log.warning("minting a GitHub token for job %s failed: %s", job.id, e)
-        raise HTTPException(502, str(e)) from None
-    return GitHubTokenOut(token=token.token, expires_at=token.expires_at)

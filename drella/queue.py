@@ -10,6 +10,7 @@ v0 has one queue group with concurrency 1. Each tick:
 3. now and then, deletes job Secrets whose job has finished or doesn't exist.
 """
 
+import dataclasses
 import itertools
 import logging
 import threading
@@ -21,8 +22,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from drella.adapters import Interface, ModelSpec
-from drella.github import GitHubApp
-from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job
+from drella.github import PROFILES, GitHubApp
+from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, Token
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState
 from drella.storage import CHUNK, NotFound, Storage
 
@@ -164,12 +165,15 @@ class Queue:
         self._last_tick = time.monotonic()
 
     def _launch(self, s: Session, job: Job) -> None:
-        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt, github_app=job.github_app)
+        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt)
         try:
             if job.github_app and job.repo:
-                self._mint_github_token(job)
+                spec = self._mint_github_token(s, job, spec)
             self.runner.launch(spec)
         except Exception as e:
+            # A failed mint fails the job rather than leaving it queued: the queue
+            # always takes the oldest queued job, so one that can't launch would block
+            # every job behind it. GitHubAppError messages carry no secrets.
             log.exception("launching job %s failed", job.id)
             self._finish(s, job, FAILED, f"launch failed: {e}")
             self._cleanup(job.id)
@@ -179,18 +183,36 @@ class Queue:
         s.commit()
         log.info("job %s launched", job.id)
 
-    def _mint_github_token(self, job: Job) -> None:
-        """The job's GitHub token, minted now rather than at job creation: a queued job
-        can wait longer than a token lasts (an hour). It goes into the job's Secret where
-        a caller's `github` credential would be, and never into the database."""
+    def _mint_github_token(self, s: Session, job: Job, spec: JobSpec) -> JobSpec:
+        """The job's GitHub token, minted at dispatch rather than at job creation: a
+        queued job can wait longer than a token lasts (an hour). Its permissions are its
+        Drella token's GitHub profile, read now, so a profile an admin has narrowed
+        applies to jobs still queued. It goes into the job's Secret where a caller's
+        `github` credential would be, and never into the database. The job's deadline is
+        capped at the token's expiry, so the token outlasts everything the job does."""
         if self.github_app is None:
             raise RuntimeError(
                 "the job needs a token from Drella's GitHub App, which is no longer"
                 " configured (DRELLA_GITHUB_APP_ID)"
             )
-        token = self.github_app.token(job.repo)
-        self.runner.add_secrets(job.id, {"github": token.token})
-        log.info("minted a GitHub App token for job %s (%s)", job.id, job.repo)
+        token_row = s.get(Token, job.token_id)
+        profile = PROFILES.get(token_row.github_profile) if token_row else None
+        if profile is None:
+            raise RuntimeError("the job's Drella token has no known GitHub profile")
+        token = self.github_app.token(job.repo, profile)
+        try:
+            self.runner.add_secrets(job.id, {"github": token.token})
+        except Exception as e:
+            # Don't pass on the cluster's error text: it may quote the request.
+            log.error("adding the GitHub token to job %s's Secret failed (%s)", job.id,
+                      type(e).__name__)
+            raise RuntimeError("couldn't add the GitHub token to the job's Secret") from None
+        log.info(
+            "minted a GitHub App token for job %s (%s, profile %s)", job.id, job.repo, profile.name
+        )
+        return dataclasses.replace(
+            spec, opens_prs=profile.opens_prs, github_token_expires=token.expires
+        )
 
     def _check(self, s: Session, job: Job) -> None:
         st = self.runner.status(job.id)

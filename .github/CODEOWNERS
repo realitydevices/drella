@@ -1,0 +1,4 @@
+# Every change needs the owner's review. With "Require review from Code Owners" on
+# main's branch protection, an approval from drella-bot (or any other App or user
+# that isn't listed here) doesn't count. See deploy/README.md, "Approvals".
+* @realitydevices

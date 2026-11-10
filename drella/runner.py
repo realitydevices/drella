@@ -26,9 +26,12 @@ class JobSpec:
     repo: str | None
     model: ModelSpec
     prompt: str
-    # The job's GitHub token was minted by Drella's GitHub App, so the wrapper may ask
-    # for a fresh one (POST /jobs/{id}/github-token) before it checks for the PR.
-    github_app: bool = False
+    # A repo job pushes a branch and opens a PR, unless its GitHub token is read-only
+    # (a GitHub App token with a profile that can't): then it writes results to /out.
+    opens_prs: bool = True
+    # When the job's GitHub App token expires (epoch seconds), if it has one. The job's
+    # deadline is capped at it, so the token outlasts everything the wrapper does.
+    github_token_expires: float | None = None
 
 
 class RunState(StrEnum):
@@ -184,11 +187,16 @@ class KubernetesRunner:
             env["DRELLA_PREFLIGHT_HEADERS"] = "\n".join(check.headers)
         if spec.repo:
             env["DRELLA_REPO"] = spec.repo
-            if spec.github_app:
-                env["DRELLA_GITHUB_REFRESH"] = "1"
+            if not spec.opens_prs:
+                env["DRELLA_REPO_READ_ONLY"] = "1"
         # The soft limit: the wrapper stops the agent this long before the hard limit
-        # (activeDeadlineSeconds), which runs from roughly now.
-        env["DRELLA_DEADLINE"] = str(int(time.time()) + s.job_timeout_seconds)
+        # (activeDeadlineSeconds), which runs from roughly now. The wrapper finishes
+        # everything (PR check, auto-merge, report) before DRELLA_DEADLINE, so capping it
+        # at the GitHub token's expiry means the token never runs out mid-job.
+        deadline = int(time.time()) + s.job_timeout_seconds
+        if spec.github_token_expires is not None:
+            deadline = min(deadline, int(spec.github_token_expires))
+        env["DRELLA_DEADLINE"] = str(deadline)
         env["DRELLA_AGENT_GRACE"] = str(s.agent_grace_seconds)
         # Once told to stop, the wrapper has this long to report before it's killed.
         env["DRELLA_TERM_GRACE"] = str(s.job_termination_grace_seconds)

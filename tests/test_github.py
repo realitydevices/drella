@@ -13,8 +13,18 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from drella.github import PERMISSIONS, GitHubApp, GitHubAppError, app_jwt, load_key
+from drella.github import (
+    DEFAULT_PROFILE,
+    PROFILES,
+    GitHubApp,
+    GitHubAppError,
+    InstallationToken,
+    app_jwt,
+    load_key,
+)
 from drella.runner import JOB_TOKEN_KEY, RunState, RunStatus
+
+BUILDER, READER = PROFILES["builder"], PROFILES["reader"]
 
 APP_ID = "123456"
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -49,6 +59,9 @@ class FakeGitHub:
         self.requests: list[tuple[str, str, dict | None]] = []
         self.token_status = 201
         self.minted = 0
+        # What GitHub says it granted; None: exactly what was asked for, as GitHub does.
+        self.granted: dict | None = None
+        self.expires_in = 3600
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -102,9 +115,17 @@ class FakeGitHub:
                         fake.token_status, {"message": "The permissions requested are not granted"}
                     )
                 fake.minted += 1
+                expires = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + fake.expires_in)
+                )
                 self._reply(
                     201,
-                    {"token": f"ghs_minted{fake.minted:04d}", "expires_at": "2026-11-10T13:00:00Z"},
+                    {
+                        "token": f"ghs_minted{fake.minted:04d}",
+                        "expires_at": expires,
+                        "permissions": fake.granted or {**body["permissions"], "metadata": "read"},
+                        "repository_selection": "selected",
+                    },
                 )
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -163,10 +184,36 @@ def test_a_bad_key_file_is_reported_without_its_contents(tmp_path):
 # -- minting --------------------------------------------------------------------
 
 
+# -- profiles -------------------------------------------------------------------
+
+
+def test_the_profiles_and_their_permissions():
+    # Pinned exactly: a change here changes what every job of a profile can do.
+    assert {p.name: p.permissions for p in PROFILES.values()} == {
+        "builder": {"contents": "write", "pull_requests": "write", "issues": "read"},
+        "reader": {"contents": "read", "pull_requests": "read", "issues": "read"},
+    }
+    assert BUILDER.opens_prs and not READER.opens_prs
+    assert DEFAULT_PROFILE == "reader"
+
+
+def test_no_profile_can_touch_workflows_or_administer_the_repo():
+    for p in PROFILES.values():
+        assert set(p.permissions) <= {"contents", "pull_requests", "issues"}, p.name
+        assert set(p.permissions.values()) <= {"read", "write"}, p.name
+        # Only a profile that can open PRs can write anything.
+        assert p.opens_prs or "write" not in p.permissions.values(), p.name
+
+
+# -- minting --------------------------------------------------------------------
+
+
 def test_mint_looks_up_the_installation_and_asks_for_a_one_repo_token(gh_app, github):
-    token = gh_app.token("octo/widgets")
+    before = time.time()
+    token = gh_app.token("octo/widgets", BUILDER)
     assert token.token == "ghs_minted0001"
-    assert token.expires_at == "2026-11-10T13:00:00Z"
+    assert before + 3590 < token.expires <= time.time() + 3600
+    assert "ghs_" not in repr(token)
     assert github.requests == [
         ("GET", "/repos/octo/widgets/installation", None),
         (
@@ -182,19 +229,59 @@ def test_mint_looks_up_the_installation_and_asks_for_a_one_repo_token(gh_app, gi
             },
         ),
     ]
-    assert PERMISSIONS == github.requests[1][2]["permissions"]
+
+
+def test_a_reader_token_asks_for_read_access_only(gh_app, github):
+    gh_app.token("octo/widgets", READER)
+    assert github.requests[-1][2] == {
+        "repositories": ["widgets"],
+        "permissions": {"contents": "read", "pull_requests": "read", "issues": "read"},
+    }
+
+
+@pytest.mark.parametrize(
+    "granted",
+    [
+        {"contents": "write", "pull_requests": "read", "issues": "read"},
+        {"contents": "read", "pull_requests": "read", "issues": "read", "workflows": "write"},
+        {"contents": "read", "pull_requests": "read", "issues": "read", "administration": "x"},
+    ],
+)
+def test_a_token_wider_than_its_profile_is_never_used(gh_app, github, granted):
+    github.granted = granted
+    with pytest.raises(GitHubAppError, match="granted more than the 'reader' profile") as e:
+        gh_app.token("octo/widgets", READER)
+    assert "ghs_" not in str(e.value)
+
+
+def test_the_expiry_is_never_later_than_an_hour_from_now(gh_app, github):
+    github.expires_in = 7200  # GitHub's clock ahead, or a longer token
+    assert gh_app.token("octo/widgets", BUILDER).expires <= time.time() + 3600
+    github.expires_in = 1800
+    assert gh_app.token("octo/widgets", BUILDER).expires <= time.time() + 1800
+
+
+@pytest.mark.parametrize("repo", ["octo/..", "../widgets", "octo/.", "octo", "a/b/c"])
+def test_mint_refuses_a_repo_that_isnt_owner_name(gh_app, github, repo):
+    with pytest.raises(GitHubAppError, match="isn't a GitHub repo"):
+        gh_app.token(repo, BUILDER)
+    assert github.requests == []
+
+
+def test_installation_token_repr_hides_the_token():
+    assert "secret" not in repr(InstallationToken("ghs_secret123", 0.0))
 
 
 def test_mint_fails_clearly_when_the_app_is_not_installed(gh_app, github):
     with pytest.raises(GitHubAppError, match="isn't installed on octo/other"):
-        gh_app.token("octo/other")
+        gh_app.token("octo/other", BUILDER)
     assert [m for m, *_ in github.requests] == ["GET"]
 
 
 def test_mint_reports_githubs_refusal(gh_app, github):
     github.token_status = 422
     with pytest.raises(GitHubAppError, match="HTTP 422.*permissions requested are not granted"):
-        gh_app.token("octo/widgets")
+        gh_app.token("octo/widgets", BUILDER)
 
 
 def test_mint_with_the_wrong_key_is_refused(github, tmp_path):
@@ -208,18 +295,18 @@ def test_mint_with_the_wrong_key_is_refused(github, tmp_path):
         )
     )
     with pytest.raises(GitHubAppError, match="HTTP 401"):
-        GitHubApp(APP_ID, str(p), github.url, timeout=5).token("octo/widgets")
+        GitHubApp(APP_ID, str(p), github.url, timeout=5).token("octo/widgets", BUILDER)
 
 
 def test_mint_never_follows_a_redirect(gh_app, github):
     with pytest.raises(GitHubAppError, match="HTTP 301"):
-        gh_app.token("octo/moved")
+        gh_app.token("octo/moved", BUILDER)
 
 
 def test_mint_reports_an_unreachable_github(key_file):
     app = GitHubApp(APP_ID, str(key_file), "http://127.0.0.1:1", timeout=2)
     with pytest.raises(GitHubAppError, match="couldn't reach GitHub"):
-        app.token("octo/widgets")
+        app.token("octo/widgets", BUILDER)
 
 
 def test_from_settings(settings, key_file, tmp_path):
@@ -256,9 +343,19 @@ def app_client(app_settings, runner, storage):
 
 @pytest.fixture
 def app_auth(app_settings, app_client):
+    """A builder token: drella-bot's normal use."""
     from drella.cli import create_token
 
-    auth = {"Authorization": f"Bearer {create_token(app_settings, 'alice')}"}
+    auth = {"Authorization": f"Bearer {create_token(app_settings, 'alice', 'builder')}"}
+    assert app_client.put("/models/local", json=LOCAL, headers=auth).status_code == 200
+    return auth
+
+
+@pytest.fixture
+def reader_auth(app_settings, app_client):
+    from drella.cli import create_token
+
+    auth = {"Authorization": f"Bearer {create_token(app_settings, 'rita')}"}  # the default
     assert app_client.put("/models/local", json=LOCAL, headers=auth).status_code == 200
     return auth
 
@@ -276,11 +373,75 @@ def test_a_repo_job_without_a_credential_gets_an_app_token_at_launch(
     # Nothing is minted while the job is queued: it could wait longer than an hour.
     assert "github" not in runner.secrets[jid]
     assert github.minted == 0
+    before = time.time()
     app_client.queue.tick()
     assert runner.secrets[jid]["github"] == "ghs_minted0001"
+    assert github.requests[-1][2]["permissions"] == BUILDER.permissions
     (spec,) = runner.launched
-    assert spec.github_app is True
+    assert spec.opens_prs is True
+    # The job's deadline is capped at the token's expiry (see test_runner.py).
+    assert before + 3590 < spec.github_token_expires <= time.time() + 3600
     assert app_client.get(f"/jobs/{jid}", headers=app_auth).json()["status"] == "running"
+
+
+def test_a_reader_tokens_job_gets_a_read_only_token_and_opens_no_pr(
+    app_client, reader_auth, runner, github
+):
+    jid = app_client.post("/jobs", json=JOB, headers=reader_auth).json()["id"]
+    app_client.queue.tick()
+    assert github.requests[-1][2] == {
+        "repositories": ["widgets"],
+        "permissions": {"contents": "read", "pull_requests": "read", "issues": "read"},
+    }
+    (spec,) = runner.launched
+    assert spec.opens_prs is False
+    assert runner.secrets[jid]["github"] == "ghs_minted0001"
+
+
+def test_a_caller_cannot_choose_the_jobs_github_access(app_client, reader_auth, github):
+    # Not per job: the request can't name a profile or permissions.
+    for extra in (
+        {"github_profile": "builder"},
+        {"permissions": {"contents": "write"}},
+        {"profile": "builder"},
+    ):
+        r = app_client.post("/jobs", json=JOB | extra, headers=reader_auth)
+        assert r.status_code == 422, extra
+    # And the API has no route that changes a token's profile: only the CLI does.
+    paths = set(app_client.get("/openapi.json").json()["paths"])
+    assert "/jobs" in paths
+    assert not any("token" in p or "profile" in p for p in paths), paths
+    assert github.requests == []
+
+
+def test_the_profile_is_read_when_the_job_launches(app_client, app_auth, app_settings, github):
+    """An admin who narrows a token's profile narrows its queued jobs too."""
+    from drella.cli import list_tokens, set_profile
+
+    app_client.post("/jobs", json=JOB, headers=app_auth)
+    ((tid, name, profile),) = list_tokens(app_settings)
+    assert (name, profile) == ("alice", "builder")
+    set_profile(app_settings, tid, "reader")
+    app_client.queue.tick()
+    assert github.requests[-1][2]["permissions"] == READER.permissions
+
+
+def test_an_unknown_profile_fails_the_launch_without_minting(
+    app_client, app_auth, app_settings, runner, github
+):
+    from sqlalchemy import text
+
+    from drella.db import make_engine
+
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    engine = make_engine(app_settings.database_url)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE tokens SET github_profile = 'admin'"))
+    engine.dispose()
+    app_client.queue.tick()
+    got = app_client.get(f"/jobs/{jid}", headers=app_auth).json()
+    assert got["status"] == "failed" and "no known GitHub profile" in got["message"]
+    assert github.requests == [] and runner.launched == []
 
 
 def test_the_minted_token_is_never_stored_in_the_database(
@@ -301,18 +462,40 @@ def test_the_minted_token_is_never_stored_in_the_database(
     assert runner.secrets[jid]["github"].startswith("ghs_minted")
 
 
+def test_a_secret_patch_failure_fails_the_job_without_quoting_the_cluster(
+    app_client, app_auth, runner, github
+):
+    def broken(job_id, secrets):
+        raise RuntimeError(f"422 Unprocessable: {secrets}")  # an error that quotes the request
+
+    runner.add_secrets = broken
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    app_client.queue.tick()
+    got = app_client.get(f"/jobs/{jid}", headers=app_auth).json()
+    assert got["status"] == "failed"
+    assert "couldn't add the GitHub token" in got["message"]
+    assert "ghs_" not in got["message"]
+    assert runner.cleaned == [jid]
+
+
 def test_a_stored_github_credential_wins_over_the_app(app_client, app_auth, runner, github):
     app_client.put("/credentials/github", json={"value": "github_pat_mine"}, headers=app_auth)
     jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
     app_client.queue.tick()
     assert runner.secrets[jid]["github"] == "github_pat_mine"
     (spec,) = runner.launched
-    assert spec.github_app is False
+    assert spec.github_token_expires is None and spec.opens_prs is True
     assert github.requests == []
-    # And no refresh for it.
-    ja = job_auth(runner, jid)
-    r = app_client.post(f"/jobs/{jid}/github-token", headers=ja)
-    assert r.status_code == 409 and "caller's github credential" in r.json()["detail"]
+
+
+def test_deleting_the_stored_credential_switches_to_the_app(app_client, app_auth, runner, github):
+    app_client.put("/credentials/github", json={"value": "github_pat_stale"}, headers=app_auth)
+    assert app_client.delete("/credentials/github", headers=app_auth).status_code == 204
+    assert app_client.get("/credentials", headers=app_auth).json() == []
+    assert app_client.delete("/credentials/github", headers=app_auth).status_code == 404
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    app_client.queue.tick()
+    assert runner.secrets[jid]["github"] == "ghs_minted0001"
 
 
 def test_a_job_without_a_repo_gets_no_github_token(app_client, app_auth, runner, github):
@@ -321,8 +504,13 @@ def test_a_job_without_a_repo_gets_no_github_token(app_client, app_auth, runner,
     app_client.queue.tick()
     assert set(runner.secrets[jid]) == {JOB_TOKEN_KEY}
     assert github.requests == []
-    r = app_client.post(f"/jobs/{jid}/github-token", headers=job_auth(runner, jid))
-    assert r.status_code == 409
+
+
+@pytest.mark.parametrize("repo", ["octo/..", "../widgets", "octo/.", "./widgets"])
+def test_a_dot_repo_is_refused_at_creation(app_client, app_auth, github, repo):
+    r = app_client.post("/jobs", json=JOB | {"repo": repo}, headers=app_auth)
+    assert r.status_code == 422
+    assert github.requests == []
 
 
 def test_without_an_app_or_a_credential_a_repo_job_is_refused(client, auth):
@@ -345,57 +533,24 @@ def test_a_repo_the_app_is_not_installed_on_fails_at_launch(app_client, app_auth
 def test_a_mint_failure_fails_the_job_and_the_queue_moves_on(app_client, app_auth, runner, github):
     github.token_status = 500
     first = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    second = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
     app_client.queue.tick()
     got = app_client.get(f"/jobs/{first}", headers=app_auth).json()
     assert got["status"] == "failed" and "HTTP 500" in got["message"]
+    # A failed launch takes its slot for the rest of the tick; the next job is tried at
+    # the next tick, not stuck behind it.
+    app_client.queue.tick()
+    assert app_client.get(f"/jobs/{second}", headers=app_auth).json()["status"] == "failed"
     github.token_status = 201
-    second = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    third = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
     app_client.queue.tick()
-    assert app_client.get(f"/jobs/{second}", headers=app_auth).json()["status"] == "running"
+    assert app_client.get(f"/jobs/{third}", headers=app_auth).json()["status"] == "running"
 
 
-# -- the refresh endpoint -------------------------------------------------------
-
-
-def test_a_running_app_job_can_refresh_its_token(app_client, app_auth, runner, github):
+def test_there_is_no_token_refresh_route(app_client, app_auth, runner):
+    """The token minted at dispatch is the job's only one: a job (or a prompt-injected
+    agent holding its job token) can't mint more."""
     jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
-    ja = job_auth(runner, jid)
-    # Queued: the pod doesn't exist yet, as for the other job routes.
-    assert app_client.post(f"/jobs/{jid}/github-token", headers=ja).status_code == 409
-    app_client.queue.tick()
-    r = app_client.post(f"/jobs/{jid}/github-token", headers=ja)
-    assert r.status_code == 200, r.text
-    assert r.json() == {"token": "ghs_minted0002", "expires_at": "2026-11-10T13:00:00Z"}
-    # For the job's own repo only, with the same permissions.
-    assert github.requests[-2][1] == "/repos/octo/widgets/installation"
-    assert github.requests[-1][2]["repositories"] == ["widgets"]
-
-
-def test_refresh_needs_the_jobs_own_token(app_client, app_auth, runner, github):
-    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
-    other = app_client.post("/jobs", json=JOB | {"repo": "octo/gadgets"}, headers=app_auth)
-    app_client.queue.tick()
-    url = f"/jobs/{jid}/github-token"
-    # The caller's token isn't a job token; another job's token isn't this job's.
-    assert app_client.post(url, headers=app_auth).status_code == 401
-    assert app_client.post(url, headers=job_auth(runner, other.json()["id"])).status_code == 401
-    assert app_client.post(url).status_code == 401
-    assert github.minted == 1  # only the launch
-
-
-def test_refresh_stops_once_the_job_has_finished(app_client, app_auth, runner):
-    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
-    app_client.queue.tick()
-    runner.states[jid] = RunStatus(RunState.SUCCEEDED)
     app_client.queue.tick()
     r = app_client.post(f"/jobs/{jid}/github-token", headers=job_auth(runner, jid))
-    assert r.status_code == 409
-
-
-def test_a_failed_refresh_is_a_502_without_secrets(app_client, app_auth, runner, github):
-    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
-    app_client.queue.tick()
-    github.token_status = 500
-    r = app_client.post(f"/jobs/{jid}/github-token", headers=job_auth(runner, jid))
-    assert r.status_code == 502
-    assert "HTTP 500" in r.json()["detail"] and "ghs_" not in r.text
+    assert r.status_code in (404, 405)
