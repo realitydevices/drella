@@ -126,3 +126,54 @@ def test_0003_downgrade_keeps_finished_claude_code_jobs(settings):
         assert conn.execute(text("SELECT base_url FROM jobs")).scalar() == ""
     _upgrade(engine, "head")
     engine.dispose()
+
+
+def _insert_model(engine, alias, interface, base_url, credential=None):
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO models (owner_token_id, alias, interface, base_url, model_id,"
+                 " credential, created_at, updated_at) VALUES (1, :a, :i, :u, 'm', :c,"
+                 " :now, :now)"),
+            {"a": alias, "i": interface, "u": base_url, "c": credential,
+             "now": datetime.now(UTC)},
+        )
+
+
+def test_0003_upgrade_keeps_models_and_jobs(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "0002")
+    _seed_token(engine)
+    _insert_model(engine, "local", "openai-compatible", "http://ollama:11434/v1")
+    _insert_model(engine, "claude", "anthropic", "https://api.anthropic.com/v1", "k")
+    _insert_v02_job(engine, "j1", "succeeded")
+    _insert_v02_job(engine, "j2", "queued", interface="anthropic", credential="k")
+    _upgrade(engine, "0003")
+    with engine.connect() as conn:
+        models = conn.execute(
+            text("SELECT alias, interface, base_url, credential FROM models ORDER BY alias")
+        ).all()
+        jobs = conn.execute(
+            text("SELECT id, status, interface, base_url, model_id FROM jobs ORDER BY id")
+        ).all()
+    assert [tuple(m) for m in models] == [
+        ("claude", "anthropic", "https://api.anthropic.com/v1", "k"),
+        ("local", "openai-compatible", "http://ollama:11434/v1", None),
+    ]
+    assert [tuple(j) for j in jobs] == [
+        ("j1", "succeeded", "openai-compatible", "http://ollama:11434/v1", "real-model"),
+        ("j2", "queued", "anthropic", "http://ollama:11434/v1", "real-model"),
+    ]
+    engine.dispose()
+
+
+def test_0003_downgrade_deletes_claude_code_models_only(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "head")
+    _seed_token(engine)
+    _insert_model(engine, "local", "openai-compatible", "http://ollama:11434/v1")
+    _insert_model(engine, "sub", "claude-code", None, "oauth")
+    _downgrade(engine, "0002")
+    with engine.connect() as conn:
+        aliases = conn.execute(text("SELECT alias FROM models")).scalars().all()
+    assert aliases == ["local"]
+    engine.dispose()
