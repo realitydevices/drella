@@ -95,6 +95,16 @@ one. When a decision changes, edit it here first.
     repo) → OpenCode against a local model → log + output artifact. No UI, schedules,
     memory or MCP yet. From then on Drella builds itself from these docs.
 
+### Models
+
+27. **Models are registered, and jobs name them by alias** ([v0.2](v0.2.md)). One table:
+    alias, interface, base URL, model ID, an optional credential name for the API key,
+    context length and costs. The **interface** (e.g. `openai-compatible`, `anthropic`)
+    picks an **adapter** in code, which renders the agent's provider config and the
+    preflight check; adding a provider type is code, adding a model is a row. The key
+    comes from the caller's own credentials [19] and reaches the pod only as an env var.
+    Each job keeps a snapshot of its model. The table is global until owners exist (O2).
+
 ## Open
 
 - **O1. Retention:** how long job logs, artifacts and memory versions are kept.
