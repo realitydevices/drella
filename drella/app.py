@@ -17,7 +17,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -40,10 +40,15 @@ MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 GITHUB_CREDENTIAL = "github"
 # Model rows end up in OpenCode's config, which substitutes {env:...} and {file:...}
 # anywhere in its raw text, so "{" and "}" are never allowed (docs/v0.2.md#security).
-# No whitespace or control characters either.
-# "[" and "]" are refused too: curl would read them as URL ranges in the preflight.
-BASE_URL_RE = r"^https?://[^\x00-\x20\x7f{}\[\]]+$"
-MODEL_ID_RE = r"^[^\x00-\x20\x7f{}]+$"
+# Both fields are printable ASCII only, an allow-list: no whitespace (ASCII or
+# Unicode), control or format characters. Hostnames can be written in punycode.
+# A base URL also can't hold userinfo ("@"), a query or a fragment ("?", "#"): they
+# could carry secrets, and every job snapshot copies the URL. "[" and "]" are refused
+# too: curl would read them as URL ranges in the preflight.
+BASE_URL_RE = r"^https?://[A-Za-z0-9._~:/%!$&'()*+,;=-]+$"
+MODEL_ID_RE = r"^[A-Za-z0-9._~:/%!$&'()*+,;=@-]+$"
+# Models per token [27].
+MAX_MODELS_PER_TOKEN = 200
 # An API key is substituted into OpenCode's JSON config as raw text, so it can't hold
 # anything that would break the JSON (and print the config, key included, to the log),
 # nor "{" or "}", which OpenCode would substitute again ({file:/creds/github}).
@@ -128,11 +133,10 @@ class ModelIn(BaseModel):
 
 
 class ModelOut(BaseModel):
-    """A stored model. Plain fields, no validation rules: a row that predates a rule
-    is still listed rather than breaking GET /models for everyone."""
+    """One of the caller's models. Plain fields, no validation rules: a row that
+    predates a rule is still listed rather than breaking GET /models."""
 
     alias: str
-    owner: str  # the name of the token that created it; only it can change the model
     interface: str
     base_url: str
     model_id: str
@@ -372,9 +376,20 @@ def list_credentials(c: CallerDep, db: DbDep) -> list[str]:
 
 @router.post("/jobs", status_code=201)
 def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
-    model = db.get(Model, body.model)
+    # Only the caller's own models [27].
+    model = own_model(body.model, c, db)
     if model is None:
         raise HTTPException(422, f"no model '{body.model}' (register it with PUT /models)")
+    # The row is checked again with today's rules, so a row stored before a rule
+    # existed can't launch.
+    try:
+        ModelIn(**model_fields(model))
+    except ValueError:
+        raise HTTPException(
+            422,
+            f"model '{model.alias}' no longer passes validation; register it again"
+            " (PUT /models)",
+        ) from None
     creds = {
         cred.name: cred
         for cred in db.scalars(select(Credential).where(Credential.token_id == c.token.id))
@@ -387,15 +402,6 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
             check_model_credential(model.credential)
         except ValueError as e:
             raise HTTPException(422, f"model '{model.alias}': {e}") from None
-        # Until owners and roles exist (O2), a key is only sent to a URL its owner
-        # chose: a model with a credential can be used only by the token that owns it.
-        # Otherwise the model's owner could repoint it and receive other tokens' keys.
-        if model.owner_token_id != c.token.id:
-            raise HTTPException(
-                403,
-                f"model '{model.alias}' uses an API key and belongs to another token;"
-                " register your own model (PUT /models) to use it with your key",
-            )
         if model.credential not in creds:
             raise HTTPException(
                 422, f"model '{model.alias}' needs a '{model.credential}' credential (its API key)"
@@ -459,15 +465,37 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
 
 
 # -- models [27] ---------------------------------------------------------------
-# Any token can list and use a model; only the token that created it can change or
-# delete it.
+# Models are per token until O2: a token sees, changes, deletes and uses only the
+# models it registered. Another token's models don't exist for it (404). Whoever
+# controls a model's endpoint controls the agent, which holds the job's GitHub token,
+# so a model is never shared.
+
+MODEL_FIELDS = (
+    "interface",
+    "base_url",
+    "model_id",
+    "credential",
+    "context_length",
+    "max_output_tokens",
+    "cost_in_per_mtok",
+    "cost_out_per_mtok",
+    "notes",
+)
 
 
-def model_out(m: Model, db: Session) -> ModelOut:
-    owner = db.get(Token, m.owner_token_id)
+def model_fields(m: Model) -> dict:
+    return {k: getattr(m, k) for k in MODEL_FIELDS}
+
+
+def own_model(alias: str, c: Caller, db: Session) -> Model | None:
+    return db.scalar(
+        select(Model).where(Model.owner_token_id == c.token.id, Model.alias == alias)
+    )
+
+
+def model_out(m: Model) -> ModelOut:
     return ModelOut(
         alias=m.alias,
-        owner=owner.name if owner else "",
         interface=m.interface,
         base_url=m.base_url,
         model_id=m.model_id,
@@ -482,59 +510,63 @@ def model_out(m: Model, db: Session) -> ModelOut:
     )
 
 
-def _owned(m: Model, c: Caller) -> Model:
-    if m.owner_token_id != c.token.id:
-        raise HTTPException(403, f"model '{m.alias}' belongs to another token")
-    return m
-
-
 @router.put("/models/{alias}")
 def put_model(
     alias: Annotated[str, Path(pattern=NAME_RE)], body: ModelIn, c: CallerDep, db: DbDep
 ) -> ModelOut:
     fields = body.model_dump()
     fields["interface"] = body.interface.value
-    m = db.get(Model, alias)
+    m = own_model(alias, c, db)
     if m is None:
+        count = db.scalar(
+            select(func.count()).select_from(Model).where(Model.owner_token_id == c.token.id)
+        )
+        if count >= MAX_MODELS_PER_TOKEN:
+            raise HTTPException(
+                422, f"a token can have at most {MAX_MODELS_PER_TOKEN} models; delete one first"
+            )
         db.add(Model(alias=alias, owner_token_id=c.token.id, **fields))
         try:
             db.commit()
         except IntegrityError:
-            # Another request created it first: this becomes an update of that row
-            # (if the caller owns it).
+            # A concurrent request by the same token created it first: this becomes
+            # an update of that row.
             db.rollback()
-            m = db.get(Model, alias)
+            m = own_model(alias, c, db)
             if m is None:
                 raise
     if m is not None:
-        _owned(m, c)
         for k, v in fields.items():
             setattr(m, k, v)
         db.commit()
-    m = db.get(Model, alias)
+    m = own_model(alias, c, db)
     db.refresh(m)
-    return model_out(m, db)
+    return model_out(m)
 
 
 @router.get("/models")
 def list_models(c: CallerDep, db: DbDep) -> list[ModelOut]:
-    return [model_out(m, db) for m in db.scalars(select(Model).order_by(Model.alias))]
+    """The caller's own models."""
+    models = db.scalars(
+        select(Model).where(Model.owner_token_id == c.token.id).order_by(Model.alias)
+    )
+    return [model_out(m) for m in models]
 
 
 @router.get("/models/{alias}")
 def get_model(alias: str, c: CallerDep, db: DbDep) -> ModelOut:
-    m = db.get(Model, alias)
+    m = own_model(alias, c, db)
     if m is None:
         raise HTTPException(404, "model not found")
-    return model_out(m, db)
+    return model_out(m)
 
 
 @router.delete("/models/{alias}", status_code=204)
 def delete_model(alias: str, c: CallerDep, db: DbDep) -> Response:
-    m = db.get(Model, alias)
+    m = own_model(alias, c, db)
     if m is None:
         raise HTTPException(404, "model not found")
-    db.delete(_owned(m, c))
+    db.delete(m)
     db.commit()
     return Response(status_code=204)
 

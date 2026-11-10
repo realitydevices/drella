@@ -15,10 +15,12 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Models are per token until O2 [27]: an alias is unique per owner, not globally.
     op.create_table(
         "models",
-        sa.Column("alias", sa.String(length=63), nullable=False),
+        sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("owner_token_id", sa.Integer(), nullable=False),
+        sa.Column("alias", sa.String(length=63), nullable=False),
         sa.Column("interface", sa.String(length=32), nullable=False),
         sa.Column("base_url", sa.String(length=500), nullable=False),
         sa.Column("model_id", sa.String(length=200), nullable=False),
@@ -31,7 +33,8 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["owner_token_id"], ["tokens.id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("alias"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("owner_token_id", "alias"),
     )
     # Jobs from before v0.2 named a model ID and an OpenAI-compatible endpoint. Keep
     # both in the snapshot; their alias is the model ID.

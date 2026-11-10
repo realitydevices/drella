@@ -31,6 +31,15 @@ def job(client, auth):
     return r.json()
 
 
+def _model(s, alias):
+    """The (only) model row with this alias, in tests where one token has it."""
+    from sqlalchemy import select
+
+    from drella.models import Model
+
+    return s.scalars(select(Model).where(Model.alias == alias)).one()
+
+
 def job_auth(runner, job_id):
     return {"Authorization": f"Bearer {runner.secrets[job_id][JOB_TOKEN_KEY]}"}
 
@@ -428,6 +437,12 @@ def test_models_api(client, auth):
         {"base_url": "https:///"},
         # curl would read [..] as a range in the preflight.
         {"base_url": "https://x.example/[1-100000]"},
+        # No userinfo, query or fragment: they could carry secrets.
+        {"base_url": "https://u:pw@x.example/v1"}, {"base_url": "https://x.example/v1?key=s"},
+        {"base_url": "https://x.example/v1#f"},
+        # Printable ASCII only: no Unicode whitespace or format characters.
+        {"base_url": "https://x.example/v1\u2028"}, {"base_url": "https://x\u00a0y/v1"},
+        {"base_url": "https://\u0430pi.anthropic.com/v1"}, {"model_id": "m\u200b"},
         # Values that wouldn't fit the database columns.
         {"context_length": 2**40}, {"max_output_tokens": 10_000_001},
         {"cost_in_per_mtok": "1e12"}, {"cost_out_per_mtok": "0.00001"},
@@ -491,32 +506,78 @@ def test_a_job_keeps_its_model_snapshot(client, auth, runner, queue):
     )
 
 
-def test_only_the_owner_can_change_or_delete_a_model(client, auth, settings):
+def test_models_are_per_token(client, auth, runner, settings):
+    # Whoever controls a model's endpoint controls the agent, so a token never sees or
+    # uses another token's models [27].
     client.put("/models/claude", json=CLAUDE, headers=auth)
     other = {"Authorization": f"Bearer {create_token(settings, 'mallory')}"}
-    # Mallory can see it...
-    assert client.get("/models/claude", headers=other).json()["owner"] == "alice"
-    # ...but can't repoint it (e.g. at her own URL) or delete it.
+    # Another token's models don't exist for Mallory.
+    assert client.get("/models/claude", headers=other).status_code == 404
+    assert client.get("/models/local", headers=other).status_code == 404
+    assert client.get("/models", headers=other).json() == []
+    assert client.delete("/models/claude", headers=other).status_code == 404
+    r = client.post("/jobs", json={"prompt": "x", "model": "local"}, headers=other)
+    assert r.status_code == 422 and "no model 'local'" in r.json()["detail"]
+    # She can register the same alias for herself; it doesn't touch Alice's.
     evil = CLAUDE | {"base_url": "https://evil.example/v1"}
-    assert client.put("/models/claude", json=evil, headers=other).status_code == 403
-    assert client.delete("/models/claude", headers=other).status_code == 403
+    assert client.put("/models/claude", json=evil, headers=other).status_code == 200
     assert client.get("/models/claude", headers=auth).json()["base_url"] == "https://api.anthropic.com/v1"
-    # Her own new alias is hers.
-    r = client.put("/models/mine", json=LOCAL, headers=other)
-    assert r.status_code == 200 and r.json()["owner"] == "mallory"
+    assert client.get("/models/claude", headers=other).json()["base_url"] == "https://evil.example/v1"
+    assert [m["alias"] for m in client.get("/models", headers=other).json()] == ["claude"]
+    # Deleting hers leaves Alice's.
+    assert client.delete("/models/claude", headers=other).status_code == 204
+    assert client.get("/models/claude", headers=auth).status_code == 200
+
+
+def test_another_tokens_model_never_runs_your_job(client, auth, runner, settings):
+    # The round-3 attack: Mallory registers a keyless model, Alice's jobs name that
+    # alias. Alice's job resolves only her own models, so it can't reach Mallory's URL
+    # with Alice's GitHub token.
+    mallory = {"Authorization": f"Bearer {create_token(settings, 'mallory')}"}
+    attacker = LOCAL | {"base_url": "https://attacker.example/v1"}
+    assert client.put("/models/shared", json=attacker, headers=mallory).status_code == 200
+    client.put("/credentials/github", json={"value": "ghp_alice"}, headers=auth)
+    r = client.post("/jobs", json=JOB | {"model": "shared"}, headers=auth)
+    assert r.status_code == 422 and runner.secrets == {}
+    # Alice's own "local" is what her jobs use, even if Mallory has a "local" too.
+    client.put("/models/local", json=attacker, headers=mallory)
+    job = client.post("/jobs", json=JOB, headers=auth).json()
+    assert job["model"]["base_url"] == LOCAL["base_url"]
+
+
+def test_models_per_token_are_capped(client, auth, monkeypatch):
+    import drella.app
+
+    monkeypatch.setattr(drella.app, "MAX_MODELS_PER_TOKEN", 2)
+    assert client.put("/models/two", json=LOCAL, headers=auth).status_code == 200
+    r = client.put("/models/three", json=LOCAL, headers=auth)
+    assert r.status_code == 422 and "at most 2" in r.json()["detail"]
+    # Updating an existing one is fine.
+    assert client.put("/models/two", json=LOCAL, headers=auth).status_code == 200
+
+
+def test_a_stored_model_is_revalidated_at_job_creation(client, auth, runner):
+    # A row stored before a rule existed can't launch.
+    client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
+    for bad in ["https://x.example/{env:GH_TOKEN}/v1", "http://u:pw@x.example/v1"]:
+        with client.app.state.deps.sessions() as s:
+            _model(s, "local").base_url = bad
+            s.commit()
+        r = client.post("/jobs", json=JOB, headers=auth)
+        assert r.status_code == 422 and "no longer passes validation" in r.json()["detail"]
+    assert runner.secrets == {}
 
 
 def test_a_job_refuses_a_model_that_names_the_github_credential(client, auth, runner):
     # Rows can't be created like this through the API; this covers rows that are.
-    from drella.models import Model
-
     client.put("/models/claude", json=CLAUDE, headers=auth)
     with client.app.state.deps.sessions() as s:
-        s.get(Model, "claude").credential = "github"
+        _model(s, "claude").credential = "github"
         s.commit()
     client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
     r = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth)
-    assert r.status_code == 422 and "reserved" in r.json()["detail"]
+    # Caught by re-validating the row (the github rule is part of it).
+    assert r.status_code == 422 and "no longer passes validation" in r.json()["detail"]
     assert runner.secrets == {}
 
 
@@ -553,59 +614,39 @@ def test_jobs_reject_unknown_fields(client, auth):
 
 
 def test_put_model_race_on_a_new_alias(client, auth, monkeypatch):
-    # Another request creates the alias between our read and our insert.
-    from sqlalchemy.orm import Session
-
+    # A concurrent request by the same token creates the alias between our read and
+    # our insert.
+    import drella.app
     from drella.models import Model, Token
 
     deps = client.app.state.deps
-    real_get = Session.get
+    real = drella.app.own_model
     raced = {"done": False}
 
-    def get(self, cls, key, *a, **kw):
-        row = real_get(self, cls, key, *a, **kw)
-        if cls is Model and key == "racy" and not raced["done"]:
+    def own_model(alias, c, db):
+        row = real(alias, c, db)
+        if alias == "racy" and not raced["done"]:
             raced["done"] = True
             with deps.sessions() as other:
-                owner = other.scalars(__import__("sqlalchemy").select(Token)).first()
+                owner = other.get(Token, c.token.id)
                 other.add(Model(alias="racy", owner_token_id=owner.id, interface="openai-compatible",
                                 base_url="http://x/v1", model_id="first"))
                 other.commit()
             return None
         return row
 
-    monkeypatch.setattr(Session, "get", get)
+    monkeypatch.setattr(drella.app, "own_model", own_model)
     r = client.put("/models/racy", json=LOCAL, headers=auth)
     assert r.status_code == 200, r.text
     assert r.json()["model_id"] == "some-model"
 
 
-def test_a_model_with_a_key_is_usable_only_by_its_owner(client, auth, runner, settings):
-    # Otherwise its owner could repoint it later and receive other tokens' keys.
-    client.put("/models/claude", json=CLAUDE, headers=auth)
-    other = {"Authorization": f"Bearer {create_token(settings, 'mallory')}"}
-    client.put("/credentials/anthropic-key", json={"value": "sk-mallory"}, headers=other)
-    r = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=other)
-    assert r.status_code == 403 and "register your own model" in r.json()["detail"]
-    assert runner.secrets == {}
-    # A model without a key is anyone's to use.
-    r = client.post("/jobs", json={"prompt": "x", "model": "local"}, headers=other)
-    assert r.status_code == 201
-    # With her own model, Mallory's key goes where she chose.
-    client.put("/models/mine", json=CLAUDE, headers=other)
-    job = client.post("/jobs", json={"prompt": "x", "model": "mine"}, headers=other).json()
-    assert runner.secrets[job["id"]]["_llm-key"] == "sk-mallory"
-
-
-def test_listing_models_survives_a_row_that_predates_a_rule(client, auth, settings):
-    from drella.models import Model
-
+def test_listing_models_survives_a_row_that_predates_a_rule(client, auth):
     client.put("/models/claude", json=CLAUDE, headers=auth)
     with client.app.state.deps.sessions() as s:
-        s.get(Model, "claude").base_url = "https:"
+        _model(s, "claude").base_url = "https:"
         s.commit()
-    other = {"Authorization": f"Bearer {create_token(settings, 'bob')}"}
-    r = client.get("/models", headers=other)
+    r = client.get("/models", headers=auth)
     assert r.status_code == 200
     assert {m["alias"]: m["base_url"] for m in r.json()}["claude"] == "https:"
 

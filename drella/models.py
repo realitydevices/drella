@@ -82,13 +82,16 @@ class Job(Base):
 
 
 class Model(Base):
-    """A model jobs can use, by alias [27]. Any token can use it; only the token that
-    created it can change or delete it."""
+    """A model a token's jobs can use, by alias [27]. Models are per token until owners
+    and roles exist (O2): only the token that registered a model can see, change, delete
+    or use it, and two tokens can each have their own model with the same alias."""
 
     __tablename__ = "models"
+    __table_args__ = (UniqueConstraint("owner_token_id", "alias"),)
 
-    alias: Mapped[str] = mapped_column(String(63), primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True)
     owner_token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"))
+    alias: Mapped[str] = mapped_column(String(63))
     interface: Mapped[str] = mapped_column(String(32))
     base_url: Mapped[str] = mapped_column(String(500))
     model_id: Mapped[str] = mapped_column(String(200))
