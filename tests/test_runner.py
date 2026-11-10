@@ -253,3 +253,42 @@ def test_opencode_jobs_name_their_agent(k8s):
     (c,) = job["spec"]["template"]["spec"]["containers"]
     env = {e["name"]: e.get("value") for e in c["env"]}
     assert env["DRELLA_AGENT"] == "opencode" and "DRELLA_OPENCODE_CONFIG" in env
+
+
+def test_add_secrets_patches_the_job_secret(k8s):
+    r, _, core = k8s
+    r.add_secrets(JOB_ID, {"github": "ghs_minted"})
+    name, ns, patch = core.patch_namespaced_secret.call_args.args
+    assert (name, ns) == (NAME, "drella")
+    assert patch == {"data": {"github": "Z2hzX21pbnRlZA=="}}
+
+
+def _env(r, batch, spec):
+    r.launch(spec)
+    _, job = batch.create_namespaced_job.call_args.args
+    (c,) = job["spec"]["template"]["spec"]["containers"]
+    return {e["name"]: e.get("value") for e in c["env"]}
+
+
+def test_only_a_read_only_repo_job_is_told_so(k8s):
+    r, batch, _ = k8s
+    assert "DRELLA_REPO_READ_ONLY" not in _env(r, batch, SPEC)
+    ro = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", opens_prs=False)
+    assert _env(r, batch, ro)["DRELLA_REPO_READ_ONLY"] == "1"
+    no_repo = JobSpec(JOB_ID, None, LOCAL, "do it", opens_prs=False)
+    assert "DRELLA_REPO_READ_ONLY" not in _env(r, batch, no_repo)
+
+
+def test_the_deadline_never_passes_the_github_tokens_expiry(k8s):
+    import time
+
+    r, batch, _ = k8s
+    now = time.time()
+    # No App token: the job's own time limit.
+    assert abs(int(_env(r, batch, SPEC)["DRELLA_DEADLINE"]) - (now + 3600)) < 5
+    # A token that expires sooner than the time limit (minted a while before launch):
+    # the deadline is the expiry, so the wrapper is done before the token runs out.
+    early = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", github_token_expires=now + 3000)
+    assert int(_env(r, batch, early)["DRELLA_DEADLINE"]) == int(now + 3000)
+    late = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", github_token_expires=now + 9000)
+    assert abs(int(_env(r, batch, late)["DRELLA_DEADLINE"]) - (now + 3600)) < 5

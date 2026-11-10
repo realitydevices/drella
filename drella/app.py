@@ -25,6 +25,7 @@ from drella import crypto
 from drella.adapters import LLM_KEY_SECRET, Interface
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
+from drella.github import GitHubApp
 from drella.models import QUEUED, RUNNING, TERMINAL, Credential, Job, Model, Token
 from drella.queue import Queue, archived_log, output_prefix
 from drella.runner import JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
@@ -103,6 +104,14 @@ class JobIn(BaseModel):
     @classmethod
     def _no_null(cls, v):
         return _no_null(v)
+
+    @field_validator("repo")
+    @classmethod
+    def _no_dot_names(cls, v: str | None) -> str | None:
+        # "." and ".." are never owner or repo names; they'd end up in URL paths.
+        if v is not None and any(part in (".", "..") for part in v.split("/")):
+            raise ValueError("not a GitHub repo (owner/name)")
+        return v
 
 
 def check_model_credential(name: str | None) -> None:
@@ -260,6 +269,8 @@ class Deps:
     runner: Runner
     storage: Storage
     queue: Queue
+    # Drella's GitHub App, if configured: mints repo jobs' tokens (issue #50).
+    github_app: GitHubApp | None = None
 
 
 def create_app(
@@ -272,6 +283,7 @@ def create_app(
     engine = make_engine(settings.database_url)
     sessions = make_sessionmaker(engine)
     storage = storage or LocalStorage(settings.storage_path)
+    github_app = GitHubApp.from_settings(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -295,8 +307,9 @@ def create_app(
         settings.queue_interval,
         log_snapshot_seconds=settings.log_snapshot_seconds,
         stall_seconds=settings.queue_stall_seconds,
+        github_app=github_app,
     )
-    app.state.deps = Deps(settings, sessions, runner, storage, queue)
+    app.state.deps = Deps(settings, sessions, runner, storage, queue, github_app)
     app.include_router(router)
 
     @app.exception_handler(RequestValidationError)
@@ -407,6 +420,22 @@ def put_credential(
     return Response(status_code=204)
 
 
+@router.delete("/credentials/{name}", status_code=204)
+def delete_credential(
+    name: Annotated[str, Path(pattern=NAME_RE)], c: CallerDep, db: DbDep
+) -> Response:
+    """E.g. a stored `github` credential, which otherwise always wins over Drella's
+    GitHub App. Jobs already created keep the credentials they were given."""
+    cred = db.scalar(
+        select(Credential).where(Credential.token_id == c.token.id, Credential.name == name)
+    )
+    if cred is None:
+        raise HTTPException(404, "no such credential")
+    db.delete(cred)
+    db.commit()
+    return Response(status_code=204)
+
+
 @router.get("/credentials")
 def list_credentials(c: CallerDep, db: DbDep) -> list[str]:
     """Names only; values are never returned."""
@@ -437,9 +466,16 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         cred.name: cred
         for cred in db.scalars(select(Credential).where(Credential.token_id == c.token.id))
     }
-    # Only a job with a repo needs git access.
-    if body.repo and GITHUB_CREDENTIAL not in creds:
-        raise HTTPException(422, f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential")
+    # Only a job with a repo needs git access: the caller's own `github` credential if
+    # they stored one (it wins), otherwise a token from Drella's GitHub App, minted at
+    # launch.
+    github_app = bool(body.repo) and GITHUB_CREDENTIAL not in creds
+    if github_app and deps.github_app is None:
+        raise HTTPException(
+            422,
+            f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential (this Drella has no"
+            " GitHub App to mint one)",
+        )
     if model.credential:
         try:
             check_model_credential(model.credential)
@@ -457,7 +493,9 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         # Stripped on read too, so credentials stored before stripping was added work.
         return crypto.decrypt(c.secret, c.token.salt, creds[name].ciphertext).strip()
 
-    secrets = {GITHUB_CREDENTIAL: decrypt(GITHUB_CREDENTIAL)} if body.repo else {}
+    secrets = {}
+    if body.repo and not github_app:
+        secrets[GITHUB_CREDENTIAL] = decrypt(GITHUB_CREDENTIAL)
     if model.credential:
         key = decrypt(model.credential)
         # Never echo the key, not even in an error.
@@ -485,6 +523,7 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         cost_in_per_mtok=model.cost_in_per_mtok,
         cost_out_per_mtok=model.cost_out_per_mtok,
         job_token_hash=crypto.lookup_hash(job_token),
+        github_app=github_app,
     )
     db.add(job)
     db.flush()
@@ -750,4 +789,3 @@ async def put_output(
         key = output_prefix(job.id) + name
         await run_in_threadpool(deps.storage.put, key, iter(lambda: f.read(CHUNK), b""))
     return Response(status_code=204)
-

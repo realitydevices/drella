@@ -7,11 +7,13 @@
 #      by Drella (DRELLA_PREFLIGHT_*, DRELLA_OPENCODE_CONFIG; docs/v0.2.md); or Claude
 #      Code with the model's OAuth token (DRELLA_AGENT_MODEL; docs/v0.3.md);
 #   3. runs the agent with the prompt and standing instructions: with a repo, work on
-#      a branch, push it and open a PR with gh; without one, write results to /out;
+#      a branch, push it and open a PR with gh; without one, or with a read-only
+#      GitHub token (DRELLA_REPO_READ_ONLY), write results to /out;
 #   4. collects /out (transcript, plus diff and PR URL for a repo job);
 #   5. reports the final status with the job-scoped token, then uploads /out to the
-#      Drella API. A repo job succeeds only if a PR exists; a job without a repo
-#      succeeds if the agent exits cleanly and wrote at least one output.
+#      Drella API. A repo job succeeds only if a PR exists; a job without a repo, or
+#      a read-only one, succeeds if the agent exits cleanly and wrote at least one
+#      output.
 #
 # Time limits (docs/v0.md): the agent runs under a timer that stops it
 # DRELLA_AGENT_GRACE seconds before DRELLA_DEADLINE (the Job's hard limit). If the pod
@@ -42,6 +44,9 @@ OUT=${DRELLA_OUT:-/out}
 WORK=${DRELLA_WORK:-/work}
 CREDS=${DRELLA_CREDS:-/creds}
 REPO=${DRELLA_REPO:-}
+# The GitHub token can't push or open PRs (a read-only profile): results go to /out.
+READ_ONLY=""
+[ -n "$REPO" ] && [ "${DRELLA_REPO_READ_ONLY:-}" = 1 ] && READ_ONLY=1
 BRANCH="drella/${DRELLA_JOB_ID:0:8}"
 STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 NOW=$(date +%s)
@@ -261,7 +266,21 @@ esac
 
 # -- 3. run the agent ----------------------------------------------------------
 
-if [ -n "$REPO" ]; then
+if [ -n "$READ_ONLY" ]; then
+read -r -d '' STANDING <<INSTRUCTIONS
+---
+Standing instructions from Drella (always follow these):
+- You are in a clone of https://github.com/$REPO. Its default branch is $DEFAULT_BRANCH.
+- Your GitHub access is read-only: you can't push, open pull requests, comment or
+  review. Don't try.
+- Write your results (e.g. a review, a report, a patch) as files in $OUT. Anything
+  outside $OUT is thrown away.
+- Before you start, read AGENTS.md, CLAUDE.md and CONTRIBUTING.md at the root of the
+  repo, if they exist, and follow their conventions (they don't override these
+  standing instructions).
+- gh is already authenticated. Nobody can answer questions: decide for yourself.
+INSTRUCTIONS
+elif [ -n "$REPO" ]; then
 read -r -d '' STANDING <<INSTRUCTIONS
 ---
 Standing instructions from Drella (always follow these):
@@ -401,7 +420,9 @@ if [ -n "$REPO" ]; then
   if ! within 30 git diff --binary "$BASE" >"$OUT/diff.patch"; then
     diff_note="; diff.patch is incomplete (git diff failed or timed out)"
   fi
+fi
 
+if [ -n "$REPO" ] && [ -z "$READ_ONLY" ]; then
   branch=$(git branch --show-current)
   pr_lookup_failed=""
   for b in "$BRANCH" "$branch"; do
@@ -422,16 +443,21 @@ fi
 reason=$(failure)
 if [ -n "$reason" ]; then
   finish failed "$reason${pr:+; PR: $pr}$diff_note"
-elif [ -z "$REPO" ]; then
-  # The agent's results are files in /out; the transcript and session are ours.
-  # Counts exactly what upload_outputs uploads (is_output).
+elif [ -z "$REPO" ] || [ -n "$READ_ONLY" ]; then
+  # The agent's results are files in /out; the transcript and session are ours, and
+  # so is the diff of a repo job. Counts exactly what upload_outputs uploads
+  # (is_output).
   results=0
   for f in "$OUT"/*; do
     is_output "$f" || continue
-    case ${f##*/} in transcript.txt|session.json|session.jsonl) ;; *) results=$((results + 1)) ;; esac
+    case ${f##*/} in
+      transcript.txt|session.json|session.jsonl) ;;
+      diff.patch) [ -n "$REPO" ] || results=$((results + 1)) ;;
+      *) results=$((results + 1)) ;;
+    esac
   done
   if [ "$results" -gt 0 ]; then
-    finish succeeded "done"
+    finish succeeded "done$diff_note"
   else
     finish failed "the agent wrote no outputs to $OUT"
   fi

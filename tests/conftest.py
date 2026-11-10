@@ -28,6 +28,9 @@ class FakeRunner:
         self.secrets[job_id] = dict(secrets)
         self.secret_created[job_id] = datetime.now(UTC)
 
+    def add_secrets(self, job_id, secrets):
+        self.secrets[job_id].update(secrets)
+
     def launch(self, spec):
         if self.fail_launch:
             raise RuntimeError("cluster says no")

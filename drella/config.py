@@ -36,6 +36,20 @@ class Settings:
     queue_interval: float = field(
         default_factory=lambda: float(os.environ.get("DRELLA_QUEUE_INTERVAL", "5"))
     )
+    # The GitHub App Drella mints repo jobs' tokens with (drella/github.py). Both come
+    # from a Kubernetes Secret (deploy/README.md); without an App ID, Drella doesn't
+    # mint tokens and a repo job needs the caller's own `github` credential.
+    github_app_id: str = field(
+        default_factory=lambda: os.environ.get("DRELLA_GITHUB_APP_ID", "").strip()
+    )
+    github_app_key_file: str = field(
+        default_factory=lambda: os.environ.get(
+            "DRELLA_GITHUB_APP_KEY_FILE", "/etc/drella/github-app/private-key.pem"
+        )
+    )
+    github_api_url: str = field(
+        default_factory=lambda: os.environ.get("DRELLA_GITHUB_API_URL", "https://api.github.com")
+    )
     # Default limits [23].
     job_timeout_seconds: int = 3600
     job_memory: str = "2Gi"

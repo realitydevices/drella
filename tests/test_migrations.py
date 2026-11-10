@@ -177,3 +177,58 @@ def test_0003_downgrade_deletes_claude_code_models_only(settings):
         aliases = conn.execute(text("SELECT alias FROM models")).scalars().all()
     assert aliases == ["local"]
     engine.dispose()
+
+
+def test_0004_marks_existing_jobs_as_using_their_callers_credential(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "0003")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "queued")
+    _upgrade(engine, "0004")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT github_app FROM jobs")).scalar() in (False, 0)
+    engine.dispose()
+
+
+def test_0004_downgrade_refuses_with_live_app_token_jobs(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "head")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "running")
+    _insert_v02_job(engine, "j2", "succeeded")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE jobs SET github_app = :t"), {"t": True})
+    # pysqlite doesn't roll back DDL, so a refused downgrade must refuse before any of
+    # it: step down to 0004 first.
+    _downgrade(engine, "0004")
+    with pytest.raises(RuntimeError, match="can't downgrade"):
+        _downgrade(engine, "0003")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE jobs SET status = 'failed' WHERE id = 'j1'"))
+    _downgrade(engine, "0003")
+    _upgrade(engine, "head")
+    engine.dispose()
+
+
+def test_0005_makes_existing_tokens_builders_and_new_ones_readers(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "0004")
+    _seed_token(engine)
+    _upgrade(engine, "0005")
+    with engine.begin() as conn:
+        # The tokens that existed were made to build: they keep pushing and opening PRs.
+        assert conn.execute(text("SELECT github_profile FROM tokens")).scalar() == "builder"
+        # A row inserted without a profile gets the least access.
+        conn.execute(
+            text("INSERT INTO tokens (id, name, lookup_hash, salt, created_at) "
+                 "VALUES (2, 'bob', 'h2', :salt, :now)"),
+            {"salt": b"0" * 16, "now": datetime.now(UTC)},
+        )
+        profile = conn.execute(text("SELECT github_profile FROM tokens WHERE id = 2")).scalar()
+        assert profile == "reader"
+    # A rollback to v0.3 (0003) isn't blocked by profiles, and keeps the tokens.
+    _downgrade(engine, "0003")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM tokens")).scalar() == 2
+    _upgrade(engine, "head")
+    engine.dispose()
