@@ -82,6 +82,54 @@ kubectl -n drella exec deploy/drella -- drella token create --name <your name>
 It's printed once. Drella keeps only its hash, and the credentials you store are
 encrypted with it, so keep it somewhere safe.
 
+## GitHub tokens from a GitHub App (optional)
+
+A job with a repo needs a GitHub token. Either each caller stores their own `github`
+credential (see **Run a job**), or Drella holds a GitHub App's private key and mints a
+token for each repo job itself. Installation tokens last an hour, so nobody has to keep
+storing fresh ones. A caller's own `github` credential still wins if they store one.
+
+1. **Create the App** (GitHub → Settings → Developer settings → GitHub Apps → New).
+   It needs no webhook. Repository permissions: **Contents** read and write, **Pull
+   requests** read and write, **Issues** read-only (Metadata read-only is automatic).
+   Leave out **Workflows**, so jobs can't edit `.github/workflows`. Note its **App
+   ID**, and generate a **private key** (a `.pem` file).
+2. **Install it only on the repos Drella's jobs may change** ("Only select
+   repositories"). Drella can write to every repo the App is installed on (see the
+   security note in [docs/v0.md](../docs/v0.md#security)). Protect those repos'
+   default branches as for a PAT: pull requests only, at least one approval, no force
+   pushes.
+3. **Create the Secret** from the `.pem`:
+
+   ```sh
+   kubectl -n drella create secret generic drella-github-app \
+     --from-file=private-key.pem=<path to the .pem> \
+     --from-literal=app-id=<App ID>
+   kubectl -n drella rollout restart deployment/drella
+   ```
+
+   Or generate it in your own kustomize overlay, next to the `.pem` (there's an
+   example in `kustomization.yaml`). Don't put the key in this checkout.
+
+The deployment (`drella.yaml`) reads both from that Secret: `DRELLA_GITHUB_APP_ID` from
+`app-id`, and the key as a file, `DRELLA_GITHUB_APP_KEY_FILE`
+(`/etc/drella/github-app/private-key.pem`). The Secret is optional: without it Drella
+starts as before, and repo jobs need a `github` credential. With it, Drella checks the
+key at startup and refuses to start if it can't read it. The key is read again for
+every token, so a rotated key takes effect without a restart (a new App ID needs one).
+Neither the key nor any token is stored in the database.
+
+For each repo job without a `github` credential, Drella mints a token when it launches
+the job (not when it's queued: a queued job can wait longer than an hour). The token is
+for the job's repo only, with Contents write, Pull requests write and Issues read. If
+the App isn't installed on the repo, the job fails at launch and says so. The job's
+time limit is an hour too, so before the wrapper checks for the job's PR it asks
+Drella for a fresh token (`POST /jobs/{id}/github-token`, with its job token); if that
+fails, it carries on with the one it has.
+
+By default the agent commits as "Drella agent" (an installation token can't
+read the App's own user), and PRs are opened by `<app name>[bot]`.
+
 ## Reaching Drella
 
 Drella exposes one HTTP service, `drella` on port 8000. What sits in front of it is up
@@ -116,7 +164,8 @@ With `DRELLA=http://localhost:8000` and `TOKEN` set to your token:
 ```sh
 auth="Authorization: Bearer $TOKEN"
 
-# 1. Store a GitHub credential (needed only for jobs with a repo): a fine-grained
+# 1. Store a GitHub credential (needed only for jobs with a repo, and not at all if
+#    Drella has a GitHub App; see above): a fine-grained
 #    PAT for the target repo only, with Contents and Pull requests read/write, and
 #    without the Workflows permission (so it can't edit .github/workflows). Protect
 #    the repo's default branch for everyone, admins included: pull requests only,

@@ -253,3 +253,21 @@ def test_opencode_jobs_name_their_agent(k8s):
     (c,) = job["spec"]["template"]["spec"]["containers"]
     env = {e["name"]: e.get("value") for e in c["env"]}
     assert env["DRELLA_AGENT"] == "opencode" and "DRELLA_OPENCODE_CONFIG" in env
+
+
+def test_add_secrets_patches_the_job_secret(k8s):
+    r, _, core = k8s
+    r.add_secrets(JOB_ID, {"github": "ghs_minted"})
+    name, ns, patch = core.patch_namespaced_secret.call_args.args
+    assert (name, ns) == (NAME, "drella")
+    assert patch == {"data": {"github": "Z2hzX21pbnRlZA=="}}
+
+
+def test_only_an_app_token_job_is_told_it_can_refresh(k8s):
+    r, batch, _ = k8s
+    for github_app, expected in ((False, None), (True, "1")):
+        r.launch(JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", github_app=github_app))
+        _, job = batch.create_namespaced_job.call_args.args
+        (c,) = job["spec"]["template"]["spec"]["containers"]
+        env = {e["name"]: e.get("value") for e in c["env"]}
+        assert env.get("DRELLA_GITHUB_REFRESH") == expected

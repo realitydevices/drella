@@ -25,6 +25,7 @@ from drella import crypto
 from drella.adapters import LLM_KEY_SECRET, Interface
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
+from drella.github import GitHubApp, GitHubAppError
 from drella.models import QUEUED, RUNNING, TERMINAL, Credential, Job, Model, Token
 from drella.queue import Queue, archived_log, output_prefix
 from drella.runner import JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
@@ -213,6 +214,11 @@ class JobOut(BaseModel):
     outputs: list[str] | None = None
 
 
+class GitHubTokenOut(BaseModel):
+    token: str
+    expires_at: str | None
+
+
 class StatusIn(BaseModel):
     status: Literal["succeeded", "failed"]
     message: str | None = None
@@ -260,6 +266,8 @@ class Deps:
     runner: Runner
     storage: Storage
     queue: Queue
+    # Drella's GitHub App, if configured: mints repo jobs' tokens (issue #50).
+    github_app: GitHubApp | None = None
 
 
 def create_app(
@@ -272,6 +280,7 @@ def create_app(
     engine = make_engine(settings.database_url)
     sessions = make_sessionmaker(engine)
     storage = storage or LocalStorage(settings.storage_path)
+    github_app = GitHubApp.from_settings(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -295,8 +304,9 @@ def create_app(
         settings.queue_interval,
         log_snapshot_seconds=settings.log_snapshot_seconds,
         stall_seconds=settings.queue_stall_seconds,
+        github_app=github_app,
     )
-    app.state.deps = Deps(settings, sessions, runner, storage, queue)
+    app.state.deps = Deps(settings, sessions, runner, storage, queue, github_app)
     app.include_router(router)
 
     @app.exception_handler(RequestValidationError)
@@ -437,9 +447,16 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         cred.name: cred
         for cred in db.scalars(select(Credential).where(Credential.token_id == c.token.id))
     }
-    # Only a job with a repo needs git access.
-    if body.repo and GITHUB_CREDENTIAL not in creds:
-        raise HTTPException(422, f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential")
+    # Only a job with a repo needs git access: the caller's own `github` credential if
+    # they stored one (it wins), otherwise a token from Drella's GitHub App, minted at
+    # launch.
+    github_app = bool(body.repo) and GITHUB_CREDENTIAL not in creds
+    if github_app and deps.github_app is None:
+        raise HTTPException(
+            422,
+            f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential (this Drella has no"
+            " GitHub App to mint one)",
+        )
     if model.credential:
         try:
             check_model_credential(model.credential)
@@ -457,7 +474,9 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         # Stripped on read too, so credentials stored before stripping was added work.
         return crypto.decrypt(c.secret, c.token.salt, creds[name].ciphertext).strip()
 
-    secrets = {GITHUB_CREDENTIAL: decrypt(GITHUB_CREDENTIAL)} if body.repo else {}
+    secrets = {}
+    if body.repo and not github_app:
+        secrets[GITHUB_CREDENTIAL] = decrypt(GITHUB_CREDENTIAL)
     if model.credential:
         key = decrypt(model.credential)
         # Never echo the key, not even in an error.
@@ -485,6 +504,7 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         cost_in_per_mtok=model.cost_in_per_mtok,
         cost_out_per_mtok=model.cost_out_per_mtok,
         job_token_hash=crypto.lookup_hash(job_token),
+        github_app=github_app,
     )
     db.add(job)
     db.flush()
@@ -751,3 +771,21 @@ async def put_output(
         await run_in_threadpool(deps.storage.put, key, iter(lambda: f.read(CHUNK), b""))
     return Response(status_code=204)
 
+
+@router.post("/jobs/{job_id}/github-token")
+def github_token(job: Annotated[Job, Depends(job_itself)], deps: DepsDep) -> GitHubTokenOut:
+    """A fresh GitHub token for the job's own repo, for a job whose token comes from
+    Drella's GitHub App. The token minted at launch lasts an hour, which a job that
+    runs to its time limit can outlive before it checks for its PR."""
+    if not job.repo:
+        raise HTTPException(409, "the job has no repo")
+    if not job.github_app:
+        raise HTTPException(409, "the job uses its caller's github credential")
+    if deps.github_app is None:
+        raise HTTPException(409, "this Drella has no GitHub App")
+    try:
+        token = deps.github_app.token(job.repo)
+    except GitHubAppError as e:
+        log.warning("minting a GitHub token for job %s failed: %s", job.id, e)
+        raise HTTPException(502, str(e)) from None
+    return GitHubTokenOut(token=token.token, expires_at=token.expires_at)

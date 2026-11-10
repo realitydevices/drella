@@ -177,3 +177,31 @@ def test_0003_downgrade_deletes_claude_code_models_only(settings):
         aliases = conn.execute(text("SELECT alias FROM models")).scalars().all()
     assert aliases == ["local"]
     engine.dispose()
+
+
+def test_0004_marks_existing_jobs_as_using_their_callers_credential(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "0003")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "queued")
+    _upgrade(engine, "0004")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT github_app FROM jobs")).scalar() in (False, 0)
+    engine.dispose()
+
+
+def test_0004_downgrade_refuses_with_live_app_token_jobs(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "head")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "running")
+    _insert_v02_job(engine, "j2", "succeeded")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE jobs SET github_app = :t"), {"t": True})
+    with pytest.raises(RuntimeError, match="can't downgrade"):
+        _downgrade(engine, "0003")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE jobs SET status = 'failed' WHERE id = 'j1'"))
+    _downgrade(engine, "0003")
+    _upgrade(engine, "head")
+    engine.dispose()

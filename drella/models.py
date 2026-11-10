@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     LargeBinary,
@@ -69,6 +70,10 @@ class Job(Base):
     max_output_tokens: Mapped[int | None]
     cost_in_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     cost_out_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    # True: the job's GitHub token is minted by Drella's GitHub App at launch (and can
+    # be refreshed by the job), because the caller stored no `github` credential. The
+    # token itself is never stored.
+    github_app: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(16), default=QUEUED, index=True)
     # What the job reported via POST /jobs/{id}/status. It becomes `status` once
     # the Kubernetes Job has finished and its log is archived.

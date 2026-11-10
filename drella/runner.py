@@ -1,5 +1,6 @@
 """The job launcher [18]. Kubernetes is the only implementation."""
 
+import base64
 import json
 import logging
 import time
@@ -25,6 +26,9 @@ class JobSpec:
     repo: str | None
     model: ModelSpec
     prompt: str
+    # The job's GitHub token was minted by Drella's GitHub App, so the wrapper may ask
+    # for a fresh one (POST /jobs/{id}/github-token) before it checks for the PR.
+    github_app: bool = False
 
 
 class RunState(StrEnum):
@@ -47,6 +51,10 @@ class LogsUnavailable(Exception):
 class Runner(Protocol):
     def prepare(self, job_id: str, secrets: dict[str, str]) -> None:
         """Store the job's decrypted credentials, ready for launch()."""
+
+    def add_secrets(self, job_id: str, secrets: dict[str, str]) -> None:
+        """Add to (or replace keys in) the job's Secret before launch(), e.g. a GitHub
+        token minted at launch."""
 
     def launch(self, spec: JobSpec) -> None:
         """Start the job. The Secret from prepare() becomes owned by it."""
@@ -96,6 +104,15 @@ class KubernetesRunner:
                 "type": "Opaque",
                 "stringData": secrets,
             },
+            _request_timeout=self.t,
+        )
+
+    def add_secrets(self, job_id: str, secrets: dict[str, str]) -> None:
+        # `data` (base64), not `stringData`, so the patch merges like any other field.
+        self.core.patch_namespaced_secret(
+            k8s_name(job_id),
+            self.ns,
+            {"data": {k: base64.b64encode(v.encode()).decode() for k, v in secrets.items()}},
             _request_timeout=self.t,
         )
 
@@ -167,6 +184,8 @@ class KubernetesRunner:
             env["DRELLA_PREFLIGHT_HEADERS"] = "\n".join(check.headers)
         if spec.repo:
             env["DRELLA_REPO"] = spec.repo
+            if spec.github_app:
+                env["DRELLA_GITHUB_REFRESH"] = "1"
         # The soft limit: the wrapper stops the agent this long before the hard limit
         # (activeDeadlineSeconds), which runs from roughly now.
         env["DRELLA_DEADLINE"] = str(int(time.time()) + s.job_timeout_seconds)

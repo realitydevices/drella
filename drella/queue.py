@@ -21,6 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from drella.adapters import Interface, ModelSpec
+from drella.github import GitHubApp
 from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState
 from drella.storage import CHUNK, NotFound, Storage
@@ -88,6 +89,7 @@ class Queue:
         interval: float = 5,
         log_snapshot_seconds: float = 30,
         stall_seconds: float = 300,
+        github_app: GitHubApp | None = None,
     ):
         self.sessions = sessions
         self.runner = runner
@@ -96,6 +98,7 @@ class Queue:
         self.interval = interval
         self.log_snapshot_seconds = log_snapshot_seconds
         self.stall_seconds = stall_seconds
+        self.github_app = github_app
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -161,8 +164,10 @@ class Queue:
         self._last_tick = time.monotonic()
 
     def _launch(self, s: Session, job: Job) -> None:
-        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt)
+        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt, github_app=job.github_app)
         try:
+            if job.github_app and job.repo:
+                self._mint_github_token(job)
             self.runner.launch(spec)
         except Exception as e:
             log.exception("launching job %s failed", job.id)
@@ -173,6 +178,19 @@ class Queue:
         job.started_at = datetime.now(UTC)
         s.commit()
         log.info("job %s launched", job.id)
+
+    def _mint_github_token(self, job: Job) -> None:
+        """The job's GitHub token, minted now rather than at job creation: a queued job
+        can wait longer than a token lasts (an hour). It goes into the job's Secret where
+        a caller's `github` credential would be, and never into the database."""
+        if self.github_app is None:
+            raise RuntimeError(
+                "the job needs a token from Drella's GitHub App, which is no longer"
+                " configured (DRELLA_GITHUB_APP_ID)"
+            )
+        token = self.github_app.token(job.repo)
+        self.runner.add_secrets(job.id, {"github": token.token})
+        log.info("minted a GitHub App token for job %s (%s)", job.id, job.repo)
 
     def _check(self, s: Session, job: Job) -> None:
         st = self.runner.status(job.id)

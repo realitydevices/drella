@@ -15,6 +15,15 @@ secretGenerator:
   - name: postgres
     literals:
       - password=drella
+  # Optional: Drella's GitHub App, so Drella mints repo jobs' GitHub tokens itself
+  # (deploy/README.md). Keep the key out of this checkout: create the Secret with
+  # kubectl, or generate it in an overlay next to the .pem, e.g.
+  #
+  #   - name: drella-github-app
+  #     files:
+  #       - private-key.pem=drella-bot.pem
+  #     literals:
+  #       - app-id=<the App's ID>
 # Pinned to a release. The drella image launches the drella-job image with the
 # same tag, so pinning this one pins both.
 images:

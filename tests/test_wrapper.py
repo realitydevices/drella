@@ -32,3 +32,20 @@ def test_agent_output_is_never_read_through_a_symlink():
 
 def test_wrapper_turns_on_auto_merge_on_success():
     assert 'gh pr merge "$pr" --auto --squash' in WRAPPER
+
+
+def test_a_refreshed_github_token_is_checked_before_use():
+    # It ends up in git's credential helper output: one line of plain characters.
+    assert "[[ ! $fresh =~ ^[A-Za-z0-9_.-]{8,}$ ]]" in WRAPPER
+
+
+def test_the_replaced_github_token_stays_redacted():
+    assert "export DRELLA_GH_TOKEN_OLD=$GH_TOKEN" in WRAPPER
+    assert 'k[++n] = ENVIRON["DRELLA_GH_TOKEN_OLD"]' in WRAPPER
+    assert 'k[++n] = ENVIRON["GH_TOKEN"]' in WRAPPER
+
+
+def test_the_github_token_is_refreshed_only_for_app_token_jobs_and_bounded():
+    assert '[ "${DRELLA_GITHUB_REFRESH:-}" = 1 ]' in WRAPPER
+    assert "within 30 curl -fsS --retry 3" in WRAPPER
+    assert '"$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/github-token"' in WRAPPER

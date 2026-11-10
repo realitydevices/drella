@@ -8,7 +8,9 @@
 #      Code with the model's OAuth token (DRELLA_AGENT_MODEL; docs/v0.3.md);
 #   3. runs the agent with the prompt and standing instructions: with a repo, work on
 #      a branch, push it and open a PR with gh; without one, write results to /out;
-#   4. collects /out (transcript, plus diff and PR URL for a repo job);
+#   4. collects /out (transcript, plus diff and PR URL for a repo job). If the GitHub
+#      token came from Drella's GitHub App (DRELLA_GITHUB_REFRESH), it first asks
+#      Drella for a fresh one: a token lasts an hour, and so can the job;
 #   5. reports the final status with the job-scoped token, then uploads /out to the
 #      Drella API. A repo job succeeds only if a PR exists; a job without a repo
 #      succeeds if the agent exits cleanly and wrote at least one output.
@@ -79,7 +81,8 @@ api() {
     --retry-connrefused -m 120 -H "Authorization: Bearer $DRELLA_JOB_TOKEN" "$@"
 }
 
-# Replace the job's secrets (the model's API key and the GitHub token) with
+# Replace the job's secrets (the model's API key and the GitHub token, and the GitHub
+# token it replaced if it was refreshed) with
 # [redacted] in a stream, line by line. The agent can read both from its environment;
 # this keeps them out of the transcript, the session record and the archived log if it
 # prints them. Best effort: a secret split across lines, or encoded, gets through, and
@@ -93,6 +96,7 @@ redact() {
       n = 0
       if (length(ENVIRON["DRELLA_LLM_KEY"]) >= 8) k[++n] = ENVIRON["DRELLA_LLM_KEY"]
       if (length(ENVIRON["GH_TOKEN"]) >= 8) k[++n] = ENVIRON["GH_TOKEN"]
+      if (length(ENVIRON["DRELLA_GH_TOKEN_OLD"]) >= 8) k[++n] = ENVIRON["DRELLA_GH_TOKEN_OLD"]
     }
     {
       line = $0
@@ -394,8 +398,31 @@ else
   [ -n "$session" ] && within 20 opencode export "$session" 2>/dev/null | redact >"$OUT/session.json"
 fi
 
+# refresh_github_token: replace GH_TOKEN with a fresh token from Drella's GitHub App,
+# for the job's own repo. git's credential helper reads $GH_TOKEN when it runs, so it
+# picks up the new one too. The old token stays redacted. If this fails, the job
+# carries on with the token it has (it may still be valid).
+refresh_github_token() {
+  local fresh
+  # Bounded (not api()'s retry-until-the-deadline): this is best effort, and the PR
+  # check and the final report still need the time.
+  fresh=$(within 30 curl -fsS --retry 3 --retry-delay 2 --retry-connrefused -m 20 \
+    -X POST -H "Authorization: Bearer $DRELLA_JOB_TOKEN" \
+    "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/github-token" | jq -r '.token // empty') || fresh=""
+  # A token is one line of plain characters; anything else would break the
+  # credential helper's output.
+  if [[ ! $fresh =~ ^[A-Za-z0-9_.-]{8,}$ ]]; then
+    log "couldn't get a fresh GitHub token; carrying on with the one from launch"
+    return 0
+  fi
+  export DRELLA_GH_TOKEN_OLD=$GH_TOKEN
+  GH_TOKEN=$fresh
+  log "refreshed the GitHub token"
+}
+
 pr="" diff_note="" pr_lookup_failed=""
 if [ -n "$REPO" ]; then
+  [ "${DRELLA_GITHUB_REFRESH:-}" = 1 ] && [ -n "${GH_TOKEN:-}" ] && refresh_github_token
   # Everything that changed since the clone, committed or not.
   within 30 git add -A -N
   if ! within 30 git diff --binary "$BASE" >"$OUT/diff.patch"; then
