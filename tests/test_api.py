@@ -6,9 +6,20 @@ from drella.runner import JOB_TOKEN_KEY, RunState, RunStatus
 JOB = {
     "prompt": "add a CHANGELOG.md",
     "repo": "octo/widgets",
-    "model": "some-model",
-    "endpoint": "http://ollama:11434/v1",
+    "model": "local",
 }
+LOCAL = {
+    "interface": "openai-compatible",
+    "base_url": "http://ollama:11434/v1",
+    "model_id": "some-model",
+}
+
+
+@pytest.fixture(autouse=True)
+def local_model(client, auth):
+    """Every test can use the model alias "local" (no API key)."""
+    r = client.put("/models/local", json=LOCAL, headers=auth)
+    assert r.status_code == 200, r.text
 
 
 @pytest.fixture
@@ -67,7 +78,7 @@ def test_job_without_repo_needs_no_credentials(client, auth, runner):
 
 def test_create_job_validates_body(client, auth):
     client.put("/credentials/github", json={"value": "x"}, headers=auth)
-    for bad in ({"repo": "not a repo"}, {"endpoint": "ftp://x"}, {"prompt": ""}):
+    for bad in ({"repo": "not a repo"}, {"model": "Not An Alias"}, {"prompt": ""}):
         assert client.post("/jobs", json=JOB | bad, headers=auth).status_code == 422
 
 
@@ -123,9 +134,10 @@ def test_full_job_lifecycle(client, auth, job, queue, runner):
     queue.tick()
     jid, ja = job["id"], job_auth(runner, job["id"])
     spec = runner.launched[0]
-    assert (spec.repo, spec.model, spec.endpoint, spec.prompt) == (
-        JOB["repo"], JOB["model"], JOB["endpoint"], JOB["prompt"]
+    assert (spec.repo, spec.model.alias, spec.model.base_url, spec.model.model_id, spec.prompt) == (
+        JOB["repo"], "local", LOCAL["base_url"], LOCAL["model_id"], JOB["prompt"]
     )
+    assert not spec.model.has_key
 
     # The pod uploads its outputs and reports.
     assert client.put(f"/jobs/{jid}/outputs/diff.patch", content=b"+hello\n", headers=ja).status_code == 204
@@ -360,3 +372,96 @@ def test_reported_failure_message_wins_over_kubernetes_reason(client, auth, job,
     queue.tick()
     got = client.get(f"/jobs/{job['id']}", headers=auth).json()
     assert (got["status"], got["message"]) == ("failed", "no PR")
+
+
+# -- models [27] ------------------------------------------------------------------
+
+CLAUDE = {
+    "interface": "anthropic",
+    "base_url": "https://api.anthropic.com/v1/",
+    "model_id": "claude-x",
+    "credential": "anthropic-key",
+    "context_length": 200000,
+    "cost_in_per_mtok": "3",
+    "cost_out_per_mtok": "15",
+    "notes": "reviews",
+}
+
+
+def test_models_api(client, auth):
+    r = client.put("/models/claude", json=CLAUDE, headers=auth)
+    assert r.status_code == 200, r.text
+    m = r.json()
+    assert m["alias"] == "claude" and m["base_url"] == "https://api.anthropic.com/v1"
+    assert [x["alias"] for x in client.get("/models", headers=auth).json()] == ["claude", "local"]
+    # PUT replaces.
+    r = client.put("/models/claude", json=CLAUDE | {"notes": None, "context_length": None}, headers=auth)
+    assert r.json()["notes"] is None and r.json()["context_length"] is None
+    assert client.get("/models/claude", headers=auth).json()["model_id"] == "claude-x"
+    assert client.delete("/models/claude", headers=auth).status_code == 204
+    assert client.get("/models/claude", headers=auth).status_code == 404
+    assert client.delete("/models/claude", headers=auth).status_code == 404
+    assert client.get("/models").status_code == 401
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"interface": "carrier-pigeon"}, {"base_url": "ftp://x"}, {"model_id": ""},
+     {"credential": "_llm-key"}, {"context_length": 0}, {"cost_in_per_mtok": "-1"}],
+)
+def test_models_are_validated(client, auth, bad):
+    assert client.put("/models/claude", json=CLAUDE | bad, headers=auth).status_code == 422
+    assert client.put("/models/Bad Alias", json=CLAUDE, headers=auth).status_code in (404, 422)
+
+
+def test_job_with_unknown_model_is_rejected(client, auth):
+    r = client.post("/jobs", json={"prompt": "x", "model": "nope"}, headers=auth)
+    assert r.status_code == 422 and "nope" in r.json()["detail"]
+
+
+def test_job_needs_the_models_credential(client, auth):
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    r = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth)
+    assert r.status_code == 422 and "anthropic-key" in r.json()["detail"]
+
+
+def test_job_secret_gets_the_model_key_and_nothing_else(client, auth, runner, queue):
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    for name, value in [("github", "ghp_x"), ("anthropic-key", "sk-x"), ("other", "o")]:
+        client.put(f"/credentials/{name}", json={"value": value}, headers=auth)
+
+    no_repo = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth).json()
+    assert set(runner.secrets[no_repo["id"]]) == {"_llm-key", JOB_TOKEN_KEY}
+    assert runner.secrets[no_repo["id"]]["_llm-key"] == "sk-x"
+
+    repo = client.post("/jobs", json=JOB | {"model": "claude"}, headers=auth).json()
+    assert set(runner.secrets[repo["id"]]) == {"github", "_llm-key", JOB_TOKEN_KEY}
+
+    local = client.post("/jobs", json=JOB, headers=auth).json()
+    assert set(runner.secrets[local["id"]]) == {"github", JOB_TOKEN_KEY}
+
+    queue.tick()
+    assert runner.launched[0].model.has_key
+
+
+def test_a_job_keeps_its_model_snapshot(client, auth, runner, queue):
+    client.put("/models/claude", json=CLAUDE, headers=auth)
+    client.put("/credentials/anthropic-key", json={"value": "sk-x"}, headers=auth)
+    job = client.post("/jobs", json={"prompt": "x", "model": "claude"}, headers=auth).json()
+    snapshot = {
+        "alias": "claude", "interface": "anthropic", "base_url": "https://api.anthropic.com/v1",
+        "model_id": "claude-x", "credential": "anthropic-key", "context_length": 200000,
+    }
+    assert {k: job["model"][k] for k in snapshot} == snapshot
+    assert float(job["model"]["cost_out_per_mtok"]) == 15
+
+    # Changing or deleting the model doesn't rewrite the job, or what it runs.
+    client.put("/models/claude", json=CLAUDE | {"model_id": "claude-y"}, headers=auth)
+    client.delete("/models/claude", headers=auth)
+    got = client.get(f"/jobs/{job['id']}", headers=auth).json()
+    assert got["model"]["model_id"] == "claude-x"
+    queue.tick()
+    spec = runner.launched[0]
+    assert (spec.model.model_id, spec.model.interface, spec.model.has_key) == (
+        "claude-x", "anthropic", True
+    )

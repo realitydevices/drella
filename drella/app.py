@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, Response
@@ -18,9 +19,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from drella import crypto
+from drella.adapters import LLM_KEY_SECRET, Interface
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
-from drella.models import QUEUED, RUNNING, TERMINAL, Credential, Job, Token
+from drella.models import QUEUED, RUNNING, TERMINAL, Credential, Job, Model, Token
 from drella.queue import Queue, archived_log, output_prefix
 from drella.runner import JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
 from drella.storage import CHUNK, LocalStorage, NotFound, Storage
@@ -49,8 +51,41 @@ class JobIn(BaseModel):
         pattern=REPO_RE,
         description="GitHub repo as owner/name. Leave it out for a job with no repo (no PR).",
     )
-    model: str = Field(min_length=1)
-    endpoint: str = Field(pattern=r"^https?://", description="OpenAI-compatible base URL")
+    model: str = Field(pattern=NAME_RE, description="A registered model alias (PUT /models)")
+
+
+class ModelIn(BaseModel):
+    interface: Interface
+    base_url: str = Field(pattern=r"^https?://", max_length=500)
+    model_id: str = Field(min_length=1, max_length=200)
+    credential: str | None = Field(
+        default=None,
+        pattern=NAME_RE,
+        description="Name of the caller's credential holding the API key, if needed",
+    )
+    context_length: int | None = Field(default=None, gt=0)
+    cost_in_per_mtok: Decimal | None = Field(default=None, ge=0)
+    cost_out_per_mtok: Decimal | None = Field(default=None, ge=0)
+    notes: str | None = None
+
+
+class ModelOut(ModelIn):
+    alias: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class JobModelOut(BaseModel):
+    """The job's model, as it was when the job was created."""
+
+    alias: str
+    interface: str
+    base_url: str
+    model_id: str
+    credential: str | None
+    context_length: int | None
+    cost_in_per_mtok: Decimal | None
+    cost_out_per_mtok: Decimal | None
 
 
 class JobOut(BaseModel):
@@ -58,8 +93,7 @@ class JobOut(BaseModel):
     status: str
     prompt: str
     repo: str | None
-    model: str
-    endpoint: str
+    model: JobModelOut
     message: str | None
     created_at: datetime
     started_at: datetime | None
@@ -78,8 +112,16 @@ def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
         status=job.status,
         prompt=job.prompt,
         repo=job.repo,
-        model=job.model,
-        endpoint=job.endpoint,
+        model=JobModelOut(
+            alias=job.model,
+            interface=job.interface,
+            base_url=job.base_url,
+            model_id=job.model_id,
+            credential=job.credential,
+            context_length=job.context_length,
+            cost_in_per_mtok=job.cost_in_per_mtok,
+            cost_out_per_mtok=job.cost_out_per_mtok,
+        ),
         message=job.message,
         created_at=job.created_at,
         started_at=job.started_at,
@@ -249,27 +291,45 @@ def list_credentials(c: CallerDep, db: DbDep) -> list[str]:
 
 @router.post("/jobs", status_code=201)
 def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
-    creds = db.scalars(select(Credential).where(Credential.token_id == c.token.id)).all()
+    model = db.get(Model, body.model)
+    if model is None:
+        raise HTTPException(422, f"no model '{body.model}' (register it with PUT /models)")
+    creds = {
+        cred.name: cred
+        for cred in db.scalars(select(Credential).where(Credential.token_id == c.token.id))
+    }
     # Only a job with a repo needs git access.
-    if body.repo and GITHUB_CREDENTIAL not in {cred.name for cred in creds}:
+    if body.repo and GITHUB_CREDENTIAL not in creds:
         raise HTTPException(422, f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential")
+    if model.credential and model.credential not in creds:
+        raise HTTPException(
+            422, f"model '{model.alias}' needs a '{model.credential}' credential (its API key)"
+        )
     # The request carries the token, so this is when credentials are decrypted
     # [19]. They go straight into the job's Secret, never into the database. A job
-    # gets only what it needs [10]: in v0 that's the GitHub credential, for a repo job.
-    needed = {GITHUB_CREDENTIAL} if body.repo else set()
-    secrets = {
-        cred.name: crypto.decrypt(c.secret, c.token.salt, cred.ciphertext)
-        for cred in creds
-        if cred.name in needed
-    }
+    # gets only what it needs [10]: the GitHub credential for a repo job, and its
+    # model's API key, if the model has one [27].
+    def decrypt(name: str) -> str:
+        return crypto.decrypt(c.secret, c.token.salt, creds[name].ciphertext)
+
+    secrets = {GITHUB_CREDENTIAL: decrypt(GITHUB_CREDENTIAL)} if body.repo else {}
+    if model.credential:
+        secrets[LLM_KEY_SECRET] = decrypt(model.credential)
     job_token = crypto.new_token(crypto.JOB_TOKEN_PREFIX)
     secrets[JOB_TOKEN_KEY] = job_token
     job = Job(
         token_id=c.token.id,
         prompt=body.prompt,
         repo=body.repo,
-        model=body.model,
-        endpoint=body.endpoint.rstrip("/"),
+        # A snapshot: later changes to the model don't rewrite this job's history.
+        model=model.alias,
+        interface=model.interface,
+        base_url=model.base_url,
+        model_id=model.model_id,
+        credential=model.credential,
+        context_length=model.context_length,
+        cost_in_per_mtok=model.cost_in_per_mtok,
+        cost_out_per_mtok=model.cost_out_per_mtok,
         job_token_hash=crypto.lookup_hash(job_token),
     )
     db.add(job)
@@ -291,6 +351,68 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         raise
     deps.queue.wake()
     return job_out(job)
+
+
+# -- models [27] ---------------------------------------------------------------
+# Global: any valid token can manage them until owners exist (O2).
+
+
+def model_out(m: Model) -> ModelOut:
+    return ModelOut(
+        alias=m.alias,
+        interface=Interface(m.interface),
+        base_url=m.base_url,
+        model_id=m.model_id,
+        credential=m.credential,
+        context_length=m.context_length,
+        cost_in_per_mtok=m.cost_in_per_mtok,
+        cost_out_per_mtok=m.cost_out_per_mtok,
+        notes=m.notes,
+        created_at=m.created_at,
+        updated_at=m.updated_at,
+    )
+
+
+@router.put("/models/{alias}")
+def put_model(
+    alias: Annotated[str, Path(pattern=NAME_RE)], body: ModelIn, c: CallerDep, db: DbDep
+) -> ModelOut:
+    fields = body.model_dump()
+    fields["interface"] = body.interface.value
+    fields["base_url"] = body.base_url.rstrip("/")
+    m = db.get(Model, alias)
+    if m is None:
+        m = Model(alias=alias, **fields)
+        db.add(m)
+    else:
+        for k, v in fields.items():
+            setattr(m, k, v)
+    db.commit()
+    db.refresh(m)
+    return model_out(m)
+
+
+@router.get("/models")
+def list_models(c: CallerDep, db: DbDep) -> list[ModelOut]:
+    return [model_out(m) for m in db.scalars(select(Model).order_by(Model.alias))]
+
+
+@router.get("/models/{alias}")
+def get_model(alias: str, c: CallerDep, db: DbDep) -> ModelOut:
+    m = db.get(Model, alias)
+    if m is None:
+        raise HTTPException(404, "model not found")
+    return model_out(m)
+
+
+@router.delete("/models/{alias}", status_code=204)
+def delete_model(alias: str, c: CallerDep, db: DbDep) -> Response:
+    m = db.get(Model, alias)
+    if m is None:
+        raise HTTPException(404, "model not found")
+    db.delete(m)
+    db.commit()
+    return Response(status_code=204)
 
 
 @router.get("/jobs")

@@ -2,8 +2,17 @@
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, LargeBinary, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    LargeBinary,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -49,8 +58,16 @@ class Job(Base):
     token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"))
     prompt: Mapped[str] = mapped_column(Text)
     repo: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    model: Mapped[str] = mapped_column(String(200))
-    endpoint: Mapped[str] = mapped_column(String(500))
+    # The job's model, snapshotted from the models table when the job was created
+    # [27], so later changes to the model don't rewrite the job's history.
+    model: Mapped[str] = mapped_column(String(200))  # the alias
+    interface: Mapped[str] = mapped_column(String(32))
+    base_url: Mapped[str] = mapped_column(String(500))
+    model_id: Mapped[str] = mapped_column(String(200))
+    credential: Mapped[str | None] = mapped_column(String(200))  # name, not the key
+    context_length: Mapped[int | None]
+    cost_in_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    cost_out_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     status: Mapped[str] = mapped_column(String(16), default=QUEUED, index=True)
     # What the job reported via POST /jobs/{id}/status. It becomes `status` once
     # the Kubernetes Job has finished and its log is archived.
@@ -61,3 +78,22 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(default=_now, index=True)
     started_at: Mapped[datetime | None]
     finished_at: Mapped[datetime | None]
+
+
+class Model(Base):
+    """A model jobs can use, by alias [27]. Global until owners exist (O2)."""
+
+    __tablename__ = "models"
+
+    alias: Mapped[str] = mapped_column(String(63), primary_key=True)
+    interface: Mapped[str] = mapped_column(String(32))
+    base_url: Mapped[str] = mapped_column(String(500))
+    model_id: Mapped[str] = mapped_column(String(200))
+    # Name of the caller's credential holding the API key, if the model needs one.
+    credential: Mapped[str | None] = mapped_column(String(63))
+    context_length: Mapped[int | None]
+    cost_in_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    cost_out_per_mtok: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+    updated_at: Mapped[datetime] = mapped_column(default=_now, onupdate=_now)

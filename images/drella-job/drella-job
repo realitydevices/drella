@@ -2,13 +2,14 @@
 # Drella job wrapper [21]. Runs inside the job pod:
 #   1. with a repo (DRELLA_REPO): clones it with the GitHub credential (/creds/github).
 #      Without one: starts in an empty working directory;
-#   2. configures OpenCode for the job's endpoint and model;
+#   2. checks the model endpoint and writes OpenCode's config, both rendered by Drella
+#      for the job's model (DRELLA_PREFLIGHT_*, DRELLA_OPENCODE_CONFIG; docs/v0.2.md);
 #   3. runs `opencode run` with the prompt and standing instructions: with a repo,
 #      work on a branch, push it and open a PR with gh; without one, write results to /out;
 #   4. collects /out (transcript, plus diff and PR URL for a repo job);
 #   5. reports the final status with the job-scoped token, then uploads /out to the
 #      Drella API. A repo job succeeds only if a PR exists; a job without a repo
-#      succeeds if the agent exits cleanly.
+#      succeeds if the agent exits cleanly and wrote at least one output.
 #
 # Time limits (docs/v0.md): the agent runs under a timer that stops it
 # DRELLA_AGENT_GRACE seconds before DRELLA_DEADLINE (the Job's hard limit). If the pod
@@ -21,7 +22,8 @@
 set -uo pipefail
 
 : "${DRELLA_API_URL:?}" "${DRELLA_JOB_ID:?}" "${DRELLA_JOB_TOKEN:?}"
-: "${DRELLA_MODEL:?}" "${DRELLA_ENDPOINT:?}" "${DRELLA_PROMPT:?}"
+: "${DRELLA_OPENCODE_CONFIG:?}" "${DRELLA_PREFLIGHT_URL:?}" "${DRELLA_PROMPT:?}"
+MODEL_LABEL=${DRELLA_MODEL_LABEL:-$DRELLA_PREFLIGHT_URL}
 OUT=${DRELLA_OUT:-/out}
 WORK=${DRELLA_WORK:-/work}
 CREDS=${DRELLA_CREDS:-/creds}
@@ -148,25 +150,29 @@ fi
 # -- 2. configure OpenCode -----------------------------------------------------
 
 # OpenCode retries an unreachable endpoint until the job times out, so check first.
-curl -fsS -m 20 -o /dev/null "$DRELLA_ENDPOINT/models" \
-  || finish failed "model endpoint $DRELLA_ENDPOINT is unreachable"
+# Drella's adapter for the model says what to call and with which headers; header
+# values refer to the API key as {key}. The headers go through a private file, so the
+# key isn't on curl's command line.
+headers="$WORK/preflight-headers"
+(umask 077; : >"$headers")
+while IFS= read -r h; do
+  [ -n "$h" ] && printf '%s\n' "${h//'{key}'/${DRELLA_LLM_KEY:-}}" >>"$headers"
+done <<<"${DRELLA_PREFLIGHT_HEADERS:-}"
+code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H @"$headers" "$DRELLA_PREFLIGHT_URL")
+rm -f "$headers"
+case $code in
+  2??) ;;
+  401|403) finish failed "the model endpoint rejected the API key (HTTP $code from $DRELLA_PREFLIGHT_URL)" ;;
+  000) finish failed "the model endpoint is unreachable ($DRELLA_PREFLIGHT_URL)" ;;
+  *) finish failed "the model endpoint answered HTTP $code ($DRELLA_PREFLIGHT_URL)" ;;
+esac
 
-# A custom OpenAI-compatible provider (Ollama serves one at <host>:11434/v1).
+# OpenCode's config, as rendered by Drella. The API key, if any, stays in the
+# environment: the config refers to it as {env:DRELLA_LLM_KEY}.
 export OPENCODE_CONFIG="$WORK/opencode.json"
-jq -n --arg url "$DRELLA_ENDPOINT" --arg model "$DRELLA_MODEL" '{
-  "$schema": "https://opencode.ai/config.json",
-  provider: {
-    drella: {
-      npm: "@ai-sdk/openai-compatible",
-      name: "Drella endpoint",
-      options: {baseURL: $url},
-      models: {($model): {name: $model}}
-    }
-  },
-  model: "drella/\($model)",
-  autoupdate: false,
-  share: "disabled"
-}' >"$OPENCODE_CONFIG"
+printf '%s\n' "$DRELLA_OPENCODE_CONFIG" >"$OPENCODE_CONFIG"
+AGENT_MODEL=$(jq -er .model "$OPENCODE_CONFIG") \
+  || finish failed "the job's OpenCode config names no model"
 
 # -- 3. run the agent ----------------------------------------------------------
 
@@ -199,7 +205,7 @@ MESSAGE="Task from Drella:"$'\n'"$DRELLA_PROMPT"$'\n\n'"$STANDING"
 budget=$((DEADLINE - AGENT_GRACE - $(date +%s)))
 [ "$budget" -gt 60 ] || finish failed "no time left to run the agent (the deadline is too close)"
 
-log "running opencode with drella/$DRELLA_MODEL at $DRELLA_ENDPOINT (stops after ${budget}s)"
+log "running opencode with $MODEL_LABEL (stops after ${budget}s)"
 # Runs unattended in a throwaway pod, so it may use its tools without asking. It runs
 # in the background so the TERM trap can fire while it works; the inner shell records
 # the agent's pid and exit code.
@@ -207,7 +213,7 @@ phase=agent
 agent_started=$(date +%s)
 {
   timeout --signal=TERM --kill-after=30 "$budget" \
-    opencode run --dangerously-skip-permissions --model "drella/$DRELLA_MODEL" "$MESSAGE" &
+    opencode run --dangerously-skip-permissions --model "$AGENT_MODEL" "$MESSAGE" &
   echo $! >"$WORK/agent.pid"
   wait $!
   echo $? >"$WORK/agent.rc"
@@ -277,7 +283,13 @@ reason=$(failure)
 if [ -n "$reason" ]; then
   finish failed "$reason${pr:+; PR: $pr}$diff_note"
 elif [ -z "$REPO" ]; then
-  finish succeeded "done"
+  # The agent's results are files in /out; the transcript and session are ours.
+  results=$(find "$OUT" -maxdepth 1 -type f ! -name transcript.txt ! -name session.json | wc -l)
+  if [ "$results" -gt 0 ]; then
+    finish succeeded "done"
+  else
+    finish failed "the agent wrote no outputs to $OUT"
+  fi
 elif [ -z "$pr" ] && [ -n "$pr_lookup_failed" ]; then
   finish failed "couldn't check for a pull request (gh pr list failed or timed out)$diff_note"
 elif [ -z "$pr" ]; then

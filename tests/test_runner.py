@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,12 +16,17 @@ from kubernetes.client import (
 )
 from kubernetes.client.exceptions import ApiException
 
+from drella.adapters import Interface, ModelSpec
 from drella.config import Settings
 from drella.runner import JOB_TOKEN_KEY, JobSpec, KubernetesRunner, LogsUnavailable, RunState
 
 JOB_ID = "abc123"
 NAME = "drella-job-abc123"
-SPEC = JobSpec(JOB_ID, "octo/widgets", "some-model", "http://ollama:11434/v1", "do it")
+LOCAL = ModelSpec("local", Interface.OPENAI_COMPATIBLE, "http://ollama:11434/v1", "some-model")
+CLAUDE = ModelSpec(
+    "claude", Interface.ANTHROPIC, "https://api.anthropic.com/v1", "claude-x", has_key=True
+)
+SPEC = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it")
 
 
 @pytest.fixture
@@ -68,7 +74,10 @@ def test_launch_creates_job_with_limits_and_hands_it_the_secret(k8s):
     env = {e["name"]: e for e in c["env"]}
     assert env["DRELLA_REPO"]["value"] == SPEC.repo
     assert env["DRELLA_PROMPT"]["value"] == SPEC.prompt
-    assert env["DRELLA_ENDPOINT"]["value"] == SPEC.endpoint
+    assert env["DRELLA_PREFLIGHT_URL"]["value"] == "http://ollama:11434/v1/models"
+    assert json.loads(env["DRELLA_OPENCODE_CONFIG"]["value"])["model"] == "drella/some-model"
+    # No key for this model, so none is mapped in.
+    assert "DRELLA_LLM_KEY" not in env
     assert env["DRELLA_JOB_TOKEN"]["valueFrom"]["secretKeyRef"] == {"name": NAME, "key": JOB_TOKEN_KEY}
     assert {"name": "creds", "secret": {"secretName": NAME}} in pod_spec["volumes"]
 
@@ -150,7 +159,7 @@ def test_cleanup_ignores_already_deleted(k8s):
 
 def test_launch_without_repo_omits_drella_repo(k8s):
     r, batch, _ = k8s
-    r.launch(JobSpec(JOB_ID, None, "some-model", "http://ollama:11434/v1", "summarise"))
+    r.launch(JobSpec(JOB_ID, None, LOCAL, "summarise"))
     _, job = batch.create_namespaced_job.call_args.args
     (c,) = job["spec"]["template"]["spec"]["containers"]
     assert "DRELLA_REPO" not in {e["name"] for e in c["env"]}
@@ -198,3 +207,17 @@ def test_job_secrets_lists_secrets_by_job_id(k8s):
         items=[V1Secret(metadata=V1ObjectMeta(labels={"drella.dev/job-id": "j1"}, creation_timestamp=t))]
     )
     assert r.job_secrets() == {"j1": t}
+
+
+def test_launch_maps_the_model_key_from_the_secret(k8s):
+    r, batch, _ = k8s
+    r.launch(JobSpec(JOB_ID, None, CLAUDE, "summarise"))
+    _, job = batch.create_namespaced_job.call_args.args
+    (c,) = job["spec"]["template"]["spec"]["containers"]
+    env = {e["name"]: e for e in c["env"]}
+    assert env["DRELLA_LLM_KEY"]["valueFrom"]["secretKeyRef"] == {"name": NAME, "key": "_llm-key"}
+    assert env["DRELLA_PREFLIGHT_HEADERS"]["value"] == (
+        "x-api-key: {key}\nanthropic-version: 2023-06-01"
+    )
+    # The key itself is never in the manifest.
+    assert "sk-" not in json.dumps(job)
