@@ -58,6 +58,10 @@ class FakeGitHub:
         self.installations = {"octo/widgets": 42}  # repo -> installation id
         self.requests: list[tuple[str, str, dict | None]] = []
         self.token_status = 201
+        # Statuses to answer the next mint requests with (one each), before token_status.
+        self.token_statuses: list[int] = []
+        # Overrides for the minted token's answer; a key set to None is left out.
+        self.answer: dict = {}
         self.minted = 0
         # What GitHub says it granted; None: exactly what was asked for, as GitHub does.
         self.granted: dict | None = None
@@ -110,23 +114,23 @@ class FakeGitHub:
                     f"/app/installations/{i}/access_tokens" for i in fake.installations.values()
                 }:
                     return self._reply(404, {"message": "Not Found"})
-                if fake.token_status != 201:
+                status = fake.token_statuses.pop(0) if fake.token_statuses else fake.token_status
+                if status != 201:
                     return self._reply(
-                        fake.token_status, {"message": "The permissions requested are not granted"}
+                        status, {"message": "The permissions requested are not granted"}
                     )
                 fake.minted += 1
                 expires = time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + fake.expires_in)
                 )
-                self._reply(
-                    201,
-                    {
-                        "token": f"ghs_minted{fake.minted:04d}",
-                        "expires_at": expires,
-                        "permissions": fake.granted or {**body["permissions"], "metadata": "read"},
-                        "repository_selection": "selected",
-                    },
-                )
+                answer = {
+                    "token": f"ghs_minted{fake.minted:04d}",
+                    "expires_at": expires,
+                    "permissions": fake.granted or {**body["permissions"], "metadata": "read"},
+                    "repository_selection": "selected",
+                    **fake.answer,
+                }
+                self._reply(201, {k: v for k, v in answer.items() if v is not None})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -172,8 +176,9 @@ def test_a_jwt_does_not_verify_with_another_key():
 
 
 def test_a_bad_key_file_is_reported_without_its_contents(tmp_path):
-    with pytest.raises(GitHubAppError, match="can't read"):
+    with pytest.raises(GitHubAppError, match="private key can't be read") as e:
         load_key(str(tmp_path / "missing.pem"))
+    assert "missing.pem" not in str(e.value) and "No such file" not in str(e.value)
     bad = tmp_path / "bad.pem"
     bad.write_text("not a key at all")
     with pytest.raises(GitHubAppError, match="isn't a PEM RSA key") as e:
@@ -252,6 +257,33 @@ def test_a_token_wider_than_its_profile_is_never_used(gh_app, github, granted):
     with pytest.raises(GitHubAppError, match="granted more than the 'reader' profile") as e:
         gh_app.token("octo/widgets", READER)
     assert "ghs_" not in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"permissions": None},
+        {"permissions": ["contents"]},
+        {"repository_selection": "all"},
+        {"repository_selection": None},
+        {"repositories": [{"name": "widgets"}, {"name": "gadgets"}]},
+        {"repositories": [{"name": "gadgets"}]},
+        {"repositories": []},
+        {"repositories": "widgets"},
+    ],
+)
+def test_a_token_that_isnt_clearly_one_repo_with_known_permissions_is_never_used(
+    gh_app, github, answer
+):
+    github.answer = answer
+    with pytest.raises(GitHubAppError, match="not using") as e:
+        gh_app.token("octo/widgets", READER)
+    assert "ghs_" not in str(e.value)
+
+
+def test_a_token_for_exactly_this_repo_is_used(gh_app, github):
+    github.answer = {"repositories": [{"name": "widgets"}]}
+    assert gh_app.token("octo/widgets", READER).token == "ghs_minted0001"
 
 
 def test_the_expiry_is_never_later_than_an_hour_from_now(gh_app, github):
@@ -338,6 +370,8 @@ def app_client(app_settings, runner, storage):
     app = create_app(app_settings, runner=runner, storage=storage, start_queue=False)
     with TestClient(app) as c:
         c.queue = app.state.deps.queue
+        c.sleeps = []
+        c.queue._sleep = c.sleeps.append  # no real waiting between mint attempts
         yield c
 
 
@@ -545,6 +579,63 @@ def test_a_mint_failure_fails_the_job_and_the_queue_moves_on(app_client, app_aut
     third = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
     app_client.queue.tick()
     assert app_client.get(f"/jobs/{third}", headers=app_auth).json()["status"] == "running"
+
+
+def test_a_launch_failure_after_minting_cleans_up_and_leaves_no_token(
+    app_client, app_auth, runner, github
+):
+    runner.fail_launch = True
+    real_cleanup = runner.cleanup
+
+    def cleanup(job_id):  # the real one deletes the Secret; the fake only records
+        real_cleanup(job_id)
+        runner.secrets.pop(job_id, None)
+
+    runner.cleanup = cleanup
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    app_client.queue.tick()
+    assert github.minted == 1  # minted (and added to the Secret) before the launch failed
+    got = app_client.get(f"/jobs/{jid}", headers=app_auth).json()
+    assert got["status"] == "failed" and "launch failed" in got["message"]
+    assert runner.cleaned == [jid]
+    assert "github" not in runner.secrets.get(jid, {})
+    assert runner.launched == []
+
+
+def test_a_transient_mint_failure_is_retried(app_client, app_auth, runner, github):
+    github.token_statuses = [502]
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    app_client.queue.tick()
+    assert app_client.get(f"/jobs/{jid}", headers=app_auth).json()["status"] == "running"
+    assert app_client.sleeps == [0.5]
+    assert runner.secrets[jid]["github"] == "ghs_minted0001"
+
+
+def test_three_transient_mint_failures_fail_the_job(app_client, app_auth, runner, github):
+    github.token_statuses = [502, 502, 502]
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    app_client.queue.tick()
+    got = app_client.get(f"/jobs/{jid}", headers=app_auth).json()
+    assert got["status"] == "failed" and "HTTP 502" in got["message"]
+    assert app_client.sleeps == [0.5, 1.0]
+    assert [m for m, *_ in github.requests].count("POST") == 3
+
+
+def test_a_rate_limited_mint_is_retried(app_client, app_auth, github):
+    github.token_statuses = [429]
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    app_client.queue.tick()
+    assert app_client.get(f"/jobs/{jid}", headers=app_auth).json()["status"] == "running"
+
+
+@pytest.mark.parametrize("status", [404, 422])
+def test_a_client_error_is_not_retried(app_client, app_auth, github, status):
+    github.token_status = status
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    app_client.queue.tick()
+    assert app_client.get(f"/jobs/{jid}", headers=app_auth).json()["status"] == "failed"
+    assert [m for m, *_ in github.requests].count("POST") == 1
+    assert app_client.sleeps == []
 
 
 def test_there_is_no_token_refresh_route(app_client, app_auth, runner):

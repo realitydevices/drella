@@ -22,7 +22,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from drella.adapters import Interface, ModelSpec
-from drella.github import PROFILES, GitHubApp
+from drella.github import PROFILES, GitHubApp, GitHubAppError
 from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, Token
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState
 from drella.storage import CHUNK, NotFound, Storage
@@ -32,6 +32,10 @@ log = logging.getLogger(__name__)
 # A Secret younger than this is never reaped: its job may not be committed yet.
 SECRET_MIN_AGE = timedelta(minutes=10)
 REAP_EVERY = 60  # seconds
+# Minting a GitHub token: up to this many attempts, waiting these seconds between them,
+# and only for failures that may pass (GitHub 5xx, 429, network errors).
+MINT_ATTEMPTS = 3
+MINT_BACKOFF = (0.5, 1.0)
 
 
 def log_key(job_id: str) -> str:
@@ -91,6 +95,7 @@ class Queue:
         log_snapshot_seconds: float = 30,
         stall_seconds: float = 300,
         github_app: GitHubApp | None = None,
+        sleep=time.sleep,
     ):
         self.sessions = sessions
         self.runner = runner
@@ -100,6 +105,7 @@ class Queue:
         self.log_snapshot_seconds = log_snapshot_seconds
         self.stall_seconds = stall_seconds
         self.github_app = github_app
+        self._sleep = sleep  # injectable, so tests don't wait
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -199,7 +205,15 @@ class Queue:
         profile = PROFILES.get(token_row.github_profile) if token_row else None
         if profile is None:
             raise RuntimeError("the job's Drella token has no known GitHub profile")
-        token = self.github_app.token(job.repo, profile)
+        for attempt in range(MINT_ATTEMPTS):
+            try:
+                token = self.github_app.token(job.repo, profile)
+                break
+            except GitHubAppError as e:
+                if not e.transient or attempt == MINT_ATTEMPTS - 1:
+                    raise
+                log.warning("minting a GitHub token for job %s failed (%s); retrying", job.id, e)
+                self._sleep(MINT_BACKOFF[attempt])
         try:
             self.runner.add_secrets(job.id, {"github": token.token})
         except Exception as e:

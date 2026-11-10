@@ -92,6 +92,11 @@ credential (see **Run a job**), or Drella holds a GitHub App's private key and m
 token for each repo job itself. Installation tokens last an hour, so nobody has to keep
 storing fresh ones. A caller's own `github` credential still wins if they store one.
 
+**Rollout order:** merge, then set the branch protection and rulesets listed under
+**Approvals and branch protection** below on every repo the App will be installed on,
+and only then configure the App key in Drella (step 3). Until the protection is in
+place, App tokens can write to those repos' default branches.
+
 1. **Create the App** (GitHub → Settings → Developer settings → GitHub Apps → New).
    It needs no webhook. Repository permissions: **Contents** read and write, **Pull
    requests** read and write, **Issues** read-only (Metadata read-only is automatic).
@@ -126,7 +131,8 @@ For each repo job without a `github` credential, Drella mints a token when it la
 the job (not when it's queued: a queued job can wait longer than an hour). The token is
 for the job's repo only, with the permissions of the job's Drella token's GitHub
 profile (below). If the App isn't installed on the repo, or minting fails for any other
-reason (GitHub down, say), the job fails at launch and says why; it isn't retried. The
+reason (GitHub down, say), the job fails at launch and says why. Transient failures
+(GitHub 5xx or 429, network errors) are retried first, up to 3 attempts in all. The
 token is the job's only one: there's no way to ask for another. Instead, the job's
 deadline is capped at the token's expiry, so the wrapper has finished everything (the
 PR check, auto-merge, the final report) while the token is still valid.
@@ -160,6 +166,10 @@ A new token is a `reader` unless you say otherwise. Tokens that existed before p
 (migration 0005) became `builder`s, so they work as before. The profile is read when a
 job's token is minted, so changing it also changes the token's queued jobs. It only
 applies to App tokens: a caller's own `github` credential can do whatever it can do.
+
+A profile only limits the tokens Drella mints from the App. If a Drella token stores its
+own `github` credential, that credential takes precedence: its jobs get whatever that
+credential can do on GitHub, and the profile doesn't apply.
 
 To add a profile (say a `reviewer` that comments on PRs), add it to `PROFILES`. Anything
 with Pull requests write can also approve PRs; see below for why that approval mustn't

@@ -82,7 +82,12 @@ _TOKEN = re.compile(r"^[A-Za-z0-9_.-]{8,}$")
 
 
 class GitHubAppError(Exception):
-    """Minting failed. The message is safe to show the caller (no secrets in it)."""
+    """Minting failed. The message is safe to show the caller (no secrets in it).
+    `transient` is True when trying again may work (GitHub 5xx or 429, network errors)."""
+
+    def __init__(self, message: str = "", transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
 
 
 class _NotFound(GitHubAppError):
@@ -126,7 +131,8 @@ def load_key(path: str) -> rsa.RSAPrivateKey:
     try:
         data = Path(path).read_bytes()
     except OSError as e:
-        raise GitHubAppError(f"can't read the GitHub App's private key ({path}): {e.strerror}")
+        log.error("can't read the GitHub App's private key (%s): %s", path, e)
+        raise GitHubAppError("the GitHub App's private key can't be read") from None
     try:
         key = serialization.load_pem_private_key(data, password=None)
     except (ValueError, TypeError):
@@ -193,7 +199,9 @@ class GitHubApp:
             raise _http_error(e, what) from None
         except (urllib.error.URLError, OSError, ValueError) as e:
             reason = getattr(e, "reason", e)
-            raise GitHubAppError(f"couldn't reach GitHub to {what}: {reason}") from None
+            raise GitHubAppError(
+                f"couldn't reach GitHub to {what}: {reason}", transient=True
+            ) from None
         if not isinstance(data, dict):
             raise GitHubAppError(f"GitHub's answer to {what} wasn't a JSON object")
         return data
@@ -233,20 +241,36 @@ class GitHubApp:
         if not isinstance(token, str) or not _TOKEN.match(token):
             raise GitHubAppError(f"GitHub returned no usable token for {repo}")
         # GitHub refuses (422) a request for more than the App has, and grants exactly
-        # what was asked for. Checked anyway, so a token can never be wider than its
-        # profile.
+        # what was asked for. Checked anyway, and failing closed: a token is used only
+        # if GitHub says it is for selected repositories (just this one) and with
+        # permissions no wider than the profile.
         granted = data.get("permissions")
-        if isinstance(granted, dict):
-            wider = sorted(
-                k
-                for k, v in granted.items()
-                if k != "metadata" and _level(v) > _level(profile.permissions.get(k))
+        if not isinstance(granted, dict):
+            raise GitHubAppError(
+                f"GitHub's answer for {repo} didn't say what the token may do; not using it"
             )
-            if wider:
-                raise GitHubAppError(
-                    f"GitHub granted more than the '{profile.name}' profile asked for"
-                    f" ({', '.join(wider)}); not using the token"
-                )
+        if data.get("repository_selection") != "selected":
+            raise GitHubAppError(
+                f"GitHub's token for {repo} isn't limited to selected repositories; not using it"
+            )
+        repositories = data.get("repositories")
+        if repositories is not None and not (
+            isinstance(repositories, list)
+            and len(repositories) == 1
+            and isinstance(repositories[0], dict)
+            and repositories[0].get("name") == repo.split("/", 1)[1]
+        ):
+            raise GitHubAppError(f"GitHub's token for {repo} isn't for that repo alone; not using it")
+        wider = sorted(
+            k
+            for k, v in granted.items()
+            if k != "metadata" and _level(v) > _level(profile.permissions.get(k))
+        )
+        if wider:
+            raise GitHubAppError(
+                f"GitHub granted more than the '{profile.name}' profile asked for"
+                f" ({', '.join(wider)}); not using the token"
+            )
         return InstallationToken(token, _expiry(data.get("expires_at"), asked))
 
 
@@ -273,4 +297,7 @@ def _http_error(e: urllib.error.HTTPError, what: str) -> GitHubAppError:
         message = str(json.loads(e.read()).get("message", ""))[:200]
     except Exception:
         message = ""
-    return GitHubAppError(f"GitHub answered HTTP {e.code} to {what}" + (f": {message}" if message else ""))
+    return GitHubAppError(
+        f"GitHub answered HTTP {e.code} to {what}" + (f": {message}" if message else ""),
+        transient=e.code >= 500 or e.code == 429,
+    )
