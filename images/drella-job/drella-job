@@ -440,5 +440,6 @@ elif [ -z "$pr" ] && [ -n "$pr_lookup_failed" ]; then
 elif [ -z "$pr" ]; then
   finish failed "the agent didn't open a pull request$diff_note"
 else
+  within 20 gh pr merge "$pr" --auto --squash >/dev/null 2>&1 || log "couldn't turn on auto-merge for $pr"
   finish succeeded "$pr$diff_note"
 fi
