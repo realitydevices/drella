@@ -102,3 +102,27 @@ def test_0002_downgrade_refuses_with_jobs_v0_cannot_run(settings, interface, cre
     with pytest.raises(RuntimeError, match="can't downgrade"):
         _downgrade(engine, "0001")
     engine.dispose()
+
+
+def test_0003_downgrade_refuses_with_live_claude_code_jobs(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "head")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "queued", interface="claude-code", credential="k")
+    with pytest.raises(RuntimeError, match="can't downgrade"):
+        _downgrade(engine, "0002")
+    engine.dispose()
+
+
+def test_0003_downgrade_keeps_finished_claude_code_jobs(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "head")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "succeeded", interface="claude-code", credential="k")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE jobs SET base_url = NULL"))
+    _downgrade(engine, "0002")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT base_url FROM jobs")).scalar() == ""
+    _upgrade(engine, "head")
+    engine.dispose()

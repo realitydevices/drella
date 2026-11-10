@@ -150,14 +150,21 @@ class KubernetesRunner:
             "DRELLA_JOB_ID": spec.job_id,
             "DRELLA_PROMPT": spec.prompt,
         }
-        # The job's model, rendered by its adapter [27]. The wrapper has no
-        # provider-specific code: it writes the config and runs the check.
+        # The job's model, rendered by its adapter [27, 28]. The wrapper has no
+        # provider-specific code: it runs the agent the adapter names, writes the
+        # config and runs the check.
         m = spec.model
-        check = adapters.preflight(m)
-        env["DRELLA_MODEL_LABEL"] = f"{m.alias} ({m.model_id} at {m.base_url})"
-        env["DRELLA_OPENCODE_CONFIG"] = json.dumps(adapters.opencode_config(m))
-        env["DRELLA_PREFLIGHT_URL"] = check.url
-        env["DRELLA_PREFLIGHT_HEADERS"] = "\n".join(check.headers)
+        agent = adapters.agent(m)
+        env["DRELLA_AGENT"] = agent.value
+        if agent == adapters.Agent.CLAUDE_CODE:
+            env["DRELLA_MODEL_LABEL"] = f"{m.alias} ({m.model_id} with Claude Code)"
+            env["DRELLA_AGENT_MODEL"] = m.model_id
+        else:
+            check = adapters.preflight(m)
+            env["DRELLA_MODEL_LABEL"] = f"{m.alias} ({m.model_id} at {m.base_url})"
+            env["DRELLA_OPENCODE_CONFIG"] = json.dumps(adapters.opencode_config(m))
+            env["DRELLA_PREFLIGHT_URL"] = check.url
+            env["DRELLA_PREFLIGHT_HEADERS"] = "\n".join(check.headers)
         if spec.repo:
             env["DRELLA_REPO"] = spec.repo
         # The soft limit: the wrapper stops the agent this long before the hard limit
