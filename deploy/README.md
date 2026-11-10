@@ -139,10 +139,11 @@ curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
 }' $DRELLA/models/local
 
 #    A hosted model that needs an API key: store the key as a credential, and name
-#    the credential in the model. Each caller uses their own key, and only the token
-#    that registered a model can change it. A model with a key needs an https:// base
-#    URL. Use a key you can revoke, with a spending limit: the agent can read it, and
-#    using a model means trusting its base URL with your key.
+#    the credential in the model. A model with a key can be used only by the token
+#    that registered it, so your key only goes to a base URL you chose; anyone can use
+#    a model without a key, like the local one above. A model with a key needs an
+#    https:// base URL. Use a key you can revoke, with a spending limit: the agent can
+#    read it.
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
   -d '{"value": "<anthropic api key>"}' $DRELLA/credentials/anthropic-key
 curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
