@@ -112,6 +112,14 @@ one. When a decision changes, edit it here first.
     `base_url` and `model_id` are printable ASCII with no `{` or `}` (OpenCode
     substitutes `{env:…}` and `{file:…}` in its config); a stored model is checked again
     when a job uses it. OpenCode never reads config from the repo.
+28. **Claude Code is a second agent, chosen by the model's interface** ([v0.3](v0.3.md)).
+    A model with the `claude-code` interface runs Claude Code, logged in with a Claude
+    subscription's OAuth token (`claude setup-token`) held as the model's credential;
+    it has no base URL. Every other model runs OpenCode. Both agents are in the one job
+    image [20] and follow the same job rules. Claude Code never loads settings or MCP
+    servers from the repo (`--setting-sources user`, `--strict-mcp-config`), and the
+    image turns hooks off. The subscription token is for personal, low-volume use;
+    heavy use goes through an API key and the `anthropic` interface.
 
 ## Open
 

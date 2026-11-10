@@ -20,8 +20,8 @@ here, the plan is for Drella to build itself from these docs. To try it, start w
 ## The idea
 
 - **Jobs:** a prompt (from a template or ad hoc) plus input artifacts, run as a
-  Kubernetes Job by an agent (OpenCode for coding, Hermes for everything else),
-  producing output artifacts and a session record.
+  Kubernetes Job by an agent (OpenCode or Claude Code for coding, Hermes for
+  everything else), producing output artifacts and a session record.
 - **Agents:** a token, a prompt, a place to keep memory and a schedule. A CronJob
   wakes the agent and it picks up where it left off.
 - **Access:** token-based HTTP API, a web UI, and an MCP server so other agents

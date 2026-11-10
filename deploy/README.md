@@ -154,7 +154,20 @@ curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
 }' $DRELLA/models/claude
 
 #    Other hosted APIs (e.g. OpenRouter) use "openai-compatible" with their base URL
-#    and a credential. `GET /models` lists your models.
+#    and a credential.
+#
+#    Claude Code with your Claude subscription (docs/v0.3.md): store the OAuth token
+#    from `claude setup-token` as a credential. The model has no base_url; `model_id`
+#    is what `claude --model` takes (e.g. sonnet, opus). Jobs count against your
+#    plan's usage limits: for heavy use, prefer an API key and "anthropic".
+curl -X PUT -H "$auth" -H 'Content-Type: application/json' \
+  -d '{"value": "<oauth token>"}' $DRELLA/credentials/claude-oauth
+curl -X PUT -H "$auth" -H 'Content-Type: application/json' -d '{
+  "interface": "claude-code",
+  "model_id": "sonnet",
+  "credential": "claude-oauth"
+}' $DRELLA/models/claude-code
+#    `GET /models` lists your models.
 
 # 3. Create a job, naming a model by alias. Leave out "repo" for a job with no
 #    repo: it opens no PR, and its results are whatever the agent writes to /out.
