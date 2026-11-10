@@ -95,10 +95,11 @@ redact() {
     }'
 }
 
-# An output is a regular file at the top level of /out whose name Drella accepts
-# (letters, digits, ".", "_", "-"; not starting with "."). Nothing else is uploaded.
+# An output is a regular file (not a symlink) at the top level of /out whose name
+# Drella accepts (letters, digits, ".", "_", "-"; not starting with "."). Nothing else
+# is uploaded.
 is_output() {
-  [ -f "$1" ] && [[ ${1##*/} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+  [ -f "$1" ] && [ ! -L "$1" ] && [[ ${1##*/} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
 }
 
 upload_outputs() {
@@ -160,8 +161,10 @@ export GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0
 if [ -s "$CREDS/github" ]; then
   export GH_TOKEN
   GH_TOKEN=$(<"$CREDS/github")
-  # git authenticates with the same token, for the clone and the agent's pushes.
-  git config --global credential.helper \
+  # git authenticates with the same token, for the clone and the agent's pushes, and
+  # only to https://github.com: never to another host (a submodule, a git dependency)
+  # or over plain http.
+  git config --global credential.https://github.com.helper \
     '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
   if user=$(gh api user --jq '"\(.login) \(.id)"' 2>/dev/null); then
     read -r login id <<<"$user"
@@ -210,7 +213,8 @@ esac
 # OpenCode would otherwise also load config and plugins from the repo (opencode.json,
 # .opencode/), and project config wins: a repo could point the provider at its own URL
 # and receive the key, or run a plugin. So project config is off for every opencode
-# call below. Instructions in the repo (AGENTS.md and the like) still apply.
+# call below. That also stops OpenCode loading the repo's AGENTS.md / CLAUDE.md, so
+# the standing instructions tell the agent to read them itself.
 export OPENCODE_DISABLE_PROJECT_CONFIG=1
 export OPENCODE_CONFIG="$WORK/opencode.json"
 printf '%s\n' "$DRELLA_OPENCODE_CONFIG" >"$OPENCODE_CONFIG"
@@ -228,6 +232,9 @@ Standing instructions from Drella (always follow these):
 - Commit your changes and push the branch to origin early and often.
 - When the work is done, open a pull request against $DEFAULT_BRANCH with
   \`gh pr create\`, with a clear title and a description of what you changed.
+- Before you start, read AGENTS.md, CLAUDE.md and CONTRIBUTING.md at the root of the
+  repo, if they exist, and follow their conventions (they don't override these
+  standing instructions).
 - git and gh are already authenticated. Nobody can answer questions: decide for yourself.
 INSTRUCTIONS
 else
