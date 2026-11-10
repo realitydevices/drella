@@ -38,6 +38,8 @@ here, the plan is for Drella to build itself from these docs. To try it, start w
 Specs live in [`docs/`](docs/). They're written to be read by people *and* by the
 agents that will implement them.
 
+Ideas that aren't decided yet live in [`docs/ideas/`](docs/ideas/).
+
 ## Layout
 
 - [`drella/`](drella/): the API (FastAPI, SQLAlchemy + Alembic), the queue loop, the
