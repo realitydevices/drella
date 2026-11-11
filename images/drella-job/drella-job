@@ -139,11 +139,19 @@ upload_outputs() {
 # while the job runs, so a provisional status can be replaced by a final one.
 report() {
   log "$1: $2"
-  api -X POST -H 'Content-Type: application/json' \
-    -d "$(jq -n --arg s "$1" --arg m "$2" --argjson u "${USAGE:-null}" \
-      '{status: $s, message: $m} + (if $u then {usage: $u} else {} end)')" \
-    "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/status" \
-    || log "reporting status failed"
+  local body
+  body=$(jq -n --arg s "$1" --arg m "$2" --argjson u "${USAGE:-null}" \
+    '{status: $s, message: $m} + (if $u then {usage: $u} else {} end)')
+  api -X POST -H 'Content-Type: application/json' -d "$body" \
+    "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/status" && return
+  if [ -n "${USAGE:-}" ]; then
+    # Usage is a bonus; if the report with it failed, the status mustn't be lost.
+    log "reporting status with usage failed; retrying without it"
+    api -X POST -H 'Content-Type: application/json' \
+      -d "$(jq -n --arg s "$1" --arg m "$2" '{status: $s, message: $m}')" \
+      "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/status" && return
+  fi
+  log "reporting status failed"
 }
 
 # finish STATUS MESSAGE: report, upload outputs, exit. The status goes first: it
@@ -426,18 +434,6 @@ else
   fi
 fi
 
-# Token usage for the final status [46], summed from the session record just written.
-# A missing or unparseable record, or a jq failure, means no usage; never a failed job.
-LIB=${DRELLA_LIB:-/usr/local/lib/drella-job}
-USAGE=""
-if [ "$AGENT" = claude-code ]; then
-  [ -f "$OUT/session.jsonl" ] && USAGE=$(within 20 jq -c -R -n -f "$LIB/usage-claude-code.jq" "$OUT/session.jsonl" 2>/dev/null | tail -n 1)
-else
-  [ -f "$OUT/session.json" ] && USAGE=$(within 20 jq -c -f "$LIB/usage-opencode.jq" "$OUT/session.json" 2>/dev/null | tail -n 1)
-fi
-jq -e 'type == "object"' <<<"${USAGE:-null}" >/dev/null 2>&1 || USAGE=""  # only an object is sent
-[ -n "$USAGE" ] && log "usage: $USAGE"
-
 pr="" diff_note="" pr_lookup_failed=""
 if [ -n "$REPO" ]; then
   # Everything that changed since the clone, committed or not.
@@ -461,6 +457,24 @@ if [ -n "$REPO" ] && [ -z "$READ_ONLY" ]; then
   done
   [ -n "$pr" ] && echo "$pr" >"$OUT/pr-url.txt"
 fi
+
+# Token usage for the final status [46], summed from the session record written in
+# step 4. A missing or unparseable record, a jq failure or out-of-range numbers mean no
+# usage; never a failed job. It comes after the PR lookup so it can't use up that time.
+# The limits are the API's (MAX_USAGE_TOKENS, MAX_COST in drella/app.py), which would
+# reject the whole status otherwise.
+LIB=${DRELLA_LIB:-/usr/local/lib/drella-job}
+USAGE=""
+if [ "$AGENT" = claude-code ]; then
+  [ -f "$OUT/session.jsonl" ] && USAGE=$(within 20 jq -c -R -n -f "$LIB/usage-claude-code.jq" "$OUT/session.jsonl" 2>/dev/null | tail -n 1)
+else
+  [ -f "$OUT/session.json" ] && USAGE=$(within 20 jq -c -f "$LIB/usage-opencode.jq" "$OUT/session.json" 2>/dev/null | tail -n 1)
+fi
+jq -e 'type == "object" and
+  ([.[] | select(type != "number" or . < 0)] | length == 0) and
+  ([to_entries[] | select(.key != "cost_usd") | .value | select(. != floor or . > 1e13)] | length == 0) and
+  ((.cost_usd // 0) <= 100000)' <<<"${USAGE:-null}" >/dev/null 2>&1 || USAGE=""
+[ -n "$USAGE" ] && log "usage: $USAGE"
 
 # -- 5. report -----------------------------------------------------------------
 

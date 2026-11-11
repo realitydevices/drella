@@ -3,13 +3,16 @@
 # tokens) of any assistant turn. Lines that aren't JSON are skipped.
 # Use: jq -c -R -n -f usage-claude-code.jq session.jsonl   (prints null when there is nothing)
 def n: if type == "number" and . >= 0 then floor else 0 end;
-[inputs | try fromjson catch empty | select(type == "object")] as $e
-| ([$e[] | select(.type == "result" and (.usage | type == "object"))] | last) as $r
+# Streams the events: only the last result and the peak are kept, not the file.
+reduce (inputs | try fromjson catch empty | select(type == "object")) as $e ({r: null, peak: null};
+    if $e.type == "result" and ($e.usage | type == "object") then .r = $e
+    elif $e.type == "assistant" then
+      .peak = ([.peak, ($e.message.usage? | select(type == "object")
+        | (.input_tokens | n) + (.cache_read_input_tokens | n) + (.cache_creation_input_tokens | n))] | max)
+    else . end)
+| .r as $r | .peak as $peak
 | if $r == null then null else
-    ([$e[] | select(.type == "assistant") | .message.usage? | select(type == "object")
-      | (.input_tokens | n) + (.cache_read_input_tokens | n) + (.cache_creation_input_tokens | n)]
-     | max) as $peak
-    | {
+    {
         input_tokens: ($r.usage.input_tokens | n),
         output_tokens: ($r.usage.output_tokens | n),
         cache_read_tokens: ($r.usage.cache_read_input_tokens | n),
