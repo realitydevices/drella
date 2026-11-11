@@ -22,11 +22,19 @@ It's a page, not a script: run the steps yourself and adapt them to your host.
 On the host:
 
 ```sh
-curl -sfL https://get.k3s.io | sh -s - --disable traefik
+curl -sfL https://get.k3s.io | sh -s - --disable traefik --secrets-encryption
 ```
 
 Leave out `--disable traefik` if nothing else on the host uses ports 80/443 and you want
 k3s's built-in ingress.
+
+**Secrets encryption:** k3s stores Secrets unencrypted in its datastore by default. While a
+job is queued or running, its GitHub token (and the model's API key) sit in a Kubernetes
+Secret, and Drella's own GitHub App key is in the `drella-github-app` Secret; without
+encryption, a copy of the k3s datastore exposes them, which is exactly what [19] is meant
+to prevent. `--secrets-encryption` enables AES-CBC encryption at rest on first install. For
+an existing k3s install: `k3s secrets-encrypt enable`, restart k3s, then
+`k3s secrets-encrypt reencrypt`; check with `k3s secrets-encrypt status`.
 
 ## Kubeconfig
 
