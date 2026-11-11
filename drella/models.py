@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -82,6 +83,15 @@ class Job(Base):
     # the Kubernetes Job has finished and its log is archived.
     reported_status: Mapped[str | None] = mapped_column(String(16))
     message: Mapped[str | None] = mapped_column(Text)
+    # Token usage and cost, as the wrapper reported them with the final status [46].
+    # All null when the job reported no usage. The cost is the agent's own figure, or
+    # computed from the model snapshot's prices.
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    cache_read_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    cache_write_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    peak_context_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
     # sha256 of the job-scoped token.
     job_token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     created_at: Mapped[datetime] = mapped_column(default=_now, index=True)

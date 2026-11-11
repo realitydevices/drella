@@ -140,7 +140,8 @@ upload_outputs() {
 report() {
   log "$1: $2"
   api -X POST -H 'Content-Type: application/json' \
-    -d "$(jq -n --arg s "$1" --arg m "$2" '{status: $s, message: $m}')" \
+    -d "$(jq -n --arg s "$1" --arg m "$2" --argjson u "${USAGE:-null}" \
+      '{status: $s, message: $m} + (if $u then {usage: $u} else {} end)')" \
     "$DRELLA_API_URL/jobs/$DRELLA_JOB_ID/status" \
     || log "reporting status failed"
 }
@@ -413,6 +414,18 @@ else
   session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
   [ -n "$session" ] && within 20 opencode export "$session" 2>/dev/null | redact >"$OUT/session.json"
 fi
+
+# Token usage for the final status [46], summed from the session record just written.
+# A missing or unparseable record, or a jq failure, means no usage; never a failed job.
+LIB=${DRELLA_LIB:-/usr/local/lib/drella-job}
+USAGE=""
+if [ "$AGENT" = claude-code ]; then
+  [ -f "$OUT/session.jsonl" ] && USAGE=$(within 20 jq -c -R -n -f "$LIB/usage-claude-code.jq" "$OUT/session.jsonl" 2>/dev/null | tail -n 1)
+else
+  [ -f "$OUT/session.json" ] && USAGE=$(within 20 jq -c -f "$LIB/usage-opencode.jq" "$OUT/session.json" 2>/dev/null | tail -n 1)
+fi
+jq -e 'type == "object"' <<<"${USAGE:-null}" >/dev/null 2>&1 || USAGE=""  # only an object is sent
+[ -n "$USAGE" ] && log "usage: $USAGE"
 
 pr="" diff_note="" pr_lookup_failed=""
 if [ -n "$REPO" ]; then

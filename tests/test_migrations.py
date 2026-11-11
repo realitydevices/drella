@@ -231,4 +231,24 @@ def test_0005_makes_existing_tokens_builders_and_new_ones_readers(settings):
     with engine.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM tokens")).scalar() == 2
     _upgrade(engine, "head")
+
+
+def test_0006_adds_nullable_usage_columns_and_downgrades(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "0005")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "succeeded")
+    _upgrade(engine, "0006")
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,"
+            " peak_context_tokens, cost_usd FROM jobs")).one()
+        assert tuple(row) == (None,) * 6
+        conn.execute(text("UPDATE jobs SET input_tokens = 5000000000, cost_usd = 1.234567"))
+        assert conn.execute(text("SELECT input_tokens FROM jobs")).scalar() == 5_000_000_000
+    _downgrade(engine, "0005")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT id FROM jobs")).scalar() == "j1"
+        with pytest.raises(Exception):
+            conn.execute(text("SELECT input_tokens FROM jobs"))
     engine.dispose()

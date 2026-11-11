@@ -59,6 +59,7 @@ ENV DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TEL
 COPY managed-settings.json /etc/claude-code/managed-settings.json
 
 COPY drella-job /usr/local/bin/drella-job
+COPY usage-opencode.jq usage-claude-code.jq /usr/local/lib/drella-job/
 
 RUN useradd --uid 1000 --create-home drella && mkdir -p /work /out && chown drella /work /out \
  && mkdir -p /home/drella/.cache/uv /home/drella/.local/share/uv \
