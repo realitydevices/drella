@@ -30,6 +30,11 @@ def test_agent_output_is_never_read_through_a_symlink():
     assert 'cp "$WORK/agent.out"' not in WRAPPER
 
 
+def test_wrapper_redacts_every_job_secret():
+    for name in ("DRELLA_LLM_KEY", "GH_TOKEN", "DRELLA_JOB_TOKEN"):
+        assert f'ENVIRON["{name}"]' in WRAPPER
+
+
 def test_wrapper_turns_on_auto_merge_on_success():
     assert 'gh pr merge "$pr" --auto --squash' in WRAPPER
 

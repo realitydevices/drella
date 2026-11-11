@@ -84,8 +84,8 @@ api() {
     --retry-connrefused -m 120 -H "Authorization: Bearer $DRELLA_JOB_TOKEN" "$@"
 }
 
-# Replace the job's secrets (the model's API key and the GitHub token) with
-# [redacted] in a stream, line by line. The agent can read both from its environment;
+# Replace the job's secrets (the model's API key, the GitHub token and the job token) with
+# [redacted] in a stream, line by line. The agent can read all three from its environment;
 # this keeps them out of the transcript, the session record and the archived log if it
 # prints them. Best effort: a secret split across lines, or encoded, gets through, and
 # so does anything the agent writes to other files in /out, sends to the Drella API
@@ -98,6 +98,7 @@ redact() {
       n = 0
       if (length(ENVIRON["DRELLA_LLM_KEY"]) >= 8) k[++n] = ENVIRON["DRELLA_LLM_KEY"]
       if (length(ENVIRON["GH_TOKEN"]) >= 8) k[++n] = ENVIRON["GH_TOKEN"]
+      if (length(ENVIRON["DRELLA_JOB_TOKEN"]) >= 8) k[++n] = ENVIRON["DRELLA_JOB_TOKEN"]
     }
     {
       line = $0
