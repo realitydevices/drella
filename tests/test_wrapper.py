@@ -163,3 +163,13 @@ def test_the_wrapper_never_asks_drella_for_another_github_token():
     # The token minted at dispatch is the job's only one: its deadline is capped at the
     # token's expiry instead (test_runner.py).
     assert "github-token" not in WRAPPER
+
+
+def test_opencode_export_writes_to_file_before_redact():
+    # Piping opencode export straight into redact truncates at ~64 KiB because the
+    # process exits before stdout is drained when stdout is a pipe. The fix writes to
+    # a temp file in $WORK first, then redacts it (issue #55).
+    assert 'opencode export "$session" 2>/dev/null >' in WRAPPER
+    assert 'redact <' in WRAPPER
+    assert 'rm -f "$raw"' in WRAPPER
+    assert 'session.json is not valid JSON' in WRAPPER

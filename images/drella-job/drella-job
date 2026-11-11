@@ -412,7 +412,16 @@ if [ "$AGENT" = claude-code ]; then
   [ -s "$OUT/session.jsonl" ] || rm -f "$OUT/session.jsonl"
 else
   session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
-  [ -n "$session" ] && within 20 opencode export "$session" 2>/dev/null | redact >"$OUT/session.json"
+  if [ -n "$session" ]; then
+    raw="$WORK/session.raw.json"
+    within 20 opencode export "$session" 2>/dev/null >"$raw"
+    redact <"$raw" >"$OUT/session.json"
+    rm -f "$raw"
+    # If the result doesn't parse, log and keep the file for debugging.
+    if ! jq -e . "$OUT/session.json" >/dev/null 2>&1; then
+      log "session.json is not valid JSON ($(wc -c <"$OUT/session.json") bytes)"
+    fi
+  fi
 fi
 
 # Token usage for the final status [46], summed from the session record just written.
