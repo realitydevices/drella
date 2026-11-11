@@ -31,10 +31,26 @@ k3s's built-in ingress.
 **Secrets encryption:** k3s stores Secrets unencrypted in its datastore by default. While a
 job is queued or running, its GitHub token (and the model's API key) sit in a Kubernetes
 Secret, and Drella's own GitHub App key is in the `drella-github-app` Secret; without
-encryption, a copy of the k3s datastore exposes them, which is exactly what [19] is meant
-to prevent. `--secrets-encryption` enables AES-CBC encryption at rest on first install. For
-an existing k3s install: `k3s secrets-encrypt enable`, restart k3s, then
-`k3s secrets-encrypt reencrypt`; check with `k3s secrets-encrypt status`.
+encryption, a copy of the k3s datastore exposes them, which is exactly what encrypting
+credentials with the caller's token ([decision 19](../docs/decisions.md)) is meant to
+prevent. `--secrets-encryption` enables AES-CBC encryption at rest on first install. For
+an existing k3s install that was set up without the flag, see the
+[Enable Secrets Encryption on an Existing Cluster](https://docs.k3s.io/cli/secrets-encrypt)
+procedure in the k3s docs (requires k3s v1.33.10+k3s1, v1.34.6+k3s1, v1.35.3+k3s1 or
+later; upgrade first if your version is older). It needs these steps on the single server:
+
+1. `k3s secrets-encrypt status` shows "Disabled, no configuration file found".
+2. `k3s secrets-encrypt enable`.
+3. Add `--secrets-encryption` to the k3s server's arguments (or `secrets-encryption: true`
+   in `/etc/rancher/k3s/config.yaml`) and restart k3s.
+4. `k3s secrets-encrypt rotate-keys`, which re-encrypts existing Secrets at about 5 per
+   second.
+5. Restart k3s again with the same arguments.
+6. `k3s secrets-encrypt status` should show "Enabled" and "reencrypt_finished".
+
+k3s keeps the encryption key in `/var/lib/rancher/k3s/server/cred/`, on the same host, so
+a copy of the whole server directory (or root on the host) can still read Secrets. Keep
+datastore backups separate from `server/cred/`.
 
 ## Kubeconfig
 
