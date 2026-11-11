@@ -1,6 +1,17 @@
-import pytest
+import concurrent.futures
+import os
+import threading
+import time
 
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+import drella.app
+from drella import crypto
 from drella.cli import create_token
+from drella.models import Model, Token
 from drella.runner import JOB_TOKEN_KEY, RunState, RunStatus
 
 JOB = {
@@ -828,3 +839,75 @@ def test_bad_usage_is_rejected(client, auth, job, queue, runner, bad):
     jid = job["id"]
     assert _report(client, jid, job_auth(runner, jid), bad).status_code == 422
     assert client.get(f"/jobs/{jid}", headers=auth).json()["usage"] is None
+
+
+# -- per-token model cap under concurrency (Postgres only) ------------------------
+
+
+needs_postgres = pytest.mark.skipif(
+    not os.environ.get("DRELLA_TEST_DATABASE_URL"),
+    reason="needs Postgres (set DRELLA_TEST_DATABASE_URL): SQLite can't serialise the race",
+)
+
+
+def _concurrent_puts(app, auth, aliases):
+    """PUT each alias at the same time, all with the same token; return status codes.
+
+    One TestClient per thread on the SAME app object: each is a separate anyio portal, so
+    there is no shared client state, while every request still gets its own DB session
+    from get_db. The barrier releases all requests together, and list() re-raises any
+    exception from a thread.
+    """
+    barrier = threading.Barrier(len(aliases))
+
+    def put(alias):
+        tc = TestClient(app)
+        barrier.wait(timeout=10)
+        return tc.put(f"/models/{alias}", json=LOCAL, headers=auth).status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(aliases)) as pool:
+        return list(pool.map(put, aliases))
+
+
+@pytest.fixture
+def slow_model_insert(monkeypatch):
+    """Sleep between the cap check (the count) and the commit, so that without the row
+    lock every request would pass the check before any of them commits."""
+    real_add = Session.add
+
+    def add(self, obj, *a, **kw):
+        if isinstance(obj, Model):
+            time.sleep(0.3)
+        return real_add(self, obj, *a, **kw)
+
+    monkeypatch.setattr(Session, "add", add)
+
+
+def _models_of(app, auth):
+    raw = auth["Authorization"].removeprefix("Bearer ")
+    with app.state.deps.sessions() as s:
+        tok = s.scalars(select(Token).where(Token.lookup_hash == crypto.lookup_hash(raw))).one()
+        return s.scalars(select(Model.alias).where(Model.owner_token_id == tok.id)).all()
+
+
+@needs_postgres
+def test_put_model_race_different_new_aliases(app, client, auth, monkeypatch, slow_model_insert):
+    monkeypatch.setattr(drella.app, "MAX_MODELS_PER_TOKEN", 3)
+    # "local" exists from the autouse fixture; this makes 2 of 3.
+    assert client.put("/models/two", json=LOCAL, headers=auth).status_code == 200
+
+    codes = _concurrent_puts(app, auth, [f"racy{i}" for i in range(6)])
+
+    assert sorted(codes) == [200, 422, 422, 422, 422, 422]
+    assert len(_models_of(app, auth)) == 3
+
+
+@needs_postgres
+def test_put_model_race_same_new_alias(app, client, auth, monkeypatch, slow_model_insert):
+    monkeypatch.setattr(drella.app, "MAX_MODELS_PER_TOKEN", 3)
+    assert client.put("/models/two", json=LOCAL, headers=auth).status_code == 200
+
+    codes = _concurrent_puts(app, auth, ["racy", "racy"])
+
+    assert codes == [200, 200]
+    assert sorted(_models_of(app, auth)) == ["local", "racy", "two"]
