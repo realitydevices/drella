@@ -23,6 +23,9 @@ class FakeRunner:
         self.pod_logs: dict[str, bytes] = {}
         self.cleaned: list[str] = []
         self.fail_launch = False
+        # Exceptions for the next launch calls, one each, oldest first.
+        self.launch_errors: list[Exception] = []
+        self.reset: list[str] = []
 
     def prepare(self, job_id, secrets):
         self.secrets[job_id] = dict(secrets)
@@ -32,6 +35,8 @@ class FakeRunner:
         self.secrets[job_id].update(secrets)
 
     def launch(self, spec):
+        if self.launch_errors:
+            raise self.launch_errors.pop(0)
         if self.fail_launch:
             raise RuntimeError("cluster says no")
         self.launched.append(spec)
@@ -47,6 +52,10 @@ class FakeRunner:
 
     def cleanup(self, job_id):
         self.cleaned.append(job_id)
+
+    def reset_launch(self, job_id):
+        self.reset.append(job_id)
+        self.secrets.get(job_id, {}).pop("github", None)
 
     def job_secrets(self):
         return {j: t for j, t in self.secret_created.items() if j not in self.cleaned}

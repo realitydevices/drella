@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import socket
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -70,8 +71,27 @@ class Runner(Protocol):
     def cleanup(self, job_id: str) -> None:
         """Delete the job and its Secret. Safe to call more than once."""
 
+    def reset_launch(self, job_id: str) -> None:
+        """Undo one launch attempt so the job can be launched again: delete its
+        Kubernetes Job, if it was created, and the GitHub token from its Secret. The
+        Secret itself stays: its job token can't be recreated. Safe to call more than
+        once."""
+
     def job_secrets(self) -> dict[str, datetime]:
         """Job id -> creation time, for every job Secret that exists."""
+
+
+def is_transient(e: Exception) -> bool:
+    """True for errors that a retry may get past: an API server that is briefly down or
+    overloaded, or a network failure. False for the rest, such as a 4xx (an invalid
+    manifest won't become valid)."""
+    from kubernetes.client.exceptions import ApiException
+    from urllib3.exceptions import HTTPError
+
+    if isinstance(e, ApiException):
+        return not e.status or e.status == 429 or e.status >= 500
+    # socket.timeout is TimeoutError since Python 3.10; named for clarity.
+    return isinstance(e, HTTPError | ConnectionError | TimeoutError | socket.timeout)
 
 
 def k8s_name(job_id: str) -> str:
@@ -156,7 +176,8 @@ class KubernetesRunner:
                 _request_timeout=self.t,
             )
         except Exception:
-            self.cleanup(spec.job_id)
+            # Only the Job: the queue decides whether the Secret goes too.
+            self.reset_launch(spec.job_id)
             raise
 
     def _labels(self, job_id: str) -> dict[str, str]:
@@ -375,6 +396,25 @@ class KubernetesRunner:
         ):
             try:
                 delete()
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+
+    def reset_launch(self, job_id: str) -> None:
+        from kubernetes.client.exceptions import ApiException
+
+        name = k8s_name(job_id)
+        for undo in (
+            lambda: self.batch.delete_namespaced_job(
+                name, self.ns, propagation_policy="Background", _request_timeout=self.t
+            ),
+            # A null removes the key from a merge patch.
+            lambda: self.core.patch_namespaced_secret(
+                name, self.ns, {"data": {"github": None}}, _request_timeout=self.t
+            ),
+        ):
+            try:
+                undo()
             except ApiException as e:
                 if e.status != 404:
                     raise

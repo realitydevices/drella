@@ -92,13 +92,23 @@ def test_launch_creates_job_with_limits_and_hands_it_the_secret(k8s):
     assert owner == {"apiVersion": "batch/v1", "kind": "Job", "name": NAME, "uid": "uid-1"}
 
 
-def test_launch_cleans_up_if_secret_cannot_be_adopted(k8s):
+def test_launch_undoes_the_job_if_secret_cannot_be_adopted(k8s):
+    # Only the Job: the Secret stays, so the queue can retry a transient failure; it
+    # deletes the Secret itself when it gives up.
     r, batch, core = k8s
     core.patch_namespaced_secret.side_effect = ApiException(status=500)
     with pytest.raises(ApiException):
         r.launch(SPEC)
     batch.delete_namespaced_job.assert_called_once()
-    core.delete_namespaced_secret.assert_called_once()
+    core.delete_namespaced_secret.assert_not_called()
+
+
+def test_reset_launch_deletes_the_job_and_the_github_token_but_not_the_secret(k8s):
+    r, batch, core = k8s
+    r.reset_launch(JOB_ID)
+    batch.delete_namespaced_job.assert_called_once()
+    core.delete_namespaced_secret.assert_not_called()
+    assert core.patch_namespaced_secret.call_args.args[2] == {"data": {"github": None}}
 
 
 @pytest.mark.parametrize(

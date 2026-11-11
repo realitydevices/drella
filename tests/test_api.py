@@ -342,6 +342,121 @@ def test_launch_failure_fails_the_job(client, auth, job, queue, runner):
     assert runner.cleaned == [job["id"]]
 
 
+def _api_error(status):
+    from kubernetes.client.exceptions import ApiException
+
+    return ApiException(status=status, reason="nope")
+
+
+def _launch_row(queue, job_id):
+    from drella.models import Job
+
+    with queue.sessions() as s:
+        j = s.get(Job, job_id)
+        return j.status, j.launch_attempts, j.not_before, j.message
+
+
+def _backoff_over(queue, job_id):
+    from datetime import UTC, datetime, timedelta
+
+    from drella.models import Job
+
+    with queue.sessions() as s:
+        s.get(Job, job_id).not_before = datetime.now(UTC) - timedelta(seconds=1)
+        s.commit()
+
+
+def test_a_transient_launch_error_leaves_the_job_queued_and_backs_off(client, auth, job, queue, runner):
+    runner.launch_errors = [_api_error(503)]
+    queue.tick()
+    status, attempts, not_before, _ = _launch_row(queue, job["id"])
+    assert (status, attempts) == ("queued", 1) and not_before is not None
+    # The secret is kept for the retry; the attempt was undone.
+    assert runner.reset == [job["id"]] and runner.cleaned == []
+    assert job["id"] in runner.secrets
+    # Still backing off: not tried again.
+    queue.tick()
+    assert runner.launched == [] and _launch_row(queue, job["id"])[1] == 1
+    # After the backoff it launches.
+    _backoff_over(queue, job["id"])
+    queue.tick()
+    assert [sp.job_id for sp in runner.launched] == [job["id"]]
+    assert client.get(f"/jobs/{job['id']}", headers=auth).json()["status"] == "running"
+
+
+def test_a_job_in_backoff_doesnt_block_the_ones_behind_it(client, auth, job, queue, runner):
+    runner.launch_errors = [ConnectionError("down")]
+    queue.tick()
+    other = client.post("/jobs", json=JOB, headers=auth).json()
+    queue.tick()
+    assert [sp.job_id for sp in runner.launched] == [other["id"]]
+
+
+def test_six_transient_launch_errors_fail_the_job(client, auth, job, queue, runner):
+    from urllib3.exceptions import ProtocolError
+
+    runner.launch_errors = [ProtocolError("reset")] * 6
+    for i in range(6):
+        assert _launch_row(queue, job["id"])[0] == "queued"
+        queue.tick()
+        _backoff_over(queue, job["id"])
+    status, attempts, _, message = _launch_row(queue, job["id"])
+    assert status == "failed" and attempts == 6
+    assert message == "launch failed after 6 attempts: ProtocolError"
+    assert runner.launched == [] and runner.cleaned == [job["id"]]
+
+
+def test_backoff_doubles_up_to_ten_minutes(client, auth, job, queue, runner):
+    from datetime import UTC, datetime
+
+    runner.launch_errors = [_api_error(500)] * 5
+    delays = []
+    for _ in range(5):
+        before = datetime.now(UTC)
+        queue.tick()
+        nb = _launch_row(queue, job["id"])[2]
+        delays.append(round((nb.replace(tzinfo=UTC) - before).total_seconds() / 30))
+        _backoff_over(queue, job["id"])
+    assert delays == [1, 2, 4, 8, 16]
+
+
+def test_a_422_launch_error_fails_the_job_at_once(client, auth, job, queue, runner):
+    runner.launch_errors = [_api_error(422)]
+    queue.tick()
+    status, attempts, not_before, message = _launch_row(queue, job["id"])
+    assert status == "failed" and attempts == 0 and not_before is None
+    assert "422" in message and runner.cleaned == [job["id"]]
+
+
+@pytest.mark.parametrize("status", [429, 500, 503, 0, None])
+def test_is_transient_api_exceptions(status):
+    from drella.runner import is_transient
+
+    assert is_transient(_api_error(status))
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 409, 422])
+def test_is_not_transient_for_4xx(status):
+    from drella.runner import is_transient
+
+    assert not is_transient(_api_error(status))
+
+
+def test_is_transient_for_network_errors():
+    import socket
+
+    from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError, ReadTimeoutError
+
+    from drella.runner import is_transient
+
+    for e in (
+        MaxRetryError(None, "/x"), NewConnectionError(None, "x"), ProtocolError("x"),
+        ReadTimeoutError(None, "/x", "x"), ConnectionResetError(), TimeoutError(), socket.timeout(),
+    ):
+        assert is_transient(e), e
+    assert not is_transient(RuntimeError("x")) and not is_transient(ValueError("x"))
+
+
 # -- job-scoped endpoints -------------------------------------------------------
 
 
