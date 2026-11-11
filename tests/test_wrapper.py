@@ -163,3 +163,21 @@ def test_the_wrapper_never_asks_drella_for_another_github_token():
     # The token minted at dispatch is the job's only one: its deadline is capped at the
     # token's expiry instead (test_runner.py).
     assert "github-token" not in WRAPPER
+
+
+def test_wrapper_keeps_usage_only_within_the_apis_limits():
+    # drella/app.py rejects anything else (MAX_USAGE_TOKENS = 10**13, MAX_COST = 100_000).
+    assert "1e13" in WRAPPER and "<= 100000" in WRAPPER
+    assert ". != floor" in WRAPPER and "< 0" in WRAPPER
+    assert "|| USAGE=\"\"" in WRAPPER
+
+
+def test_wrapper_retries_the_status_without_usage():
+    report = WRAPPER[WRAPPER.index("report() {"):WRAPPER.index("# finish STATUS MESSAGE")]
+    assert "retrying without it" in report
+    assert report.count("/status") == 2
+    assert "usage: $u" in report and "{status: $s, message: $m}')" in report
+
+
+def test_usage_is_parsed_after_the_pr_lookup():
+    assert WRAPPER.index("gh pr list") < WRAPPER.index("usage-claude-code.jq") < WRAPPER.index("# -- 5. report")
