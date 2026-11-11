@@ -212,3 +212,68 @@ def test_fix_pr_succeeds_when_the_remote_head_moves_and_comments_without_failing
     assert '"$remote_head" != "$PR_HEAD"' in WRAPPER
     assert "Updated by Drella job $DRELLA_JOB_ID." in WRAPPER
     assert "couldn't comment on PR" in WRAPPER
+
+
+# -- the wait for the agent [15] ----------------------------------------------------
+
+import re
+import time
+
+
+def _wait_logic():
+    m = re.search(r"^DRAIN_GRACE=.*?^wait_for_agent\(\) \{.*?^\}\n", WRAPPER, re.S | re.M)
+    assert m, "wait_for_agent not found"
+    return m.group(0)
+
+
+def _run_wait(tmp_path, agent_body, grace=2):
+    """Run the wrapper's real pipeline shape and wait_for_agent with a fake agent."""
+    (tmp_path / "out").mkdir()
+    script = f"""
+set -uo pipefail
+WORK={tmp_path}; OUT={tmp_path}/out
+left() {{ echo 1000; }}
+log() {{ echo "[drella] $*"; }}
+redact() {{ cat; }}; render() {{ cat; }}
+DRELLA_DRAIN_GRACE={grace}
+{_wait_logic()}
+{{
+  setsid bash -c '{agent_body}' &
+  echo $! >"$WORK/agent.pid"
+  wait $!
+  echo $? >"$WORK/agent.rc"
+}} 2>&1 | redact | tee "$WORK/agent.out" | render | tee "$OUT/transcript.txt" &
+pipe_pid=$!
+for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
+agent_pid=$(cat "$WORK/agent.pid")
+wait_for_agent
+echo "rc=$(cat "$WORK/agent.rc")"
+"""
+    t = time.monotonic()
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    return r, time.monotonic() - t
+
+
+def test_wait_returns_when_the_agent_left_a_process_holding_stdout(tmp_path):
+    r, took = _run_wait(tmp_path, "sleep 300 & echo hi; exit 0")
+    assert "rc=0" in r.stdout, r.stdout + r.stderr
+    assert took < 15
+    assert "the agent left processes running; stopped them" in (tmp_path / "out/transcript.txt").read_text()
+    assert "hi" in (tmp_path / "out/transcript.txt").read_text()
+    time.sleep(0.5)
+    left = [p for p in Path("/proc").glob("[0-9]*/cmdline") if b"sleep\x00300" in _read(p)]
+    assert left == []
+
+
+def _read(p):
+    try:
+        return p.read_bytes()
+    except OSError:
+        return b""
+
+
+def test_wait_is_unchanged_when_nothing_is_left_running(tmp_path):
+    r, took = _run_wait(tmp_path, "echo hi; exit 3")
+    assert "rc=3" in r.stdout
+    assert took < 5
+    assert "left processes" not in (tmp_path / "out/transcript.txt").read_text()

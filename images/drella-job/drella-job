@@ -422,7 +422,9 @@ agent_started=$(date +%s)
   # Claude Code's token, for the agent only: set in this subshell, so it's never on a
   # command line.
   [ "$AGENT" = claude-code ] && export CLAUDE_CODE_OAUTH_TOKEN=$DRELLA_LLM_KEY
-  timeout --signal=TERM --kill-after=30 "$budget" "${agent_cmd[@]}" &
+  # setsid: the agent and everything it starts get their own process group, so that
+  # leftovers can be stopped without touching the wrapper.
+  setsid timeout --signal=TERM --kill-after=30 "$budget" "${agent_cmd[@]}" &
   echo $! >"$WORK/agent.pid"
   wait $!
   echo $? >"$WORK/agent.rc"
@@ -432,8 +434,33 @@ for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
 agent_pid=$(cat "$WORK/agent.pid" 2>/dev/null)
 # Told to stop before the pid was known.
 [ -n "$stopped" ] && [ -n "$agent_pid" ] && kill -TERM "$agent_pid" 2>/dev/null
-# `wait` returns early when the trap fires, so keep waiting until the agent is done.
-while kill -0 "$pipe_pid" 2>/dev/null; do wait "$pipe_pid"; done
+# wait_for_agent: wait for the agent's exit code file, not for the pipeline: a process
+# the agent left running (a dev server) can hold the pipe open for ever. Once the agent
+# has exited, the pipeline gets DRAIN_GRACE seconds to drain; then whatever still holds
+# it is stopped: the agent's process group, then the pipeline itself. Never the wrapper.
+# Polls rather than `wait`s, which returns early when the trap fires.
+DRAIN_GRACE=${DRELLA_DRAIN_GRACE:-10}
+pipeline_running() { kill -0 "$pipe_pid" 2>/dev/null; }
+wait_for_agent() {
+  local i p
+  # The agent is bounded by its own timer, and the pipeline (the code file's writer)
+  # ending without a file means it died; FINISH_BY bounds the rest.
+  while [ ! -s "$WORK/agent.rc" ] && pipeline_running && [ "$(left)" -gt 0 ]; do sleep 0.2; done
+  for ((i = 0; i < DRAIN_GRACE * 5; i++)); do pipeline_running || break; sleep 0.2; done
+  pipeline_running || return 0
+  log "the agent left processes running; stopped them" | tee -a "$OUT/transcript.txt"
+  [[ "$agent_pid" =~ ^[0-9]+$ ]] && kill -KILL -- "-$agent_pid" 2>/dev/null
+  for ((i = 0; i < 10; i++)); do pipeline_running || break; sleep 0.2; done
+  pipeline_running || return 0
+  # The pipeline's own processes are the wrapper's only children.
+  for p in /proc/[0-9]*; do
+    p=${p#/proc/}
+    [ "$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null)" = "$$" ] && kill -KILL "$p" 2>/dev/null
+  done
+  for ((i = 0; i < 10; i++)); do pipeline_running || break; sleep 0.2; done
+  return 0
+}
+wait_for_agent
 phase=collect
 rc=$(cat "$WORK/agent.rc" 2>/dev/null)
 [[ "$rc" =~ ^[0-9]+$ ]] || rc=1  # no exit code recorded: treat as a failure
