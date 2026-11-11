@@ -70,8 +70,15 @@ itself if it has one, counts as the public internet.) If your model endpoint use
 different port, edit the last rule in `job-network.yaml`. That policy assumes k3s's default pod and service ranges
 (`10.42.0.0/16`, `10.43.0.0/16`); change them there if yours differ.
 
-The Postgres password is set in `deploy/kustomization.yaml`. Only the Drella pod can
-reach Postgres, but you can change it before your first deploy.
+The Postgres password is set in `deploy/kustomization.yaml` and **the default
+(`drella`) must be changed**: this repository is public, so the default is known to
+everyone. Replace the `password=drella` literal in the `postgres` `secretGenerator`
+(ideally in an overlay, not this checkout) with a long random one, e.g.
+`openssl rand -base64 24`, before your first deploy. Any characters are fine: Drella
+builds the database URL from separate settings and quotes the password. Changing it
+after the first deploy does not change the password in the existing database; alter it
+there too (`ALTER USER drella PASSWORD '...'`) or recreate the volume. Only the Drella
+pod can reach Postgres, which limits the exposure but doesn't replace a real password.
 
 Then create the first token:
 

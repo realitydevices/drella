@@ -3,12 +3,51 @@
 import os
 from dataclasses import dataclass, field
 
+from sqlalchemy.engine import URL
+
+
+def _database_url() -> str:
+    """The database URL: DRELLA_DATABASE_URL, or built from the separate
+    DRELLA_DATABASE_* settings when DRELLA_DATABASE_HOST is set (which quotes the
+    password correctly, unlike a password pasted into a URL)."""
+    env = os.environ
+    host = env.get("DRELLA_DATABASE_HOST", "").strip()
+    if not host:
+        return env.get("DRELLA_DATABASE_URL", "sqlite:///drella.db")
+    if "DRELLA_DATABASE_URL" in env:
+        raise ValueError(
+            "Both DRELLA_DATABASE_URL and DRELLA_DATABASE_HOST are set; use one or the other"
+        )
+    if "DRELLA_DATABASE_PASSWORD" in env and "DRELLA_DATABASE_PASSWORD_FILE" in env:
+        raise ValueError(
+            "Both DRELLA_DATABASE_PASSWORD and DRELLA_DATABASE_PASSWORD_FILE are set; "
+            "use one or the other"
+        )
+    for name in ("NAME", "USER"):
+        if not env.get(f"DRELLA_DATABASE_{name}"):
+            raise ValueError(f"DRELLA_DATABASE_{name} is required when DRELLA_DATABASE_HOST is set")
+    password = env.get("DRELLA_DATABASE_PASSWORD")
+    if "DRELLA_DATABASE_PASSWORD_FILE" in env:
+        with open(env["DRELLA_DATABASE_PASSWORD_FILE"]) as f:
+            password = f.read().strip()
+    try:
+        port = int(env.get("DRELLA_DATABASE_PORT") or 5432)
+    except ValueError:
+        raise ValueError("DRELLA_DATABASE_PORT must be an integer") from None
+    url = URL.create(
+        "postgresql+psycopg",
+        username=env["DRELLA_DATABASE_USER"],
+        password=password,
+        host=host,
+        port=port,
+        database=env["DRELLA_DATABASE_NAME"],
+    )
+    return url.render_as_string(hide_password=False)
+
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str = field(
-        default_factory=lambda: os.environ.get("DRELLA_DATABASE_URL", "sqlite:///drella.db")
-    )
+    database_url: str = field(default_factory=_database_url)
     # Root directory for the local-filesystem storage backend.
     storage_path: str = field(
         default_factory=lambda: os.environ.get("DRELLA_STORAGE_PATH", "./data")
