@@ -1,8 +1,8 @@
 # The Drella API. Build from the repo root:
 #   docker build -f images/drella/Dockerfile -t drella .
-FROM python:3.13-slim
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
-COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.8.22@sha256:9874eb7afe5ca16c363fe80b294fe700e460df29a55532bbfea234a0f12eddb1 /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/app/.venv
 
 WORKDIR /app
