@@ -231,6 +231,7 @@ def test_0005_makes_existing_tokens_builders_and_new_ones_readers(settings):
     with engine.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM tokens")).scalar() == 2
     _upgrade(engine, "head")
+    engine.dispose()
 
 
 def test_0006_adds_nullable_usage_columns_and_downgrades(settings):

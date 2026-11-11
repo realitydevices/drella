@@ -828,17 +828,58 @@ def test_later_status_without_usage_keeps_earlier_usage(client, auth, job, queue
 @pytest.mark.parametrize("bad", [
     {"input_tokens": -1, "output_tokens": 0}, {"input_tokens": 1.5, "output_tokens": 0},
     {"input_tokens": "5", "output_tokens": 0}, {"input_tokens": 1},
+    {"input_tokens": True, "output_tokens": 0},
     {"input_tokens": 1, "output_tokens": 1, "cost_usd": -0.01},
     {"input_tokens": 1, "output_tokens": 1, "cost_usd": "lots"},
+    {"input_tokens": 1, "output_tokens": 1, "cost_usd": 100001},
     {"input_tokens": 1, "output_tokens": 1, "cache_read_tokens": -5},
     {"input_tokens": 1, "output_tokens": 1, "peak_context_tokens": -5},
     {"input_tokens": 10**15, "output_tokens": 1},
+    "lots", [1, 2], 5,
 ])
-def test_bad_usage_is_rejected(client, auth, job, queue, runner, bad):
+def test_bad_usage_is_dropped_but_the_status_is_kept(client, auth, job, queue, runner, bad):
     queue.tick()
     jid = job["id"]
-    assert _report(client, jid, job_auth(runner, jid), bad).status_code == 422
-    assert client.get(f"/jobs/{jid}", headers=auth).json()["usage"] is None
+    r = client.post(f"/jobs/{jid}/status", json={"status": "succeeded", "message": "pr", "usage": bad},
+                    headers=job_auth(runner, jid))
+    assert r.status_code == 204
+    got = client.get(f"/jobs/{jid}", headers=auth).json()
+    assert got["usage"] is None and got["message"] == "pr"
+
+
+@pytest.mark.parametrize("raw", ['{"input_tokens": NaN, "output_tokens": 1}',
+                                 '{"input_tokens": 1, "output_tokens": 1, "cost_usd": NaN}',
+                                 '{"input_tokens": 1, "output_tokens": 1, "cost_usd": Infinity}'])
+def test_nan_and_infinity_usage_is_dropped(client, auth, job, queue, runner, raw):
+    queue.tick()
+    jid = job["id"]
+    body = '{"status": "succeeded", "message": "pr", "usage": ' + raw + "}"
+    r = client.post(f"/jobs/{jid}/status", content=body, headers=job_auth(runner, jid) | {"Content-Type": "application/json"})
+    assert r.status_code == 204
+    got = client.get(f"/jobs/{jid}", headers=auth).json()
+    assert got["usage"] is None and got["message"] == "pr"
+
+
+def test_a_cost_too_big_for_the_column_is_stored_as_unknown(client, auth, queue, runner):
+    client.put("/models/priced", json=LOCAL | {"cost_in_per_mtok": "100000", "cost_out_per_mtok": "100000"}, headers=auth)
+    client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
+    job = client.post("/jobs", json=JOB | {"model": "priced"}, headers=auth).json()
+    queue.tick()
+    jid = job["id"]
+    usage = {"input_tokens": 10**13, "output_tokens": 10**13}
+    assert _report(client, jid, job_auth(runner, jid), usage).status_code == 204
+    got = client.get(f"/jobs/{jid}", headers=auth).json()["usage"]
+    assert got["input_tokens"] == 10**13 and got["cost_usd"] is None
+
+
+def test_cost_is_rounded_to_six_places(client, auth, queue, runner):
+    client.put("/models/priced", json=LOCAL | {"cost_in_per_mtok": "3", "cost_out_per_mtok": "15"}, headers=auth)
+    client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
+    job = client.post("/jobs", json=JOB | {"model": "priced"}, headers=auth).json()
+    queue.tick()
+    jid = job["id"]
+    assert _report(client, jid, job_auth(runner, jid), {"input_tokens": 1, "output_tokens": 1}).status_code == 204
+    assert client.get(f"/jobs/{jid}", headers=auth).json()["usage"]["cost_usd"] == "0.000018"
 
 
 # -- per-token model cap under concurrency (Postgres only) ------------------------

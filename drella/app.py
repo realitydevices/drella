@@ -9,14 +9,21 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -254,7 +261,9 @@ class UsageIn(BaseModel):
 class StatusIn(BaseModel):
     status: Literal["succeeded", "failed"]
     message: str | None = None
-    usage: UsageIn | None = None
+    # Checked against UsageIn in the handler: bad usage is dropped, never a reason to
+    # lose the status.
+    usage: Any = None
 
     @field_validator("message")
     @classmethod
@@ -273,14 +282,18 @@ def record_usage(job: Job, u: UsageIn) -> None:
     job.cache_read_tokens = u.cache_read_tokens
     job.cache_write_tokens = u.cache_write_tokens
     job.peak_context_tokens = u.peak_context_tokens
+    cost: Decimal | None = None
     if u.cost_usd is not None:
-        job.cost_usd = Decimal(str(u.cost_usd))
+        cost = Decimal(str(u.cost_usd))
     elif job.cost_in_per_mtok is not None and job.cost_out_per_mtok is not None:
-        job.cost_usd = (
+        cost = (
             u.input_tokens * job.cost_in_per_mtok + u.output_tokens * job.cost_out_per_mtok
         ) / 1_000_000
-    else:
-        job.cost_usd = None
+    # cost_usd is Numeric(14, 6): anything bigger than the cap (or not finite) is
+    # stored as unknown rather than failing the status.
+    if cost is not None and (not cost.is_finite() or cost > MAX_COST):
+        cost = None
+    job.cost_usd = None if cost is None else cost.quantize(Decimal("0.000001"))
 
 
 def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
@@ -829,7 +842,10 @@ def report_status(
     job.reported_status = body.status
     job.message = body.message
     if body.usage is not None:
-        record_usage(job, body.usage)
+        try:
+            record_usage(job, UsageIn.model_validate(body.usage))
+        except ValidationError as e:
+            log.warning("job %s: dropping invalid usage (%d errors)", job.id, e.error_count())
     db.commit()
     return Response(status_code=204)
 
