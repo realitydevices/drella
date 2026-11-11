@@ -655,6 +655,11 @@ def put_model(
 ) -> ModelOut:
     fields = body.model_dump()
     fields["interface"] = body.interface.value
+    # On Postgres, the row lock serialises one token's model creates, so the count
+    # can't be raced. SQLite ignores FOR UPDATE, and the race is NOT prevented there,
+    # because pysqlite runs the count outside a transaction. SQLite is only the dev/test
+    # default; production runs Postgres.
+    db.execute(select(Token).where(Token.id == c.token.id).with_for_update(key_share=True))
     m = own_model(alias, c, db)
     if m is None:
         count = db.scalar(
