@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import socket
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -75,8 +76,45 @@ class Runner(Protocol):
     def cleanup(self, job_id: str) -> None:
         """Delete the job and its Secret. Safe to call more than once."""
 
+    def reset_launch(self, job_id: str, remove_github: bool = False) -> None:
+        """Undo one launch attempt so the job can be launched again: delete its
+        Kubernetes Job, if it was created, and, if `remove_github` (the job's GitHub
+        token was minted by Drella, and is minted again on the next attempt), the
+        `github` key from its Secret. The Secret itself stays, with its other keys:
+        its job token and the caller's credentials can't be recreated. Every step is
+        tried even if one fails; then the first error is raised. Safe to call more
+        than once."""
+
     def job_secrets(self) -> dict[str, datetime]:
         """Job id -> creation time, for every job Secret that exists."""
+
+
+def is_transient(e: Exception) -> bool:
+    """True for errors that a retry may get past: an API server that is briefly down or
+    overloaded, or a network failure. False for the rest, such as a 4xx (an invalid
+    manifest won't become valid)."""
+    from kubernetes.client.exceptions import ApiException
+    from urllib3.exceptions import HTTPError, LocationValueError, MaxRetryError, SSLError
+
+    if isinstance(e, ApiException):
+        if not e.status:
+            # The client wraps urllib3's SSLError and LocationValueError (a bad CA or
+            # URL) as status 0, with the exception's name as the first line of the
+            # reason: configuration, not an outage. Other status-0 errors stay transient.
+            first_line = str(e.reason or "").split("\n", 1)[0]
+            return not any(name in first_line for name in ("SSLError", "LocationValueError"))
+        return e.status == 429 or e.status >= 500
+    if isinstance(e, MaxRetryError) and isinstance(e.reason, Exception):
+        # urllib3 gave up retrying: what failed decides.
+        return is_transient(e.reason)
+    # A bad certificate or URL is configuration, not an outage.
+    if isinstance(e, SSLError | LocationValueError):
+        return False
+    # socket.timeout is TimeoutError since Python 3.10; named for clarity. gaierror: a
+    # failed DNS lookup, e.g. while the cluster's DNS restarts.
+    return isinstance(
+        e, HTTPError | ConnectionError | TimeoutError | socket.timeout | socket.gaierror
+    )
 
 
 def k8s_name(job_id: str) -> str:
@@ -160,9 +198,15 @@ class KubernetesRunner:
                 },
                 _request_timeout=self.t,
             )
-        except Exception:
-            self.cleanup(spec.job_id)
-            raise
+        except Exception as e:
+            # Only the Job, and none of the Secret's keys: the queue decides whether to
+            # retry or to delete the Secret too. A failure here is only logged, so the
+            # original error, which decides between the two, is the one raised.
+            try:
+                self._delete_job(spec.job_id)
+            except Exception:
+                log.exception("deleting job %s after a failed launch failed", spec.job_id)
+            raise e
 
     def _labels(self, job_id: str) -> dict[str, str]:
         return {"app.kubernetes.io/name": "drella-job", "drella.dev/job-id": job_id}
@@ -387,6 +431,56 @@ class KubernetesRunner:
             except ApiException as e:
                 if e.status != 404:
                     raise
+
+    def reset_launch(self, job_id: str, remove_github: bool = False) -> None:
+        from kubernetes.client.exceptions import ApiException
+
+        errors: list[Exception] = []
+        if remove_github:
+            # First, so no live token is left in the Secret while the job backs off. Best
+            # effort: if this patch fails (during an outage, say), the token stays in the
+            # Secret during the backoff. The next launch attempt mints and overwrites the
+            # key before anything else, so the stale token is replaced then. A null
+            # removes the key from a merge patch.
+            try:
+                self.core.patch_namespaced_secret(
+                    k8s_name(job_id), self.ns, {"data": {"github": None}},
+                    _request_timeout=self.t,
+                )
+            except Exception as e:
+                if not (isinstance(e, ApiException) and e.status == 404):
+                    errors.append(e)
+        # Then the Job, even if that failed.
+        try:
+            self._delete_job(job_id)
+        except Exception as e:
+            errors.append(e)
+        if errors:
+            raise errors[0]
+
+    def _delete_job(self, job_id: str) -> None:
+        """Delete the job's Kubernetes Job (and its pods) but keep its Secret. launch
+        makes the Job the Secret's owner so that the garbage collector deletes the
+        Secret with it; that ownerReference is removed first (the next launch sets it
+        again). If removing it fails, the Job is left alone rather than risk the
+        Secret: the next launch adopts the existing Job."""
+        from kubernetes.client.exceptions import ApiException
+
+        name = k8s_name(job_id)
+        try:
+            self.core.patch_namespaced_secret(
+                name, self.ns, {"metadata": {"ownerReferences": None}}, _request_timeout=self.t
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        try:
+            self.batch.delete_namespaced_job(
+                name, self.ns, propagation_policy="Background", _request_timeout=self.t
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
 
     def job_secrets(self) -> dict[str, datetime]:
         secrets = self.core.list_namespaced_secret(
