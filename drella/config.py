@@ -1,6 +1,7 @@
 """Settings, read from the environment."""
 
 import os
+import re
 from dataclasses import dataclass, field
 
 from sqlalchemy.engine import URL
@@ -75,6 +76,52 @@ def _database_url() -> str:
     return url.render_as_string(hide_password=False)
 
 
+# DRELLA_GITHUB_APP_<NAME>_ID and DRELLA_GITHUB_APP_<NAME>_KEY_FILE configure a GitHub App
+# named <name> in lower case (issue #73). DRELLA_GITHUB_APP_ID is not one of these: it's
+# the App named "builder" (drella/github.py).
+_APP_ID_VAR = re.compile(r"^DRELLA_GITHUB_APP_([A-Z][A-Z0-9_]*)_ID$")
+_APP_KEY_VAR = re.compile(r"^DRELLA_GITHUB_APP_([A-Z][A-Z0-9_]*)_KEY_FILE$")
+_APP_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+@dataclass(frozen=True)
+class GitHubAppConfig:
+    """A GitHub App Drella mints tokens with: its name (what a profile in
+    drella/github.py names), its App ID and where its private key file is."""
+
+    name: str
+    app_id: str
+    key_file: str
+
+
+def _github_apps_from_env() -> tuple[GitHubAppConfig, ...]:
+    """The Apps configured by DRELLA_GITHUB_APP_<NAME>_ID, each with its key from
+    DRELLA_GITHUB_APP_<NAME>_KEY_FILE or, by default, the Secret mounted at
+    /etc/drella/github-app-<name>/. An ID that's empty (a Secret without that key, say)
+    means the App isn't configured. A key file without an ID is a mistake, and refused."""
+    ids = {}
+    keys = {}
+    for var, value in os.environ.items():
+        if m := _APP_ID_VAR.match(var):
+            ids[m.group(1)] = value.strip()
+        elif m := _APP_KEY_VAR.match(var):
+            keys[m.group(1)] = value.strip()
+    for name in sorted(set(keys) - set(ids)):
+        raise ValueError(
+            f"DRELLA_GITHUB_APP_{name}_KEY_FILE is set, but not DRELLA_GITHUB_APP_{name}_ID"
+        )
+    apps = []
+    for var in sorted(ids):
+        if not ids[var]:
+            continue
+        name = var.lower()
+        if not _APP_NAME.match(name):
+            raise ValueError(f"DRELLA_GITHUB_APP_{var}_ID: '{name}' isn't a usable GitHub App name")
+        key_file = keys.get(var) or f"/etc/drella/github-app-{name}/private-key.pem"
+        apps.append(GitHubAppConfig(name, ids[var], key_file))
+    return tuple(apps)
+
+
 @dataclass(frozen=True)
 class Settings:
     # Not in repr: it contains the database password.
@@ -120,6 +167,9 @@ class Settings:
     github_api_url: str = field(
         default_factory=lambda: os.environ.get("DRELLA_GITHUB_API_URL", "https://api.github.com")
     )
+    # More GitHub Apps, besides the one above (e.g. superstar, for profiles that name
+    # it). The Apps together: drella/github.py's app_configs.
+    github_apps: tuple[GitHubAppConfig, ...] = field(default_factory=_github_apps_from_env)
     # Default limits [23].
     job_timeout_seconds: int = 3600
     job_memory: str = "2Gi"

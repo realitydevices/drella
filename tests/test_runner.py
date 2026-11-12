@@ -273,10 +273,23 @@ def _env(r, batch, spec):
 def test_only_a_read_only_repo_job_is_told_so(k8s):
     r, batch, _ = k8s
     assert "DRELLA_REPO_READ_ONLY" not in _env(r, batch, SPEC)
-    ro = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", opens_prs=False)
+    assert "DRELLA_REPO_REPORT" not in _env(r, batch, SPEC)
+    ro = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", opens_prs=False, read_only=True)
     assert _env(r, batch, ro)["DRELLA_REPO_READ_ONLY"] == "1"
+    assert _env(r, batch, ro)["DRELLA_REPO_REPORT"] == "1"
     no_repo = JobSpec(JOB_ID, None, LOCAL, "do it", opens_prs=False)
     assert "DRELLA_REPO_READ_ONLY" not in _env(r, batch, no_repo)
+    assert "DRELLA_REPO_REPORT" not in _env(r, batch, no_repo)
+
+
+def test_a_superstar_job_reports_to_out_but_its_token_can_write(k8s):
+    # superstar (issue #73): its outcome is a report in /out, like a reader's, but its
+    # GitHub token can write, so the job isn't told it's read-only.
+    r, batch, _ = k8s
+    spec = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", opens_prs=False, read_only=False)
+    env = _env(r, batch, spec)
+    assert env["DRELLA_REPO_REPORT"] == "1"
+    assert "DRELLA_REPO_READ_ONLY" not in env
 
 
 def test_the_deadline_never_passes_the_github_tokens_expiry(k8s):
@@ -292,3 +305,19 @@ def test_the_deadline_never_passes_the_github_tokens_expiry(k8s):
     assert int(_env(r, batch, early)["DRELLA_DEADLINE"]) == int(now + 3000)
     late = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", github_token_expires=now + 9000)
     assert abs(int(_env(r, batch, late)["DRELLA_DEADLINE"]) - (now + 3600)) < 5
+
+
+def test_pr_is_passed_to_the_pod_only_when_set(k8s):
+    import dataclasses
+
+    r, batch, _ = k8s
+
+    def env_names():
+        _, job = batch.create_namespaced_job.call_args.args
+        (c,) = job["spec"]["template"]["spec"]["containers"]
+        return {e["name"]: e.get("value") for e in c["env"]}
+
+    r.launch(SPEC)
+    assert "DRELLA_PR" not in env_names()
+    r.launch(dataclasses.replace(SPEC, pr=58))
+    assert env_names()["DRELLA_PR"] == "58"

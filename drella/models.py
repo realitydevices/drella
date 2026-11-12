@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Integer,
     LargeBinary,
     Numeric,
     String,
@@ -63,6 +64,8 @@ class Job(Base):
     token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"))
     prompt: Mapped[str] = mapped_column(Text)
     repo: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # The PR this job fixes (a job with a repo and a PR-opening profile), if any.
+    pr: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # The job's model, snapshotted from the models table when the job was created
     # [27], so later changes to the model don't rewrite the job's history.
     model: Mapped[str] = mapped_column(String(200))  # the alias

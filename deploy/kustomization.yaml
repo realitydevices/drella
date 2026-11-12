@@ -26,6 +26,14 @@ secretGenerator:
   #       - private-key.pem=drella-bot.pem
   #     literals:
   #       - app-id=<the App's ID>
+  # Optional, with the superstar profile (issue #73): a second App, its Secret the same
+  # shape with the name drella-github-app-superstar (deploy/README.md).
+  #
+  #   - name: drella-github-app-superstar
+  #     files:
+  #       - private-key.pem=superstar.pem
+  #     literals:
+  #       - app-id=<the superstar App's ID>
 # Pinned to a release. The drella image launches the drella-job image with the
 # same tag, so pinning this one pins both. drella.yaml uses the separate
 # DRELLA_DATABASE_* settings, so this must be a release that includes #13
