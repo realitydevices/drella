@@ -74,13 +74,21 @@ spec:
         - name: drella
           image: ghcr.io/realitydevices/drella
           env:
-            - name: POSTGRES_PASSWORD
+            # Drella builds the database URL from these, quoting the password, so it
+            # may contain any characters.
+            - name: DRELLA_DATABASE_HOST
+              value: postgres
+            - name: DRELLA_DATABASE_PORT
+              value: "5432"
+            - name: DRELLA_DATABASE_NAME
+              value: drella
+            - name: DRELLA_DATABASE_USER
+              value: drella
+            - name: DRELLA_DATABASE_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: postgres
                   key: password
-            - name: DRELLA_DATABASE_URL
-              value: postgresql://drella:$(POSTGRES_PASSWORD)@postgres:5432/drella
             - name: DRELLA_STORAGE_PATH
               value: /data
             - name: DRELLA_NAMESPACE
