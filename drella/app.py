@@ -32,7 +32,7 @@ from drella import crypto
 from drella.adapters import LLM_KEY_SECRET, Interface
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
-from drella.github import GitHubApp
+from drella.github import PROFILES, GitHubApp
 from drella.models import QUEUED, RUNNING, TERMINAL, Credential, Job, Model, Token
 from drella.queue import Queue, archived_log, output_prefix
 from drella.runner import JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
@@ -65,6 +65,10 @@ BAD_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f"\\{}]')
 MAX_TOKENS = 10_000_000
 MAX_COST = 100_000
 MAX_USAGE_TOKENS = 10**13
+# The prompt reaches the pod as the env var DRELLA_PROMPT. Linux limits a single env
+# var or argument to 128 KiB (MAX_ARG_STRLEN); we cap at half that to leave room for
+# the rest of the command line and other env vars.
+MAX_PROMPT_BYTES = 64 * 1024
 
 
 # -- schemas -----------------------------------------------------------------
@@ -107,11 +111,32 @@ class JobIn(BaseModel):
         description="GitHub repo as owner/name. Leave it out for a job with no repo (no PR).",
     )
     model: str = Field(pattern=NAME_RE, description="A registered model alias (PUT /models)")
+    pr: int | None = Field(
+        default=None,
+        ge=1,
+        le=2**31 - 1,
+        description="Number of an open PR in `repo`: the job pushes its fixes to that PR's"
+        " drella/ branch instead of opening a new PR. Needs `repo` and a builder token.",
+    )
+
+    @model_validator(mode="after")
+    def _pr_needs_repo(self):
+        if self.pr is not None and not self.repo:
+            raise ValueError("`pr` needs a `repo`")
+        return self
 
     @field_validator("prompt")
     @classmethod
     def _no_null(cls, v):
         return _no_null(v)
+
+    @field_validator("prompt")
+    @classmethod
+    def _max_bytes(cls, v):
+        encoded = v.encode("utf-8")
+        if len(encoded) > MAX_PROMPT_BYTES:
+            raise ValueError(f"prompt must be at most {MAX_PROMPT_BYTES // 1024} KiB (byte limit)")
+        return v
 
     @field_validator("repo")
     @classmethod
@@ -234,6 +259,7 @@ class JobOut(BaseModel):
     status: str
     prompt: str
     repo: str | None
+    pr: int | None = None
     model: JobModelOut
     message: str | None
     usage: UsageOut | None = None
@@ -302,6 +328,7 @@ def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
         status=job.status,
         prompt=job.prompt,
         repo=job.repo,
+        pr=job.pr,
         model=JobModelOut(
             alias=job.model,
             interface=job.interface,
@@ -532,6 +559,14 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
             f"model '{model.alias}' no longer passes validation; register it again"
             " (PUT /models)",
         ) from None
+    if body.pr is not None:
+        profile = PROFILES.get(c.token.github_profile)
+        if profile is None or not profile.opens_prs:
+            raise HTTPException(
+                422,
+                "`pr` needs a Drella token whose GitHub profile can push branches and open PRs"
+                " (builder); this token's profile can't",
+            )
     creds = {
         cred.name: cred
         for cred in db.scalars(select(Credential).where(Credential.token_id == c.token.id))
@@ -582,6 +617,7 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         token_id=c.token.id,
         prompt=body.prompt,
         repo=body.repo,
+        pr=body.pr,
         # A snapshot: later changes to the model don't rewrite this job's history.
         model=model.alias,
         interface=model.interface,
