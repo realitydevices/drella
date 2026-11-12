@@ -19,6 +19,11 @@ log = logging.getLogger(__name__)
 
 # Secret key holding the job-scoped token. Credential names can't start with "_".
 JOB_TOKEN_KEY = "_job-token"
+# Secret key holding an operator job's API token (issue #74), exposed as DRELLA_API_TOKEN.
+API_TOKEN_KEY = "_api-token"
+# Secret key holding an operator's stored `drella-builder` credential, exposed to its
+# top-level jobs as DRELLA_BUILDER_TOKEN. Only those jobs' Secrets have it.
+BUILDER_TOKEN_KEY = "_builder-token"
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,8 @@ class JobSpec:
     github_token_expires: float | None = None
     # An existing PR in `repo` for the job to push fixes to, instead of opening a new one.
     pr: int | None = None
+    # The job has a job-scoped API token in its Secret (an operator token's job).
+    api_token: bool = False
 
 
 class RunState(StrEnum):
@@ -334,13 +341,25 @@ class KubernetesRunner:
 
     @staticmethod
     def _secret_env(name: str, spec: JobSpec) -> list[dict]:
-        """Env vars from the job's Secret: its token, and its model's key if any."""
-        pairs = [("DRELLA_JOB_TOKEN", JOB_TOKEN_KEY)]
+        """Env vars from the job's Secret: its token, its API token if it's an operator
+        token's job (and the operator's builder token, if it stored one), and its model's
+        key if any."""
+        pairs = [("DRELLA_JOB_TOKEN", JOB_TOKEN_KEY, False)]
+        if spec.api_token:
+            pairs.append(("DRELLA_API_TOKEN", API_TOKEN_KEY, False))
+            # Optional: only in the Secret if the operator stored a `drella-builder`.
+            pairs.append(("DRELLA_BUILDER_TOKEN", BUILDER_TOKEN_KEY, True))
         if spec.model.has_key:
-            pairs.append((adapters.LLM_KEY_ENV, adapters.LLM_KEY_SECRET))
+            pairs.append((adapters.LLM_KEY_ENV, adapters.LLM_KEY_SECRET, False))
         return [
-            {"name": env, "valueFrom": {"secretKeyRef": {"name": name, "key": key}}}
-            for env, key in pairs
+            {
+                "name": env,
+                "valueFrom": {
+                    "secretKeyRef": {"name": name, "key": key}
+                    | ({"optional": True} if optional else {})
+                },
+            }
+            for env, key, optional in pairs
         ]
 
     # -- status / logs / cleanup ----------------------------------------------

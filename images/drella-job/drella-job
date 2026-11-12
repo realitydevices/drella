@@ -94,11 +94,11 @@ api() {
     --retry-connrefused -m 120 -H "Authorization: Bearer $DRELLA_JOB_TOKEN" "$@"
 }
 
-# Replace the job's secrets (the model's API key, the GitHub token and the job token) with
-# [redacted] in a stream, line by line. The agent can read all three from its environment;
-# this keeps them out of the transcript, the session record and the archived log if it
-# prints them. Best effort: a secret split across lines, or encoded, gets through, and
-# so does anything the agent writes to other files in /out, sends to the Drella API
+# Replace the job's secrets (the model's API key, the GitHub token, the job token, and an
+# operator job's API token and builder token) with [redacted] in a stream, line by line. The agent can read
+# them all from its environment; this keeps them out of the transcript, the session
+# record and the archived log if it prints them. Best effort: a secret split across
+# lines, or encoded, gets through, and so does anything the agent writes to other files in /out, sends to the Drella API
 # with the job token, or writes straight to the pod's log (docs/v0.2.md#security).
 # Values come from ENVIRON and are matched as fixed strings, so any character is safe.
 # A single huge line full of secrets is slow to filter (each match copies the rest of
@@ -109,6 +109,8 @@ redact() {
       if (length(ENVIRON["DRELLA_LLM_KEY"]) >= 8) k[++n] = ENVIRON["DRELLA_LLM_KEY"]
       if (length(ENVIRON["GH_TOKEN"]) >= 8) k[++n] = ENVIRON["GH_TOKEN"]
       if (length(ENVIRON["DRELLA_JOB_TOKEN"]) >= 8) k[++n] = ENVIRON["DRELLA_JOB_TOKEN"]
+      if (length(ENVIRON["DRELLA_API_TOKEN"]) >= 8) k[++n] = ENVIRON["DRELLA_API_TOKEN"]
+      if (length(ENVIRON["DRELLA_BUILDER_TOKEN"]) >= 8) k[++n] = ENVIRON["DRELLA_BUILDER_TOKEN"]
     }
     {
       line = $0
@@ -395,6 +397,15 @@ Standing instructions from Drella (always follow these):
 - Write your results as files in $OUT. Anything outside $OUT is thrown away.
 - Nobody can answer questions: decide for yourself.
 INSTRUCTIONS
+fi
+
+# An operator token's job (issue #74) can queue and read its caller's jobs with its own
+# job-scoped API token.
+if [ -n "${DRELLA_API_TOKEN:-}" ]; then
+  STANDING+=$'\n'"- You can create and read Drella jobs as the caller who queued you, with the Drella API at \$DRELLA_API_URL and \$DRELLA_API_TOKEN as a bearer token: POST /jobs, GET /jobs, GET /jobs/{id}, GET /jobs/{id}/logs, GET /jobs/{id}/outputs/{name} and GET /models (to choose a model). A job you queue with it gets a read-only GitHub token by default. You may pass \"profile\": \"builder\" in the POST /jobs body (needed for a job that opens a PR or has \"pr\") if your caller's own GitHub profile allows it; never \"superstar\". If your caller has a stored github credential, you can only queue jobs without a \"repo\", and a \"profile\" other than your caller's own is refused. The token works only until this job ends, and only for a limited number of new jobs. Never print it."
+fi
+if [ -n "${DRELLA_BUILDER_TOKEN:-}" ]; then
+  STANDING+=$'\n'"- \$DRELLA_BUILDER_TOKEN is a separate Drella token for queueing build and fix jobs as an ordinary caller (POST /jobs with it as the bearer token, then read those jobs with it). Never print it."
 fi
 
 # The message starts with a fixed line, so a prompt beginning with "-" can't be

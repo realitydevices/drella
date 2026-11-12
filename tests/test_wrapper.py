@@ -31,8 +31,36 @@ def test_agent_output_is_never_read_through_a_symlink():
 
 
 def test_wrapper_redacts_every_job_secret():
-    for name in ("DRELLA_LLM_KEY", "GH_TOKEN", "DRELLA_JOB_TOKEN"):
+    for name in (
+        "DRELLA_LLM_KEY", "GH_TOKEN", "DRELLA_JOB_TOKEN", "DRELLA_API_TOKEN", "DRELLA_BUILDER_TOKEN"
+    ):
         assert f'ENVIRON["{name}"]' in WRAPPER
+
+
+def test_redact_hides_an_operator_jobs_api_token():
+    # issue #74: the API token can queue jobs as the caller, so it's redacted like the
+    # others. Run the wrapper's own redact() on a line that prints it.
+    import os
+    import subprocess
+
+    fn = "redact() {" + WRAPPER.split("\nredact() {", 1)[1].split("\n}\n", 1)[0] + "\n}"
+    env = {
+        **os.environ,
+        "DRELLA_API_TOKEN": "dra_secretsecret",
+        "DRELLA_JOB_TOKEN": "drj_jobjobjob",
+        "DRELLA_BUILDER_TOKEN": "drt_builderbuilder",
+    }
+    r = subprocess.run(
+        ["bash", "-c", fn + "\nredact"],
+        input="token dra_secretsecret and drj_jobjobjob, drt_builderbuilder\n",
+        capture_output=True, text=True, env=env, check=True,
+    )
+    assert r.stdout == "token [redacted] and [redacted], [redacted]\n"
+
+
+def test_an_operator_job_is_told_about_its_api_token():
+    assert 'if [ -n "${DRELLA_API_TOKEN:-}" ]; then' in WRAPPER
+    assert "$DRELLA_API_TOKEN as a bearer token" in WRAPPER
 
 
 def test_wrapper_turns_on_auto_merge_on_success():
@@ -450,3 +478,34 @@ def test_an_agent_the_wrapper_stopped_at_the_deadline_is_reported_as_such():
     assert _failure(**base, stopped_at_deadline=1) == "the agent was still running at the deadline and was stopped"
     assert _failure(**base, stopped_at_deadline="") == "the agent ran out of time (stopped after 400s)"
     assert "possibly out of memory" in _failure(**{**base, "elapsed": 5}, stopped_at_deadline="")
+
+
+def test_the_operator_paragraph_is_in_the_instructions_only_with_an_api_token():
+    import os
+    import subprocess
+
+    # The wrapper's own standing-instruction code, from the first STANDING to the MESSAGE.
+    start = WRAPPER.index("if [ -n \"$READ_ONLY\" ]; then\nread -r -d '' STANDING")
+    block = WRAPPER[start : WRAPPER.index("\nMESSAGE=", start)]
+    base = {
+        k: v for k, v in os.environ.items() if k not in ("DRELLA_API_TOKEN", "DRELLA_BUILDER_TOKEN")
+    }
+
+    def run(**env):
+        r = subprocess.run(
+            ["bash", "-c", "OUT=/out; REPO=; READ_ONLY=; " + block + '\nprintf %s "$STANDING"'],
+            capture_output=True, text=True, env={**base, **env}, check=True,
+        )
+        return r.stdout
+
+    without = run()
+    assert "Drella API" not in without and "DRELLA_API_TOKEN" not in without
+    with_token = run(DRELLA_API_TOKEN="dra_secretsecret")
+    assert "$DRELLA_API_TOKEN as a bearer token" in with_token
+    assert '"profile": "builder"' in with_token
+    assert "dra_secretsecret" not in with_token  # told about, never given the value
+    assert with_token.startswith(without)
+    assert "DRELLA_BUILDER_TOKEN" not in with_token
+    with_builder = run(DRELLA_API_TOKEN="dra_secretsecret", DRELLA_BUILDER_TOKEN="drt_builderbuilder")
+    assert "$DRELLA_BUILDER_TOKEN is a separate Drella token" in with_builder
+    assert "drt_builderbuilder" not in with_builder

@@ -219,18 +219,43 @@ It can approve and merge PRs, so the rules in **Approvals and branch protection*
 apply to it too.
 
 Only an admin sets a token's profile, with the CLI inside Drella's pod. A caller can't
-choose one, and can't ask for permissions per job:
+widen it or ask for permissions per job; it may only narrow it for one job, with
+`profile` on `POST /jobs`: a profile whose permissions are all within its own (a
+`builder` may ask for `reader`, a `superstar` for `builder` or `reader`), never a wider
+one (422). A job queued with an operator job's API token is `reader` unless it asks
+for more, and is never `superstar` ([docs/v0.3.md](../docs/v0.3.md#job-profiles)):
 
 ```sh
 kubectl -n drella exec deploy/drella -- drella token create --name <name> --github-profile builder
-kubectl -n drella exec deploy/drella -- drella token list                    # id, profile, name
+kubectl -n drella exec deploy/drella -- drella token list                    # id, profile, role, name
 kubectl -n drella exec deploy/drella -- drella token set-profile <id> reader
 ```
 
+A token also has a **role** (issue #74): `member` (the default) or `operator`, whose jobs
+get a job-scoped API token to queue and read the token's jobs
+([docs/v0.3.md](../docs/v0.3.md#operator-tokens)). Like the profile, only the CLI sets it:
+
+```sh
+kubectl -n drella exec deploy/drella -- drella token create --name superstar \
+  --github-profile superstar --role operator
+kubectl -n drella exec deploy/drella -- drella token set-role <id> member
+```
+
+`DRELLA_OPERATOR_MAX_CHILD_JOBS` (default 6) caps how many jobs one operator job may queue.
+If an operator token stores a credential named `drella-builder` (another Drella token,
+e.g. a `builder` one), its top-level jobs get it as `DRELLA_BUILDER_TOKEN`, to queue
+build and fix jobs as that token. It is long-lived and present for the whole run
+([docs/v0.3.md](../docs/v0.3.md#the-builder-token)).
+
 A new token is a `reader` unless you say otherwise. Tokens that existed before profiles
 (migration 0005) became `builder`s, so they work as before. The profile is read when a
-job's token is minted, so changing it also changes the token's queued jobs. It only
-applies to App tokens: a caller's own `github` credential can do whatever it can do.
+job's token is minted, so changing it also changes the token's queued jobs: a job with no
+`profile` of its own gets the new one, and a job whose `profile` the token's new profile
+no longer covers fails at launch rather than get more than the token now may. It only
+applies to App tokens: a caller's own `github` credential can do whatever it can do, so
+a caller that stored one can't set a `profile` other than its token's own (422), and an
+operator job's API token can't queue repo jobs for it (422), since they'd get the
+credential rather than a `reader` token.
 
 A profile only limits the tokens Drella mints from the App. If a Drella token stores its
 own `github` credential, that credential takes precedence: its jobs get whatever that
