@@ -11,6 +11,11 @@ Minting a token:
 
 Installation tokens last an hour. What a token may do depends on the GitHub profile of
 the Drella token that created the job (PROFILES), never on anything the caller sends.
+
+Drella can hold several Apps (issue #73): each profile names the App its tokens are
+minted from. The App named "builder" is DRELLA_GITHUB_APP_ID and
+DRELLA_GITHUB_APP_KEY_FILE; any other is DRELLA_GITHUB_APP_<NAME>_ID (see config.py).
+Each App is minted and checked the same way.
 """
 
 import base64
@@ -27,7 +32,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from drella.config import Settings
+from drella.config import GitHubAppConfig, Settings
 
 log = logging.getLogger(__name__)
 
@@ -42,11 +47,18 @@ class Profile:
     profile, a token is for the job's one repository only."""
 
     name: str
+    # The name of the GitHub App its tokens are minted from (see app_configs).
+    app: str
     permissions: dict[str, str]
     # The job's standing instructions and success test: push a branch and open a PR,
-    # or (read-only) write results to /out.
+    # or write results to /out.
     opens_prs: bool
     description: str
+
+    @property
+    def read_only(self) -> bool:
+        """No permission can write: the token can't push, comment or merge."""
+        return all(level == "read" for level in self.permissions.values())
 
 
 # The fixed set of profiles. A Drella token's profile is set by an admin with the CLI
@@ -59,18 +71,37 @@ PROFILES = {
     for p in (
         Profile(
             "builder",
+            "builder",
             {"contents": "write", "pull_requests": "write", "issues": "read"},
             opens_prs=True,
             description="push branches and open PRs; read issues",
         ),
         Profile(
             "reader",
+            "builder",
             {"contents": "read", "pull_requests": "read", "issues": "read"},
             opens_prs=False,
             description="read the repo, its PRs and issues; results go to /out",
         ),
+        # The supervisor (issue #73). It acts on GitHub during its run (comments, merges,
+        # through gh), and its outcome is its report in /out, as for a reader.
+        Profile(
+            "superstar",
+            "superstar",
+            {
+                "contents": "write",
+                "pull_requests": "write",
+                "issues": "write",
+                "checks": "read",
+                "statuses": "read",
+            },
+            opens_prs=False,
+            description="act on the repo (comments, merges) through gh; results go to /out",
+        ),
     )
 }
+# The App the builder and reader profiles mint from, configured by DRELLA_GITHUB_APP_ID.
+LEGACY_APP = "builder"
 # A new Drella token gets the least access unless the admin asks for more.
 DEFAULT_PROFILE = "reader"
 # GitHub owner and repo names. "." and ".." are never names, and must not reach a URL
@@ -152,6 +183,25 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
+def app_configs(settings: Settings) -> dict[str, GitHubAppConfig]:
+    """The configured Apps by name: the one of DRELLA_GITHUB_APP_ID (named "builder",
+    with DRELLA_GITHUB_APP_KEY_FILE as its key), then each of DRELLA_GITHUB_APP_<NAME>_ID.
+    A name given twice is refused."""
+    configs: dict[str, GitHubAppConfig] = {}
+    if settings.github_app_id:
+        configs[LEGACY_APP] = GitHubAppConfig(
+            LEGACY_APP, settings.github_app_id, settings.github_app_key_file
+        )
+    for config in settings.github_apps:
+        if config.name in configs:
+            raise GitHubAppError(
+                f"the GitHub App '{config.name}' is configured twice (DRELLA_GITHUB_APP_ID is"
+                f" the App '{LEGACY_APP}')"
+            )
+        configs[config.name] = config
+    return configs
+
+
 class GitHubApp:
     def __init__(self, app_id: str, key_file: str, api_url: str, timeout: float = 20):
         self.app_id = app_id
@@ -160,21 +210,23 @@ class GitHubApp:
         self.timeout = timeout
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "GitHubApp | None":
-        """The App, if it's configured (DRELLA_GITHUB_APP_ID). Its key is checked now,
-        so a bad key stops Drella at startup rather than failing every repo job."""
-        if not settings.github_app_id:
-            if Path(settings.github_app_key_file).exists():
-                log.warning(
-                    "a GitHub App key is mounted at %s but DRELLA_GITHUB_APP_ID isn't set;"
-                    " Drella won't mint GitHub tokens",
-                    settings.github_app_key_file,
-                )
-            return None
-        app = cls(settings.github_app_id, settings.github_app_key_file, settings.github_api_url)
-        load_key(app.key_file)
-        log.info("minting GitHub tokens as GitHub App %s", app.app_id)
-        return app
+    def from_settings(cls, settings: Settings) -> "dict[str, GitHubApp]":
+        """The configured Apps by name (app_configs); empty if none is configured. Each
+        one's key is checked now, so a bad key stops Drella at startup rather than failing
+        every job that needs that App."""
+        apps: dict[str, GitHubApp] = {}
+        for config in app_configs(settings).values():
+            app = cls(config.app_id, config.key_file, settings.github_api_url)
+            load_key(app.key_file)
+            log.info("minting GitHub tokens as GitHub App %s (%s)", config.name, app.app_id)
+            apps[config.name] = app
+        if not apps and Path(settings.github_app_key_file).exists():
+            log.warning(
+                "a GitHub App key is mounted at %s but DRELLA_GITHUB_APP_ID isn't set;"
+                " Drella won't mint GitHub tokens",
+                settings.github_app_key_file,
+            )
+        return apps
 
     def _call(self, method: str, path: str, what: str, body: dict | None = None) -> dict:
         # The key is read for every call, so a rotated Secret takes effect without a

@@ -94,7 +94,7 @@ class Queue:
         interval: float = 5,
         log_snapshot_seconds: float = 30,
         stall_seconds: float = 300,
-        github_app: GitHubApp | None = None,
+        github_apps: dict[str, GitHubApp] | None = None,
         sleep=time.sleep,
     ):
         self.sessions = sessions
@@ -104,7 +104,8 @@ class Queue:
         self.interval = interval
         self.log_snapshot_seconds = log_snapshot_seconds
         self.stall_seconds = stall_seconds
-        self.github_app = github_app
+        # The configured GitHub Apps by name (drella/github.py app_configs).
+        self.github_apps = github_apps or {}
         self._sleep = sleep  # injectable, so tests don't wait
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -171,7 +172,7 @@ class Queue:
         self._last_tick = time.monotonic()
 
     def _launch(self, s: Session, job: Job) -> None:
-        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt)
+        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt, pr=job.pr)
         try:
             if job.github_app and job.repo:
                 spec = self._mint_github_token(s, job, spec)
@@ -196,18 +197,20 @@ class Queue:
         applies to jobs still queued. It goes into the job's Secret where a caller's
         `github` credential would be, and never into the database. The job's deadline is
         capped at the token's expiry, so the token outlasts everything the job does."""
-        if self.github_app is None:
-            raise RuntimeError(
-                "the job needs a token from Drella's GitHub App, which is no longer"
-                " configured (DRELLA_GITHUB_APP_ID)"
-            )
         token_row = s.get(Token, job.token_id)
         profile = PROFILES.get(token_row.github_profile) if token_row else None
         if profile is None:
             raise RuntimeError("the job's Drella token has no known GitHub profile")
+        app = self.github_apps.get(profile.app)
+        if app is None:
+            raise RuntimeError(
+                f"the job's GitHub profile '{profile.name}' needs the GitHub App '{profile.app}',"
+                " which isn't configured (DRELLA_GITHUB_APP_ID or DRELLA_GITHUB_APP_"
+                f"{profile.app.upper()}_ID)"
+            )
         for attempt in range(MINT_ATTEMPTS):
             try:
-                token = self.github_app.token(job.repo, profile)
+                token = app.token(job.repo, profile)
                 break
             except GitHubAppError as e:
                 if not e.transient or attempt == MINT_ATTEMPTS - 1:
@@ -222,10 +225,14 @@ class Queue:
                       type(e).__name__)
             raise RuntimeError("couldn't add the GitHub token to the job's Secret") from None
         log.info(
-            "minted a GitHub App token for job %s (%s, profile %s)", job.id, job.repo, profile.name
+            "minted a GitHub App token for job %s (%s, profile %s, App %s)",
+            job.id, job.repo, profile.name, profile.app,
         )
         return dataclasses.replace(
-            spec, opens_prs=profile.opens_prs, github_token_expires=token.expires
+            spec,
+            opens_prs=profile.opens_prs,
+            read_only=profile.read_only,
+            github_token_expires=token.expires,
         )
 
     def _check(self, s: Session, job: Job) -> None:

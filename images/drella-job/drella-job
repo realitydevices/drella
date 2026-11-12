@@ -7,12 +7,14 @@
 #      by Drella (DRELLA_PREFLIGHT_*, DRELLA_OPENCODE_CONFIG; docs/v0.2.md); or Claude
 #      Code with the model's OAuth token (DRELLA_AGENT_MODEL; docs/v0.3.md);
 #   3. runs the agent with the prompt and standing instructions: with a repo, work on
-#      a branch, push it and open a PR with gh; without one, or with a read-only
-#      GitHub token (DRELLA_REPO_READ_ONLY), write results to /out;
+#      a branch, push it and open a PR with gh; without one, or with a GitHub token
+#      that doesn't open PRs (DRELLA_REPO_REPORT), write results to /out. A read-only
+#      token (DRELLA_REPO_READ_ONLY) can't write to GitHub at all; a report job's token
+#      can (superstar, issue #73), and it acts on GitHub with gh during the run;
 #   4. collects /out (transcript, plus diff and PR URL for a repo job);
 #   5. reports the final status with the job-scoped token, then uploads /out to the
 #      Drella API. A repo job succeeds only if a PR exists; a job without a repo, or
-#      a read-only one, succeeds if the agent exits cleanly and wrote at least one
+#      a report job, succeeds if the agent exits cleanly and wrote at least one
 #      output.
 #
 # Time limits (docs/v0.md): the agent runs under a timer that stops it
@@ -21,7 +23,9 @@
 # agent shares whatever time is left: until the deadline, or until the pod's grace
 # period (DRELLA_TERM_GRACE) ends. If the job has already failed when the agent ends
 # (stopped, out of time, killed), that status is reported straight away, before
-# step 4. Step 4 stops RESERVE seconds early, leaving the final status that long to
+# step 4. DRELLA_DRAIN_GRACE (default 10) is how long the agent's output gets to drain
+# once it has exited (never into the last RESERVE seconds); then whatever the agent
+# left running in its process group is stopped. Step 4 stops RESERVE seconds early, leaving the final status that long to
 # reach the Drella API (less if the provisional report used it up).
 set -uo pipefail
 
@@ -44,9 +48,15 @@ OUT=${DRELLA_OUT:-/out}
 WORK=${DRELLA_WORK:-/work}
 CREDS=${DRELLA_CREDS:-/creds}
 REPO=${DRELLA_REPO:-}
-# The GitHub token can't push or open PRs (a read-only profile): results go to /out.
+# An existing PR to push fixes to (docs/v0.3.md), instead of opening a new one.
+FIX_PR=${DRELLA_PR:-}
+# The GitHub token can't write at all (a read-only profile).
 READ_ONLY=""
 [ -n "$REPO" ] && [ "${DRELLA_REPO_READ_ONLY:-}" = 1 ] && READ_ONLY=1
+# The job's outcome is its results in /out, not a PR: a read-only token, or a token that
+# doesn't open PRs (superstar).
+REPORT=""
+[ -n "$REPO" ] && { [ -n "$READ_ONLY" ] || [ "${DRELLA_REPO_REPORT:-}" = 1 ]; } && REPORT=1
 BRANCH="drella/${DRELLA_JOB_ID:0:8}"
 STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 NOW=$(date +%s)
@@ -205,6 +215,49 @@ fi
 git config --global user.name >/dev/null || git config --global user.name "Drella agent"
 git config --global user.email >/dev/null || git config --global user.email "drella@users.noreply.github.com"
 
+# Fix-PR job: check the PR is one the job may push to, check its branch out and bring it
+# up to date with the default branch. Sets PR_BRANCH and PR_HEAD (the branch's remote
+# head before the agent runs) and CONFLICT_NOTE (for the agent, if main can't be
+# brought in).
+PR_BRANCH="" PR_HEAD="" CONFLICT_NOTE=""
+prepare_fix_pr() {
+  [[ $FIX_PR =~ ^[1-9][0-9]{0,9}$ ]] || finish failed "DRELLA_PR isn't a PR number"
+  local info state cross
+  info=$(timeout 60 gh pr view "$FIX_PR" --json state,headRefName,headRepositoryOwner,isCrossRepository 2>&1) \
+    || finish failed "couldn't look up PR #$FIX_PR in $REPO"
+  state=$(jq -r .state <<<"$info") cross=$(jq -r .isCrossRepository <<<"$info")
+  PR_BRANCH=$(jq -r .headRefName <<<"$info")
+  [ "$state" = OPEN ] || finish failed "PR #$FIX_PR isn't open (it is ${state:-unknown})"
+  [ "$cross" = false ] || finish failed "PR #$FIX_PR comes from a fork (cross-repository); Drella only pushes to branches in $REPO"
+  if [ -z "$PR_BRANCH" ] || [ "$PR_BRANCH" = "$DEFAULT_BRANCH" ] || [ "$PR_BRANCH" = main ]; then
+    finish failed "PR #$FIX_PR's branch is the default branch; Drella won't push to it"
+  fi
+  case $PR_BRANCH in
+    drella/*) ;;
+    *) finish failed "PR #$FIX_PR's branch '${PR_BRANCH:0:80}' isn't under drella/; Drella only pushes to its own branches" ;;
+  esac
+  git fetch origin "+refs/heads/$PR_BRANCH:refs/remotes/origin/$PR_BRANCH" \
+    || finish failed "couldn't fetch branch $PR_BRANCH of PR #$FIX_PR"
+  git checkout -B "$PR_BRANCH" "origin/$PR_BRANCH" || finish failed "couldn't check out $PR_BRANCH"
+  # What the agent starts from; the diff is against it. Taken before main is brought in.
+  PR_HEAD=$(git rev-parse "origin/$PR_BRANCH")
+  git fetch origin "$DEFAULT_BRANCH" >/dev/null 2>&1
+  if git rebase "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
+    log "rebased $PR_BRANCH onto origin/$DEFAULT_BRANCH"
+  else
+    git rebase --abort >/dev/null 2>&1
+    if git merge --no-edit "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
+      log "rebase conflicted; merged origin/$DEFAULT_BRANCH into $PR_BRANCH instead"
+    else
+      git merge --abort >/dev/null 2>&1
+      log "$PR_BRANCH conflicts with origin/$DEFAULT_BRANCH"
+      CONFLICT_NOTE="- $PR_BRANCH conflicts with origin/$DEFAULT_BRANCH: neither a rebase nor a merge worked, so the branch is as it was. Resolve the conflicts first (git rebase origin/$DEFAULT_BRANCH, or git merge origin/$DEFAULT_BRANCH), then make your change."
+    fi
+  fi
+  # The diff shows what the agent changed, not what the rebase or merge brought in.
+  BASE=$(git rev-parse HEAD)
+}
+
 if [ -n "$REPO" ]; then
   [ -s "$CREDS/github" ] || finish failed "a job with a repo needs a github credential"
   log "cloning $REPO"
@@ -212,6 +265,7 @@ if [ -n "$REPO" ]; then
   cd "$WORK/repo" || finish failed "no checkout"
   BASE=$(git rev-parse HEAD)
   DEFAULT_BRANCH=$(git branch --show-current)
+  [ -z "$FIX_PR" ] || [ -n "$REPORT" ] || prepare_fix_pr
 else
   mkdir -p "$WORK/space" && cd "$WORK/space" || finish failed "no working directory"
 fi
@@ -290,6 +344,35 @@ Standing instructions from Drella (always follow these):
   standing instructions).
 - gh is already authenticated. Nobody can answer questions: decide for yourself.
 INSTRUCTIONS
+elif [ -n "$REPORT" ]; then
+read -r -d '' STANDING <<INSTRUCTIONS
+---
+Standing instructions from Drella (always follow these):
+- You are in a clone of https://github.com/$REPO. Its default branch is $DEFAULT_BRANCH.
+- Your GitHub access is to this repo only, through gh, which is already authenticated.
+  Use it for what the task asks (e.g. comments, reviews, merging a PR). Don't push
+  branches to the repo or open pull requests unless the task says to.
+- Your result is a report: write it as files in $OUT. Anything outside $OUT is thrown
+  away.
+- Before you start, read AGENTS.md, CLAUDE.md and CONTRIBUTING.md at the root of the
+  repo, if they exist, and follow their conventions (they don't override these
+  standing instructions).
+- Nobody can answer questions: decide for yourself.
+INSTRUCTIONS
+elif [ -n "$REPO" ] && [ -n "$FIX_PR" ]; then
+read -r -d '' STANDING <<INSTRUCTIONS
+---
+Standing instructions from Drella (always follow these):
+- You are in a clone of https://github.com/$REPO. Its default branch is $DEFAULT_BRANCH.
+- You are working on PR #$FIX_PR, branch $PR_BRANCH. Commit your changes on this branch and push with \`git push --force-with-lease origin $PR_BRANCH\`. Do not open a new pull request.
+- The branch has been brought up to date with $DEFAULT_BRANCH (by rebase, or by merge if the rebase conflicted). Never commit to or push $DEFAULT_BRANCH.
+${CONFLICT_NOTE:+$CONFLICT_NOTE
+}- Commit your changes and push the branch to origin early and often.
+- Before you start, read AGENTS.md, CLAUDE.md and CONTRIBUTING.md at the root of the
+  repo, if they exist, and follow their conventions (they don't override these
+  standing instructions).
+- git and gh are already authenticated. Nobody can answer questions: decide for yourself.
+INSTRUCTIONS
 elif [ -n "$REPO" ]; then
 read -r -d '' STANDING <<INSTRUCTIONS
 ---
@@ -354,31 +437,90 @@ render() {
 }
 
 log "running $AGENT with $MODEL_LABEL (stops after ${budget}s)"
-# The agent runs in the background so the TERM trap can fire while it works; the inner
-# shell records the agent's pid and exit code.
+# The agent runs in the background so the TERM trap can fire while it works. It is the
+# wrapper's own child: its pid is $! and its exit code comes from `wait`, never from a
+# file (the agent could write one). Its output reaches the transcript pipeline through
+# a FIFO, opened by both ends before the agent starts.
+# -- agent: start (tests/test_wrapper.py runs everything from here to "agent: end")
 phase=agent
 agent_started=$(date +%s)
-{
+fifo="$WORK/agent.fifo"
+rm -f "$fifo"
+mkfifo -m 600 "$fifo" || finish failed "couldn't create the pipe for the agent's output"
+redact <"$fifo" | tee "$WORK/agent.out" | render | tee -a "$OUT/transcript.txt" &
+pipe_pid=$!
+(
   # Claude Code's token, for the agent only: set in this subshell, so it's never on a
   # command line.
   [ "$AGENT" = claude-code ] && export CLAUDE_CODE_OAUTH_TOKEN=$DRELLA_LLM_KEY
-  timeout --signal=TERM --kill-after=30 "$budget" "${agent_cmd[@]}" &
-  echo $! >"$WORK/agent.pid"
-  wait $!
-  echo $? >"$WORK/agent.rc"
-} 2>&1 | redact | tee "$WORK/agent.out" | render | tee "$OUT/transcript.txt" &
-pipe_pid=$!
-for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
-agent_pid=$(cat "$WORK/agent.pid" 2>/dev/null)
-# Told to stop before the pid was known.
-[ -n "$stopped" ] && [ -n "$agent_pid" ] && kill -TERM "$agent_pid" 2>/dev/null
-# `wait` returns early when the trap fires, so keep waiting until the agent is done.
-while kill -0 "$pipe_pid" 2>/dev/null; do wait "$pipe_pid"; done
+  # setsid: the agent and everything it starts get their own session and process
+  # group (its id is the agent's pid), so that leftovers can be stopped without
+  # touching the wrapper.
+  exec setsid timeout --signal=TERM --kill-after=30 "$budget" "${agent_cmd[@]}"
+) >"$fifo" 2>&1 &
+agent_pid=$!
+# Told to stop just before the pid was known.
+[ -n "$stopped" ] && kill -TERM "$agent_pid" 2>/dev/null
+# wait_for_agent: wait for the agent itself, not for the pipeline: a process the agent
+# left running (a dev server) can hold the pipe open for ever. Once the agent has
+# exited, the pipeline gets DRAIN_GRACE seconds to drain; then the agent's process
+# group is always killed (a leftover may not hold the pipe: `npm run dev > dev.log &`),
+# and if the pipeline still doesn't end, the pipeline itself. Never the wrapper.
+# Polls rather than `wait`s, which returns early when the trap fires. Sets agent_ended
+# (when the agent stopped) and stopped_at_deadline (the wrapper had to kill it).
+DRAIN_GRACE=${DRELLA_DRAIN_GRACE:-10}
+[[ $DRAIN_GRACE =~ ^[0-9]+$ ]] || DRAIN_GRACE=10
+pipeline_running() { kill -0 "$pipe_pid" 2>/dev/null; }
+agent_running() { kill -0 "$agent_pid" 2>/dev/null; }
+# A process group the wrapper may kill: never 0 (its own), 1 or -1 (everything).
+agent_group_ok() { [[ $agent_pid =~ ^[0-9]+$ ]] && [ "$agent_pid" -ge 2 ]; }
+agent_ended="" stopped_at_deadline=""
+wait_for_agent() {
+  local i p leftovers="" escaped=""
+  # The agent is bounded by its own timer; FINISH_BY bounds the rest, and the last
+  # RESERVE seconds belong to the final report.
+  while agent_running && [ "$(left)" -gt "$RESERVE" ]; do sleep 0.2; done
+  if agent_running; then
+    # Out of time with the agent still going: no drain, stop it at once.
+    stopped_at_deadline=1
+  else
+    agent_ended=$(date +%s)
+    for ((i = 0; i < DRAIN_GRACE * 5 && $(left) > RESERVE; i++)); do pipeline_running || break; sleep 0.2; done
+  fi
+  if agent_group_ok; then
+    kill -0 -- "-$agent_pid" 2>/dev/null && leftovers=1
+    kill -KILL -- "-$agent_pid" 2>/dev/null
+  fi
+  [ -n "$agent_ended" ] || agent_ended=$(date +%s)
+  for ((i = 0; i < 10; i++)); do pipeline_running || break; sleep 0.2; done
+  if pipeline_running; then
+    # Something outside the agent's group (setsid, a daemon) holds the pipe. The
+    # pipeline's own processes are the wrapper's only children.
+    escaped=1
+    for p in /proc/[0-9]*; do
+      p=${p#/proc/}
+      [ "$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null)" = "$$" ] && kill -KILL "$p" 2>/dev/null
+    done
+    for ((i = 0; i < 10; i++)); do pipeline_running || break; sleep 0.2; done
+  fi
+  if [ -n "$stopped_at_deadline" ]; then
+    log "the agent was still running at the deadline; stopped it" | tee -a "$OUT/transcript.txt"
+  elif [ -n "$leftovers" ]; then
+    log "the agent left processes running; stopped the agent's leftover processes" | tee -a "$OUT/transcript.txt"
+  fi
+  [ -n "$escaped" ] && log "stopped what it could; processes that left the agent's process group may still be running" | tee -a "$OUT/transcript.txt"
+  return 0
+}
+wait_for_agent
 phase=collect
-rc=$(cat "$WORK/agent.rc" 2>/dev/null)
-[[ "$rc" =~ ^[0-9]+$ ]] || rc=1  # no exit code recorded: treat as a failure
-elapsed=$(($(date +%s) - agent_started))
+# The agent has ended (or was killed above), so this doesn't block.
+wait "$agent_pid" 2>/dev/null
+rc=$?
+rm -f "$fifo"
+# The agent's run time, without the drain: a late error isn't a timeout.
+elapsed=$((agent_ended - agent_started))
 log "$AGENT exited with $rc after ${elapsed}s"
+# -- agent: end
 
 # The agent's raw output, as recorded. The agent runs as the same user and could swap
 # $WORK/agent.out for a symlink (e.g. to /creds/github) or a FIFO, so it's read only if
@@ -395,6 +537,9 @@ agent_out() {
 failure() {
   if [ -n "$stopped" ]; then
     echo "the job was stopped (pod deleted, evicted or drained)"
+  elif [ -n "$stopped_at_deadline" ]; then
+    # The wrapper killed it (exit 137), not its timer or the kernel.
+    echo "the agent was still running at the deadline and was stopped"
   elif [ "$rc" -ne 0 ] && [ "$elapsed" -ge "$budget" ]; then
     # Stopped by the timer (124, or 137 if it had to be killed).
     echo "the agent ran out of time (stopped after ${budget}s)"
@@ -420,7 +565,18 @@ if [ "$AGENT" = claude-code ]; then
   [ -s "$OUT/session.jsonl" ] || rm -f "$OUT/session.jsonl"
 else
   session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
-  [ -n "$session" ] && within 20 opencode export "$session" 2>/dev/null | redact >"$OUT/session.json"
+  if [ -n "$session" ]; then
+    raw=$(mktemp) || { log "mktemp failed, skipping session export"; }
+    if [ -n "$raw" ]; then
+      within 20 opencode export "$session" 2>/dev/null >"$raw"
+      redact <"$raw" >"$OUT/session.json"
+      rm -f "$raw"
+      [ -s "$OUT/session.json" ] || rm -f "$OUT/session.json"
+      if [ -f "$OUT/session.json" ] && ! jq -e . "$OUT/session.json" >/dev/null 2>&1; then
+        log "session.json is not valid JSON ($(wc -c <"$OUT/session.json") bytes)"
+      fi
+    fi
+  fi
 fi
 
 pr="" diff_note="" pr_lookup_failed=""
@@ -432,7 +588,19 @@ if [ -n "$REPO" ]; then
   fi
 fi
 
-if [ -n "$REPO" ] && [ -z "$READ_ONLY" ]; then
+if [ -n "$FIX_PR" ] && [ -n "$REPO" ] && [ -z "$REPORT" ]; then
+  # A fix-PR job succeeds if the PR's branch moved on the remote.
+  if remote_head=$(within 30 git ls-remote origin "refs/heads/$PR_BRANCH" 2>/dev/null); then
+    remote_head=${remote_head%%[[:space:]]*}
+    if [ -n "$remote_head" ] && [ "$remote_head" != "$PR_HEAD" ]; then
+      pr=$(within 20 gh pr view "$FIX_PR" --json url --jq .url 2>/dev/null) || pr=""
+      [ -n "$pr" ] || pr="https://github.com/$REPO/pull/$FIX_PR"
+      echo "$pr" >"$OUT/pr-url.txt"
+    fi
+  else
+    pr_lookup_failed=1
+  fi
+elif [ -n "$REPO" ] && [ -z "$REPORT" ]; then
   branch=$(git branch --show-current)
   pr_lookup_failed=""
   for b in "$BRANCH" "$branch"; do
@@ -471,7 +639,7 @@ jq -e 'type == "object" and
 reason=$(failure)
 if [ -n "$reason" ]; then
   finish failed "$reason${pr:+; PR: $pr}$diff_note"
-elif [ -z "$REPO" ] || [ -n "$READ_ONLY" ]; then
+elif [ -z "$REPO" ] || [ -n "$REPORT" ]; then
   # The agent's results are files in /out; the transcript and session are ours, and
   # so is the diff of a repo job. Counts exactly what upload_outputs uploads
   # (is_output).
@@ -489,6 +657,15 @@ elif [ -z "$REPO" ] || [ -n "$READ_ONLY" ]; then
   else
     finish failed "the agent wrote no outputs to $OUT"
   fi
+elif [ -n "$FIX_PR" ] && [ -z "$pr" ] && [ -n "$pr_lookup_failed" ]; then
+  finish failed "couldn't check whether the agent pushed to $PR_BRANCH (git ls-remote failed or timed out)$diff_note"
+elif [ -n "$FIX_PR" ] && [ -z "$pr" ]; then
+  finish failed "the agent didn't push to PR #$FIX_PR's branch $PR_BRANCH$diff_note"
+elif [ -n "$FIX_PR" ]; then
+  # Telling the PR's readers is a courtesy; failing to doesn't fail the job.
+  within 20 gh pr comment "$FIX_PR" --body "Updated by Drella job $DRELLA_JOB_ID." >/dev/null 2>&1 \
+    || log "couldn't comment on PR #$FIX_PR"
+  finish succeeded "$pr$diff_note"
 elif [ -z "$pr" ] && [ -n "$pr_lookup_failed" ]; then
   finish failed "couldn't check for a pull request (gh pr list failed or timed out)$diff_note"
 elif [ -z "$pr" ]; then

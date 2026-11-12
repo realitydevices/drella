@@ -672,6 +672,26 @@ def test_listing_models_survives_a_row_that_predates_a_rule(client, auth):
     assert {m["alias"]: m["base_url"] for m in r.json()}["claude"] == "https:"
 
 
+def test_prompt_size_limits(client, auth):
+    # Exactly 64 KiB of ASCII (1 byte per char) is accepted.
+    big_ascii = "a" * (64 * 1024)
+    r = client.post("/jobs", json={"prompt": big_ascii, "model": "local"}, headers=auth)
+    assert r.status_code == 201, r.text
+
+    # One byte over is rejected.
+    too_big = "a" * (64 * 1024 + 1)
+    r = client.post("/jobs", json={"prompt": too_big, "model": "local"}, headers=auth)
+    assert r.status_code == 422
+    assert "64" in r.json()["detail"][0].get("msg", "")
+
+    # A prompt under 64 Ki characters but over 64 KiB in UTF-8 is rejected.
+    # "é😀" is 6 bytes in UTF-8 (é=2, 😀=4); 30000 repetitions = 180000 bytes.
+    multi_byte = ("é😀" * 30000)
+    r = client.post("/jobs", json={"prompt": multi_byte, "model": "local"}, headers=auth)
+    assert r.status_code == 422
+    assert "64" in r.json()["detail"][0].get("msg", "")
+
+
 @pytest.mark.parametrize("value", [
     "hello\x00world",
     "line1\n\x00\nline3",
@@ -952,3 +972,45 @@ def test_put_model_race_same_new_alias(app, client, auth, monkeypatch, slow_mode
 
     assert codes == [200, 200]
     assert sorted(_models_of(app, auth)) == ["local", "racy", "two"]
+
+
+# -- fixing an existing PR (issue #58) -------------------------------------------
+
+
+@pytest.fixture
+def builder_auth(settings, client):
+    return {"Authorization": f"Bearer {create_token(settings, 'bob', 'builder')}"}
+
+
+def _builder_job(client, builder_auth, **extra):
+    client.put("/models/local", json=LOCAL, headers=builder_auth)
+    client.put("/credentials/github", json={"value": "ghp_x"}, headers=builder_auth)
+    return client.post("/jobs", json={**JOB, **extra}, headers=builder_auth)
+
+
+def test_pr_is_accepted_stored_and_returned(client, builder_auth):
+    r = _builder_job(client, builder_auth, pr=12)
+    assert r.status_code == 201, r.text
+    assert r.json()["pr"] == 12
+    assert client.get(f"/jobs/{r.json()['id']}", headers=builder_auth).json()["pr"] == 12
+    assert _builder_job(client, builder_auth).json()["pr"] is None
+
+
+def test_pr_needs_a_repo(client, builder_auth):
+    client.put("/models/local", json=LOCAL, headers=builder_auth)
+    no_repo = {k: v for k, v in JOB.items() if k != "repo"}
+    r = client.post("/jobs", json={**no_repo, "pr": 3}, headers=builder_auth)
+    assert r.status_code == 422
+    assert "repo" in r.text
+
+
+def test_pr_is_refused_for_a_reader_token(client, auth):
+    client.put("/credentials/github", json={"value": "ghp_x"}, headers=auth)
+    r = client.post("/jobs", json={**JOB, "pr": 3}, headers=auth)
+    assert r.status_code == 422
+    assert "builder" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("pr", [0, -1, "x", 1.5])
+def test_pr_must_be_a_positive_integer(client, builder_auth, pr):
+    assert _builder_job(client, builder_auth, pr=pr).status_code == 422

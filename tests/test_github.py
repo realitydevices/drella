@@ -13,20 +13,23 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from drella.config import GitHubAppConfig, Settings
 from drella.github import (
     DEFAULT_PROFILE,
     PROFILES,
     GitHubApp,
     GitHubAppError,
     InstallationToken,
+    app_configs,
     app_jwt,
     load_key,
 )
 from drella.runner import JOB_TOKEN_KEY, RunState, RunStatus
 
-BUILDER, READER = PROFILES["builder"], PROFILES["reader"]
+BUILDER, READER, SUPERSTAR = PROFILES["builder"], PROFILES["reader"], PROFILES["superstar"]
 
-APP_ID = "123456"
+APP_ID = "123456"  # the App named "builder" (DRELLA_GITHUB_APP_ID)
+SUPERSTAR_APP_ID = "654321"  # the App named "superstar" (issue #73)
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 PEM = KEY.private_bytes(
     serialization.Encoding.PEM,
@@ -63,6 +66,8 @@ class FakeGitHub:
         # Overrides for the minted token's answer; a key set to None is left out.
         self.answer: dict = {}
         self.minted = 0
+        # The App ID each authenticated request was signed for (its JWT's iss).
+        self.issuers: list[str] = []
         # What GitHub says it granted; None: exactly what was asked for, as GitHub does.
         self.granted: dict | None = None
         self.expires_in = 3600
@@ -87,7 +92,10 @@ class FakeGitHub:
                 except (InvalidSignature, ValueError):
                     return False
                 now = time.time()
-                return claims["iss"] == APP_ID and claims["iat"] <= now < claims["exp"]
+                if claims["iss"] not in (APP_ID, SUPERSTAR_APP_ID):
+                    return False
+                fake.issuers.append(claims["iss"])
+                return claims["iat"] <= now < claims["exp"]
 
             def do_GET(self):
                 fake.requests.append(("GET", self.path, None))
@@ -197,17 +205,32 @@ def test_the_profiles_and_their_permissions():
     assert {p.name: p.permissions for p in PROFILES.values()} == {
         "builder": {"contents": "write", "pull_requests": "write", "issues": "read"},
         "reader": {"contents": "read", "pull_requests": "read", "issues": "read"},
+        "superstar": {
+            "contents": "write",
+            "pull_requests": "write",
+            "issues": "write",
+            "checks": "read",
+            "statuses": "read",
+        },
     }
-    assert BUILDER.opens_prs and not READER.opens_prs
+    # Each profile names the App its tokens are minted from (issue #73).
+    assert {p.name: p.app for p in PROFILES.values()} == {
+        "builder": "builder",
+        "reader": "builder",
+        "superstar": "superstar",
+    }
+    assert BUILDER.opens_prs and not READER.opens_prs and not SUPERSTAR.opens_prs
+    assert BUILDER.read_only is False and READER.read_only and SUPERSTAR.read_only is False
     assert DEFAULT_PROFILE == "reader"
 
 
 def test_no_profile_can_touch_workflows_or_administer_the_repo():
     for p in PROFILES.values():
-        assert set(p.permissions) <= {"contents", "pull_requests", "issues"}, p.name
+        assert set(p.permissions) <= {"contents", "pull_requests", "issues", "checks", "statuses"}
         assert set(p.permissions.values()) <= {"read", "write"}, p.name
-        # Only a profile that can open PRs can write anything.
-        assert p.opens_prs or "write" not in p.permissions.values(), p.name
+        # Only a profile that can open PRs, or the supervisor (which acts on GitHub with gh
+        # and reports in /out), can write anything.
+        assert p.opens_prs or p.name == "superstar" or "write" not in p.permissions.values()
 
 
 # -- minting --------------------------------------------------------------------
@@ -342,13 +365,68 @@ def test_mint_reports_an_unreachable_github(key_file):
 
 
 def test_from_settings(settings, key_file, tmp_path):
-    assert GitHubApp.from_settings(settings) is None  # no App ID: not configured
+    assert GitHubApp.from_settings(settings) == {}  # no App ID: not configured
     with_app = dataclasses.replace(settings, github_app_id=APP_ID, github_app_key_file=str(key_file))
-    assert GitHubApp.from_settings(with_app).app_id == APP_ID
+    apps = GitHubApp.from_settings(with_app)
+    assert list(apps) == ["builder"] and apps["builder"].app_id == APP_ID
     # Configured with a missing key: Drella refuses to start rather than fail every job.
     broken = dataclasses.replace(with_app, github_app_key_file=str(tmp_path / "nope.pem"))
     with pytest.raises(GitHubAppError):
         GitHubApp.from_settings(broken)
+
+
+def test_the_single_app_env_vars_are_the_app_named_builder(monkeypatch, key_file):
+    monkeypatch.setenv("DRELLA_GITHUB_APP_ID", APP_ID)
+    monkeypatch.setenv("DRELLA_GITHUB_APP_KEY_FILE", str(key_file))
+    settings = Settings()
+    assert app_configs(settings) == {
+        "builder": GitHubAppConfig("builder", APP_ID, str(key_file))
+    }
+    assert GitHubApp.from_settings(settings)["builder"].key_file == str(key_file)
+
+
+def test_each_app_is_configured_by_its_own_env_pair(monkeypatch, tmp_path):
+    monkeypatch.setenv("DRELLA_GITHUB_APP_ID", APP_ID)
+    monkeypatch.setenv("DRELLA_GITHUB_APP_SUPERSTAR_ID", SUPERSTAR_APP_ID)
+    monkeypatch.setenv("DRELLA_GITHUB_APP_SUPERSTAR_KEY_FILE", str(tmp_path / "s.pem"))
+    monkeypatch.setenv("DRELLA_GITHUB_APP_OTHER_ID", "7")  # key: the default path
+    apps = app_configs(Settings())
+    assert apps["superstar"] == GitHubAppConfig(
+        "superstar", SUPERSTAR_APP_ID, str(tmp_path / "s.pem")
+    )
+    assert apps["other"] == GitHubAppConfig(
+        "other", "7", "/etc/drella/github-app-other/private-key.pem"
+    )
+    assert apps["builder"].app_id == APP_ID and sorted(apps) == ["builder", "other", "superstar"]
+
+
+def test_an_empty_app_id_is_not_configured_and_a_key_without_an_id_is_refused(monkeypatch):
+    # A Secret without its app-id key gives an empty value: the App isn't configured.
+    monkeypatch.setenv("DRELLA_GITHUB_APP_SUPERSTAR_ID", "")
+    monkeypatch.setenv("DRELLA_GITHUB_APP_SUPERSTAR_KEY_FILE", "/k.pem")
+    assert app_configs(Settings()) == {}
+    # A key with no ID variable at all is a mistake, refused at startup.
+    monkeypatch.delenv("DRELLA_GITHUB_APP_SUPERSTAR_ID")
+    with pytest.raises(ValueError, match="KEY_FILE is set, but not DRELLA_GITHUB_APP_SUPERSTAR"):
+        Settings()
+
+
+def test_an_app_named_twice_is_refused(monkeypatch):
+    monkeypatch.setenv("DRELLA_GITHUB_APP_ID", APP_ID)
+    monkeypatch.setenv("DRELLA_GITHUB_APP_BUILDER_ID", "9")
+    with pytest.raises(GitHubAppError, match="'builder' is configured twice"):
+        app_configs(Settings())
+
+
+def test_every_configured_app_key_is_checked_at_startup(settings, key_file, tmp_path):
+    both = dataclasses.replace(
+        settings,
+        github_app_id=APP_ID,
+        github_app_key_file=str(key_file),
+        github_apps=(GitHubAppConfig("superstar", SUPERSTAR_APP_ID, str(tmp_path / "no.pem")),),
+    )
+    with pytest.raises(GitHubAppError, match="private key can't be read"):
+        GitHubApp.from_settings(both)
 
 
 # -- jobs ---------------------------------------------------------------------
@@ -436,6 +514,7 @@ def test_a_caller_cannot_choose_the_jobs_github_access(app_client, reader_auth, 
     # Not per job: the request can't name a profile or permissions.
     for extra in (
         {"github_profile": "builder"},
+        {"github_profile": "superstar"},
         {"permissions": {"contents": "write"}},
         {"profile": "builder"},
     ):
@@ -645,3 +724,97 @@ def test_there_is_no_token_refresh_route(app_client, app_auth, runner):
     app_client.queue.tick()
     r = app_client.post(f"/jobs/{jid}/github-token", headers=job_auth(runner, jid))
     assert r.status_code in (404, 405)
+
+
+# -- several Apps (issue #73) ---------------------------------------------------
+
+
+@pytest.fixture
+def superstar_settings(app_settings, key_file):
+    """The builder App and a second one, superstar, with the same key."""
+    return dataclasses.replace(
+        app_settings,
+        github_apps=(GitHubAppConfig("superstar", SUPERSTAR_APP_ID, str(key_file)),),
+    )
+
+
+@pytest.fixture
+def two_apps_client(superstar_settings, runner, storage):
+    from fastapi.testclient import TestClient
+
+    from drella.app import create_app
+
+    app = create_app(superstar_settings, runner=runner, storage=storage, start_queue=False)
+    with TestClient(app) as c:
+        c.queue = app.state.deps.queue
+        c.queue._sleep = lambda s: None
+        yield c
+
+
+@pytest.fixture
+def superstar_auth(superstar_settings, two_apps_client):
+    from drella.cli import create_token
+
+    auth = {"Authorization": f"Bearer {create_token(superstar_settings, 'sam', 'superstar')}"}
+    assert two_apps_client.put("/models/local", json=LOCAL, headers=auth).status_code == 200
+    return auth
+
+
+def test_superstar_is_minted_from_its_own_app_and_reports_to_out(
+    two_apps_client, superstar_auth, runner, github
+):
+    jid = two_apps_client.post("/jobs", json=JOB, headers=superstar_auth).json()["id"]
+    two_apps_client.queue.tick()
+    assert github.issuers[-1] == SUPERSTAR_APP_ID
+    assert github.requests[-1][2]["permissions"] == SUPERSTAR.permissions
+    assert github.requests[-1][2]["repositories"] == ["widgets"]
+    assert runner.secrets[jid]["github"] == "ghs_minted0001"
+    (spec,) = runner.launched
+    # The job's outcome is its report, not a PR; its token can still write.
+    assert spec.opens_prs is False and spec.read_only is False
+    assert two_apps_client.get(f"/jobs/{jid}", headers=superstar_auth).json()["status"] == "running"
+
+
+def test_builder_and_reader_still_mint_from_the_builder_app(
+    two_apps_client, app_settings, superstar_settings, github
+):
+    from drella.cli import create_token
+
+    two_apps_client.queue.concurrency = 2  # both jobs launch in one tick
+    for name, profile in (("alice", "builder"), ("rita", "reader")):
+        auth = {"Authorization": f"Bearer {create_token(superstar_settings, name, profile)}"}
+        assert two_apps_client.put("/models/local", json=LOCAL, headers=auth).status_code == 200
+        two_apps_client.post("/jobs", json=JOB, headers=auth)
+    two_apps_client.queue.tick()
+    assert [r[2]["permissions"] for r in github.requests if r[0] == "POST"] == [
+        BUILDER.permissions,
+        READER.permissions,
+    ]
+    assert set(github.issuers) == {APP_ID}  # the builder App only, never superstar's
+
+
+def test_superstar_fails_clearly_at_launch_when_its_app_is_not_configured(
+    app_client, runner, github, app_settings
+):
+    # Only the builder App is configured here.
+    from drella.cli import create_token
+
+    auth = {"Authorization": f"Bearer {create_token(app_settings, 'sam', 'superstar')}"}
+    assert app_client.put("/models/local", json=LOCAL, headers=auth).status_code == 200
+    jid = app_client.post("/jobs", json=JOB, headers=auth).json()["id"]
+    app_client.queue.tick()
+    got = app_client.get(f"/jobs/{jid}", headers=auth).json()
+    assert got["status"] == "failed"
+    assert "needs the GitHub App 'superstar', which isn't configured" in got["message"]
+    assert github.requests == [] and runner.launched == []
+    assert runner.cleaned == [jid]
+
+
+def test_a_superstar_token_is_checked_like_any_other(two_apps_client, superstar_auth, github):
+    # GitHub granting more than the profile (here: administration) is never used.
+    github.granted = {**SUPERSTAR.permissions, "administration": "write"}
+    jid = two_apps_client.post("/jobs", json=JOB, headers=superstar_auth).json()["id"]
+    two_apps_client.queue.tick()
+    got = two_apps_client.get(f"/jobs/{jid}", headers=superstar_auth).json()
+    assert got["status"] == "failed"
+    assert "granted more than the 'superstar' profile" in got["message"]
