@@ -292,3 +292,19 @@ def test_the_deadline_never_passes_the_github_tokens_expiry(k8s):
     assert int(_env(r, batch, early)["DRELLA_DEADLINE"]) == int(now + 3000)
     late = JobSpec(JOB_ID, "octo/widgets", LOCAL, "do it", github_token_expires=now + 9000)
     assert abs(int(_env(r, batch, late)["DRELLA_DEADLINE"]) - (now + 3600)) < 5
+
+
+def test_pr_is_passed_to_the_pod_only_when_set(k8s):
+    import dataclasses
+
+    r, batch, _ = k8s
+
+    def env_names():
+        _, job = batch.create_namespaced_job.call_args.args
+        (c,) = job["spec"]["template"]["spec"]["containers"]
+        return {e["name"]: e.get("value") for e in c["env"]}
+
+    r.launch(SPEC)
+    assert "DRELLA_PR" not in env_names()
+    r.launch(dataclasses.replace(SPEC, pr=58))
+    assert env_names()["DRELLA_PR"] == "58"
