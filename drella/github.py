@@ -10,7 +10,8 @@ Minting a token:
 3. ask for a token for that repo only: POST /app/installations/{id}/access_tokens.
 
 Installation tokens last an hour. What a token may do depends on the GitHub profile of
-the Drella token that created the job (PROFILES), never on anything the caller sends.
+the Drella token that created the job (PROFILES). A caller may ask for a narrower
+profile for one job (`profile` on POST /jobs), never a wider one.
 
 Drella can hold several Apps (issue #73): each profile names the App its tokens are
 minted from. The App named "builder" is DRELLA_GITHUB_APP_ID and
@@ -63,7 +64,8 @@ class Profile:
 
 # The fixed set of profiles. A Drella token's profile is set by an admin with the CLI
 # (`drella token create --github-profile`, `drella token set-profile`), never by the
-# caller and never per job. To add one (e.g. a reviewer that comments on PRs, with
+# caller. A job may ask for a profile its token's profile covers (`covers`), i.e. the
+# same or a narrower one, never a wider one. To add one (e.g. a reviewer that comments on PRs, with
 # pull_requests: write), add it here. pull_requests: write also lets a token approve
 # PRs; only branch protection stops that approval counting (deploy/README.md).
 PROFILES = {
@@ -100,6 +102,21 @@ PROFILES = {
         ),
     )
 }
+# The supervisor's profile: never given to a job queued with an operator job's API
+# token (issue #74), whatever its caller's profile.
+SUPERSTAR = "superstar"
+_LEVELS = {"read": 1, "write": 2}
+
+
+def covers(outer: Profile, inner: Profile) -> bool:
+    """True if every permission `inner` asks for is granted by `outer` at the same or a
+    higher level: a job whose Drella token has `outer` may be given `inner`."""
+    return all(
+        level in _LEVELS and _LEVELS.get(outer.permissions.get(name, ""), 0) >= _LEVELS[level]
+        for name, level in inner.permissions.items()
+    )
+
+
 # The App the builder and reader profiles mint from, configured by DRELLA_GITHUB_APP_ID.
 LEGACY_APP = "builder"
 # A new Drella token gets the least access unless the admin asks for more.

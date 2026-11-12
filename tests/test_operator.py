@@ -2,15 +2,17 @@
 which it can queue and read its caller's jobs, and nothing else."""
 
 import dataclasses
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from drella import app as app_module
 from drella import crypto
 from drella.adapters import LLM_KEY_SECRET
 from drella.cli import create_token, set_role
 from drella.models import Job
-from drella.runner import API_TOKEN_KEY, JOB_TOKEN_KEY, RunState, RunStatus
+from drella.runner import API_TOKEN_KEY, BUILDER_TOKEN_KEY, JOB_TOKEN_KEY, RunState, RunStatus
 
 LOCAL = {
     "interface": "openai-compatible",
@@ -142,8 +144,6 @@ def test_the_api_token_cant_touch_credentials_models_or_job_reports(
         ("get", "/credentials", None),
         ("put", "/credentials/github", {"value": "ghp_evil"}),
         ("delete", "/credentials/github", None),
-        ("get", "/models", None),
-        ("get", "/models/local", None),
         ("put", "/models/local", LOCAL),
         ("delete", "/models/local", None),
         ("post", f"/jobs/{running['id']}/status", {"status": "succeeded"}),
@@ -206,12 +206,32 @@ def _child(client, api_auth, **extra):
     return client.post("/jobs", json={**JOB, **extra}, headers=api_auth)
 
 
-def test_a_child_defaults_to_the_reader_profile(client, running, api_auth, op_job, op_auth):
+
+# -- profiles with a stored `github` credential --------------------------------
+# (These tokens store `github`, so no GitHub App token is minted; test_github.py covers
+# profiles on the App path.)
+
+
+def test_a_profile_cant_differ_from_the_tokens_with_a_stored_github_credential(
+    client, running, api_auth, op_auth
+):
+    for a in (op_auth, api_auth):  # the operator itself, and its job's API token
+        r = _child(client, a, profile="reader")  # narrower than builder, but not honoured
+        assert r.status_code == 422, r.text
+        assert "stored 'github' credential" in r.json()["detail"]
+    # Its own profile changes nothing, so it's accepted; the job uses the credential.
+    r = _child(client, op_auth, profile="builder")
+    assert r.status_code == 201 and r.json()["github_profile"] is None
+
+
+def test_with_a_stored_github_credential_a_child_uses_it_and_records_no_profile(
+    client, running, api_auth, runner
+):
     child = _child(client, api_auth).json()
-    assert child["github_profile"] == "reader"
-    assert client.get(f"/jobs/{child['id']}", headers=op_auth).json()["github_profile"] == "reader"
-    # Not its parent's: the operator token here is a builder, and its own job has none set.
-    assert op_job["github_profile"] is None
+    assert child["github_profile"] is None
+    assert runner.secrets[child["id"]]["github"] == "ghp_x"
+    # `pr` then goes by the token's own profile (builder here).
+    assert _child(client, api_auth, pr=5).status_code == 201
 
 
 @pytest.mark.parametrize("profile", ["superstar", "admin", "", "Builder", 1])
@@ -219,17 +239,125 @@ def test_a_child_cant_ask_for_other_profiles(client, running, api_auth, profile)
     assert _child(client, api_auth, profile=profile).status_code == 422
 
 
-def test_a_non_operator_caller_cant_send_a_profile(client, auth, op_auth):
+# -- models --------------------------------------------------------------------
+
+
+def test_the_api_token_reads_its_callers_models(client, auth, running, api_auth):
+    _setup(client, auth)  # another token's model with the same alias
+    client.put("/models/other", json={**LOCAL, "model_id": "x"}, headers=auth)
+    r = client.get("/models", headers=api_auth)
+    assert r.status_code == 200 and [m["alias"] for m in r.json()] == ["local"]
+    r = client.get("/models/local", headers=api_auth)
+    assert r.status_code == 200 and r.json()["model_id"] == "some-model"
+    assert client.get("/models/other", headers=api_auth).status_code == 404
+
+
+# -- following logs --------------------------------------------------------------
+
+
+def _end(app, job_id):
+    """What the queue does when an operator job's pod ends."""
+    with app.state.deps.sessions() as s:
+        job = s.get(Job, job_id)
+        job.status = "succeeded"
+        job.api_key_wrap = None
+        s.commit()
+
+
+def test_a_follow_with_the_api_token_stops_when_its_job_ends(
+    client, running, api_auth, runner, app, queue, monkeypatch
+):
+    monkeypatch.setattr(app_module, "FOLLOW_POLL", 0.05)
+    child = _child(client, api_auth).json()
+    queue.concurrency = 2
+    queue.tick()  # the child runs
+    release = threading.Event()
+
+    def silent_log(job_id, follow=False):
+        # A chunk, then the operator job ends while the child's pod stays silent.
+        yield b"child says hi\n"
+        _end(app, running["id"])
+        release.wait(30)
+        yield b"never seen\n"
+
+    runner.logs = silent_log
+    try:
+        r = client.get(f"/jobs/{child['id']}/logs?follow=1", headers=api_auth)
+    finally:
+        release.set()
+    assert r.status_code == 200
+    assert r.text.startswith("child says hi\n")
+    assert "never seen" not in r.text
+    assert "succeeded" in r.text and "stopped following" in r.text
+
+
+def test_a_follow_with_the_api_token_stops_waiting_when_its_job_ends(
+    client, running, api_auth, app, monkeypatch
+):
+    monkeypatch.setattr(app_module, "FOLLOW_POLL", 0.05)
+    child = _child(client, api_auth).json()  # stays queued: concurrency 1
+    timer = threading.Timer(0.3, _end, (app, running["id"]))
+    timer.start()
+    r = client.get(f"/jobs/{child['id']}/logs?follow=1", headers=api_auth)
+    timer.join()
+    assert r.status_code == 200 and "succeeded" in r.text
+
+
+def test_a_follow_with_the_api_token_streams_while_its_job_runs(
+    client, running, api_auth, runner
+):
+    runner.pod_logs[running["id"]] = b"all of it\n"
+    r = client.get(f"/jobs/{running['id']}/logs?follow=1", headers=api_auth)
+    assert r.status_code == 200 and r.text == "all of it\n"
+
+
+# -- the builder token (DRELLA_BUILDER_TOKEN) -------------------------------------
+
+
+def test_an_operators_top_level_job_gets_its_stored_builder_token(
+    client, op_auth, runner, queue
+):
+    assert client.put(
+        "/credentials/drella-builder", json={"value": "drt_builderbuilder"}, headers=op_auth
+    ).status_code == 204
+    job = client.post("/jobs", json=JOB, headers=op_auth).json()
+    assert runner.secrets[job["id"]][BUILDER_TOKEN_KEY] == "drt_builderbuilder"
+    queue.tick()
+    api = _bearer(runner.secrets[job["id"]][API_TOKEN_KEY])
+    # Its children never do.
+    child = client.post("/jobs", json=JOB, headers=api).json()
+    assert BUILDER_TOKEN_KEY not in runner.secrets[child["id"]]
+
+
+def test_an_operator_without_a_stored_builder_token_gets_none(op_job, runner):
+    assert BUILDER_TOKEN_KEY not in runner.secrets[op_job["id"]]
+
+
+def test_a_member_tokens_job_never_gets_a_builder_token(client, auth, runner):
     _setup(client, auth)
-    for a in (auth, op_auth):  # a member, and an operator using its own token
-        r = _child(client, a, profile="reader")
-        assert r.status_code == 422 and "profile" in r.text
+    client.put("/credentials/drella-builder", json={"value": "drt_builderbuilder"}, headers=auth)
+    job = client.post("/jobs", json=JOB, headers=auth).json()
+    assert BUILDER_TOKEN_KEY not in runner.secrets[job["id"]]
+    assert "drt_builderbuilder" not in runner.secrets[job["id"]].values()
 
 
-def test_a_pr_child_needs_builder(client, running, api_auth):
-    r = _child(client, api_auth, pr=5)
-    assert r.status_code == 422 and "builder" in r.json()["detail"]
-    r = _child(client, api_auth, pr=5, profile="reader")
-    assert r.status_code == 422
-    r = _child(client, api_auth, pr=5, profile="builder")
-    assert r.status_code == 201 and r.json()["pr"] == 5
+def test_an_sse_follow_with_the_api_token_ends_when_its_job_ends(
+    client, running, api_auth, runner, app, queue, monkeypatch
+):
+    monkeypatch.setattr(app_module, "FOLLOW_POLL", 0.05)
+    child = _child(client, api_auth).json()
+    queue.concurrency = 2
+    queue.tick()
+
+    def log(job_id, follow=False):
+        yield b"hi\n"
+        _end(app, running["id"])
+
+    runner.logs = log
+    r = client.get(
+        f"/jobs/{child['id']}/logs?follow=1",
+        headers={**api_auth, "Accept": "text/event-stream"},
+    )
+    assert r.status_code == 200
+    assert r.text.startswith("data: hi\n\n")
+    assert r.text.endswith("event: end\ndata: running\n\n")  # the child runs on

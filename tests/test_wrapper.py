@@ -31,7 +31,9 @@ def test_agent_output_is_never_read_through_a_symlink():
 
 
 def test_wrapper_redacts_every_job_secret():
-    for name in ("DRELLA_LLM_KEY", "GH_TOKEN", "DRELLA_JOB_TOKEN", "DRELLA_API_TOKEN"):
+    for name in (
+        "DRELLA_LLM_KEY", "GH_TOKEN", "DRELLA_JOB_TOKEN", "DRELLA_API_TOKEN", "DRELLA_BUILDER_TOKEN"
+    ):
         assert f'ENVIRON["{name}"]' in WRAPPER
 
 
@@ -42,13 +44,18 @@ def test_redact_hides_an_operator_jobs_api_token():
     import subprocess
 
     fn = "redact() {" + WRAPPER.split("\nredact() {", 1)[1].split("\n}\n", 1)[0] + "\n}"
-    env = {**os.environ, "DRELLA_API_TOKEN": "dra_secretsecret", "DRELLA_JOB_TOKEN": "drj_jobjobjob"}
+    env = {
+        **os.environ,
+        "DRELLA_API_TOKEN": "dra_secretsecret",
+        "DRELLA_JOB_TOKEN": "drj_jobjobjob",
+        "DRELLA_BUILDER_TOKEN": "drt_builderbuilder",
+    }
     r = subprocess.run(
         ["bash", "-c", fn + "\nredact"],
-        input="token dra_secretsecret and drj_jobjobjob\n",
+        input="token dra_secretsecret and drj_jobjobjob, drt_builderbuilder\n",
         capture_output=True, text=True, env=env, check=True,
     )
-    assert r.stdout == "token [redacted] and [redacted]\n"
+    assert r.stdout == "token [redacted] and [redacted], [redacted]\n"
 
 
 def test_an_operator_job_is_told_about_its_api_token():
@@ -480,7 +487,9 @@ def test_the_operator_paragraph_is_in_the_instructions_only_with_an_api_token():
     # The wrapper's own standing-instruction code, from the first STANDING to the MESSAGE.
     start = WRAPPER.index("if [ -n \"$READ_ONLY\" ]; then\nread -r -d '' STANDING")
     block = WRAPPER[start : WRAPPER.index("\nMESSAGE=", start)]
-    base = {k: v for k, v in os.environ.items() if k != "DRELLA_API_TOKEN"}
+    base = {
+        k: v for k, v in os.environ.items() if k not in ("DRELLA_API_TOKEN", "DRELLA_BUILDER_TOKEN")
+    }
 
     def run(**env):
         r = subprocess.run(
@@ -496,3 +505,7 @@ def test_the_operator_paragraph_is_in_the_instructions_only_with_an_api_token():
     assert '"profile": "builder"' in with_token
     assert "dra_secretsecret" not in with_token  # told about, never given the value
     assert with_token.startswith(without)
+    assert "DRELLA_BUILDER_TOKEN" not in with_token
+    with_builder = run(DRELLA_API_TOKEN="dra_secretsecret", DRELLA_BUILDER_TOKEN="drt_builderbuilder")
+    assert "$DRELLA_BUILDER_TOKEN is a separate Drella token" in with_builder
+    assert "drt_builderbuilder" not in with_builder

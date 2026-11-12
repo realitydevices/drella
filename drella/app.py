@@ -1,10 +1,12 @@
 """The HTTP API: the only way in [8]."""
 
 import logging
+import queue
 import re
+import threading
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -32,7 +34,7 @@ from drella import crypto
 from drella.adapters import LLM_KEY_SECRET, Interface
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
-from drella.github import PROFILES, GitHubApp
+from drella.github import PROFILES, SUPERSTAR, GitHubApp, covers
 from drella.models import (
     OPERATOR,
     QUEUED,
@@ -44,7 +46,7 @@ from drella.models import (
     Token,
 )
 from drella.queue import Queue, archived_log, output_prefix
-from drella.runner import API_TOKEN_KEY, JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
+from drella.runner import API_TOKEN_KEY, BUILDER_TOKEN_KEY, JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
 from drella.storage import CHUNK, LocalStorage, NotFound, Storage
 
 log = logging.getLogger(__name__)
@@ -55,6 +57,9 @@ OUTPUT_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 REPO_RE = r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
 MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 GITHUB_CREDENTIAL = "github"
+# A Drella token an operator token stores for its own jobs (issue #74): exposed to its
+# top-level jobs as DRELLA_BUILDER_TOKEN.
+BUILDER_CREDENTIAL = "drella-builder"
 # Model rows end up in OpenCode's config, which substitutes {env:...} and {file:...}
 # anywhere in its raw text, so "{" and "}" are never allowed (docs/v0.2.md#security).
 # Both fields are printable ASCII only, an allow-list: no whitespace (ASCII or
@@ -78,6 +83,8 @@ MAX_USAGE_TOKENS = 10**13
 # var or argument to 128 KiB (MAX_ARG_STRLEN); we cap at half that to leave room for
 # the rest of the command line and other env vars.
 MAX_PROMPT_BYTES = 64 * 1024
+# Seconds between status checks while following a log.
+FOLLOW_POLL = 2
 
 
 # -- schemas -----------------------------------------------------------------
@@ -128,10 +135,13 @@ class JobIn(BaseModel):
         " drella/ branch instead of opening a new PR. Needs `repo` and a builder token.",
     )
 
-    profile: Literal["reader", "builder"] | None = Field(
+    profile: Literal["reader", "builder", "superstar"] | None = Field(
         default=None,
-        description="Only for a job queued with an operator job's API token: the GitHub profile"
-        " of the new job's token, reader (the default) or builder. Other callers can't set it.",
+        description="The GitHub profile of the job's minted GitHub token: the caller's own"
+        " profile or a narrower one (its permissions a subset of the caller's), never a wider"
+        " one, and never superstar with an operator job's API token. Left out, a job gets"
+        " its Drella token's profile, or reader if it's queued with an API token. Can't"
+        " differ from the token's own profile if the caller has a stored `github` credential.",
     )
 
     @model_validator(mode="after")
@@ -277,8 +287,9 @@ class JobOut(BaseModel):
     pr: int | None = None
     # The job that queued this one with its API token (issue #74), if any.
     parent_job_id: str | None = None
-    # The GitHub profile a job queued with an API token was given (issue #74); null for
-    # other jobs, which use their Drella token's profile.
+    # The GitHub profile the job asked for (`profile`), or reader for a job queued with an
+    # API token that didn't ask (issue #74); null for jobs that use their Drella token's
+    # profile, or its stored `github` credential.
     github_profile: str | None = None
     model: JobModelOut
     message: str | None
@@ -507,6 +518,20 @@ def job_deadline(job: Job, deps: Deps) -> datetime | None:
     return started + timedelta(seconds=deps.settings.job_timeout_seconds)
 
 
+def api_token_problem(job: Job, db: Session, deps: Deps) -> str | None:
+    """Why an operator job's API token no longer works, or None if it does: only while
+    its job runs, until the job's deadline, and while its token is still an operator."""
+    if job.status != RUNNING or job.api_key_wrap is None:
+        return f"this API token's job is {job.status}; it works only while the job runs"
+    deadline = job_deadline(job, deps)
+    if deadline is not None and datetime.now(UTC) >= deadline:
+        return "this API token's job has reached its deadline"
+    token = db.get(Token, job.token_id)
+    if token is None or token.role != OPERATOR:
+        return "this API token's Drella token is no longer an operator"
+    return None
+
+
 def jobs_caller(
     raw: Annotated[str, Depends(bearer)],
     db: Annotated[Session, Depends(get_db)],
@@ -522,21 +547,54 @@ def jobs_caller(
     job = db.scalar(select(Job).where(Job.api_token_hash == crypto.lookup_hash(raw)))
     if job is None:
         raise _unauthorized()
-    if job.status != RUNNING or job.api_key_wrap is None:
-        raise _unauthorized(
-            f"this API token's job is {job.status}; it works only while the job runs"
-        )
-    deadline = job_deadline(job, deps)
-    if deadline is not None and datetime.now(UTC) >= deadline:
-        raise _unauthorized("this API token's job has reached its deadline")
+    problem = api_token_problem(job, db, deps)
+    if problem is not None:
+        raise _unauthorized(problem)
     token = db.get(Token, job.token_id)
-    if token is None or token.role != OPERATOR:
-        raise _unauthorized("this API token's Drella token is no longer an operator")
     try:
         key = crypto.unwrap_key(raw, job.api_key_wrap)
     except Exception:
         raise _unauthorized() from None
     return Caller(token, key, parent_job=job)
+
+
+def _job_profile(body: JobIn, c: Caller, stored_github: bool) -> str | None:
+    """The GitHub profile stored on a new job, or None for the Drella token's own
+    (read when the token is minted). A caller may ask for its token's profile or a
+    narrower one: every permission the asked-for profile has, the token's must grant at
+    the same level or higher. A job queued with an operator job's API token defaults to
+    reader, never its parent's profile, and can't be superstar. The queue checks the
+    stored profile again when it mints the token (Queue._mint_github_token)."""
+    own = PROFILES.get(c.token.github_profile)
+    api = c.parent_job is not None
+    asked = body.profile
+    if asked is not None:
+        if api and asked == SUPERSTAR:
+            raise HTTPException(
+                422, f"a job queued with an operator job's API token can't be '{SUPERSTAR}'"
+            )
+        if own is None or not covers(own, PROFILES[asked]):
+            raise HTTPException(
+                422,
+                f"`profile` '{asked}' is wider than this Drella token's GitHub profile"
+                f" ('{c.token.github_profile}'): a job may have the token's profile or a"
+                " narrower one",
+            )
+    if stored_github:
+        # Repo jobs use the stored credential as is: no token is minted, so a profile
+        # would change nothing. Say so rather than pretend.
+        if asked is not None and asked != c.token.github_profile:
+            raise HTTPException(
+                422,
+                f"this Drella token has a stored '{GITHUB_CREDENTIAL}' credential, which its"
+                " repo jobs use instead of a token minted from Drella's GitHub App, so"
+                f" `profile` '{asked}' can't be honoured. Leave `profile` out, or delete the"
+                " credential (DELETE /credentials/github)",
+            )
+        return None
+    if asked is not None:
+        return asked
+    return "reader" if api else None
 
 
 def own_job(job_id: str, c: Caller, db: Session) -> Job:
@@ -633,10 +691,6 @@ def list_credentials(c: CallerDep, db: DbDep) -> list[str]:
 @router.post("/jobs", status_code=201)
 def create_job(body: JobIn, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     parent = c.parent_job
-    if parent is None and body.profile is not None:
-        raise HTTPException(
-            422, "`profile` can be set only by an operator job, with its API token"
-        )
     if parent is not None:
         # An operator job queues jobs as its caller, up to a limit per run. On Postgres
         # the parent's row lock serialises its creates, so the count can't be raced
@@ -666,25 +720,24 @@ def create_job(body: JobIn, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOu
             f"model '{model.alias}' no longer passes validation; register it again"
             " (PUT /models)",
         ) from None
-    # A job queued with an API token gets a reader token unless it asks for builder: never
-    # its parent's profile (a supervisor's may write and open no PRs).
-    child_profile = (body.profile or "reader") if parent is not None else None
+    creds = {
+        cred.name: cred
+        for cred in db.scalars(select(Credential).where(Credential.token_id == c.token.id))
+    }
+    job_profile = _job_profile(body, c, GITHUB_CREDENTIAL in creds)
     if body.pr is not None:
-        profile = PROFILES.get(child_profile or c.token.github_profile)
+        profile = PROFILES.get(job_profile or c.token.github_profile)
         if profile is None or not profile.opens_prs:
             raise HTTPException(
                 422,
                 "`pr` needs a GitHub profile that can push branches and open PRs (builder); "
                 + (
-                    f"this job would get '{child_profile}' (set `profile` to builder)"
-                    if child_profile
+                    f"this job would get '{job_profile}'"
+                    + (" (set `profile` to builder)" if parent is not None else "")
+                    if job_profile
                     else "this Drella token's profile can't"
                 ),
             )
-    creds = {
-        cred.name: cred
-        for cred in db.scalars(select(Credential).where(Credential.token_id == c.token.id))
-    }
     # Only a job with a repo needs git access: the caller's own `github` credential if
     # they stored one (it wins), otherwise a token from Drella's GitHub App, minted at
     # launch.
@@ -736,6 +789,11 @@ def create_job(body: JobIn, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOu
     if c.token.role == OPERATOR and parent is None:
         api_token = crypto.new_token(crypto.API_TOKEN_PREFIX)
         secrets[API_TOKEN_KEY] = api_token
+        # The supervisor's builder Drella token, if its caller stored one: it queues
+        # build and fix jobs with it as an ordinary caller. Top-level operator jobs only,
+        # never a child. It's a long-lived token, present for the whole run.
+        if BUILDER_CREDENTIAL in creds:
+            secrets[BUILDER_TOKEN_KEY] = decrypt(BUILDER_CREDENTIAL)
     job = Job(
         token_id=c.token.id,
         prompt=body.prompt,
@@ -754,7 +812,7 @@ def create_job(body: JobIn, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOu
         job_token_hash=crypto.lookup_hash(job_token),
         github_app=github_app,
         parent_job_id=parent.id if parent is not None else None,
-        github_profile=child_profile,
+        github_profile=job_profile,
         api_token_hash=crypto.lookup_hash(api_token) if api_token else None,
         api_key_wrap=crypto.wrap_key(api_token, c.cred_key) if api_token else None,
     )
@@ -865,8 +923,9 @@ def put_model(
 
 
 @router.get("/models")
-def list_models(c: CallerDep, db: DbDep) -> list[ModelOut]:
-    """The caller's own models."""
+def list_models(c: JobsCallerDep, db: DbDep) -> list[ModelOut]:
+    """The caller's own models. An operator job's API token may read them too, to choose
+    a model for the jobs it queues; it can't change them."""
     models = db.scalars(
         select(Model).where(Model.owner_token_id == c.token.id).order_by(Model.alias)
     )
@@ -874,7 +933,7 @@ def list_models(c: CallerDep, db: DbDep) -> list[ModelOut]:
 
 
 @router.get("/models/{alias}")
-def get_model(alias: str, c: CallerDep, db: DbDep) -> ModelOut:
+def get_model(alias: str, c: JobsCallerDep, db: DbDep) -> ModelOut:
     m = own_model(alias, c, db)
     if m is None:
         raise HTTPException(404, "model not found")
@@ -922,15 +981,20 @@ def job_logs(
     text/event-stream. With follow=1, a queued job is waited on until it starts.
     """
     job = own_job(job_id, c, db)
+    stop = None
     if not follow:
         if job.status == QUEUED:
             raise HTTPException(409, "job is queued; it has no log yet")
         chunks = _log_source(deps, job.id, job.status, follow=False)
     else:
-        chunks = _follow(deps, job.id)
+        if c.parent_job is not None:
+            # A follow opened with an API token ends when the token stops working.
+            parent_id = c.parent_job.id
+            stop = lambda: _api_token_ended(deps, parent_id)  # noqa: E731
+        chunks = _follow(deps, job.id, poll=FOLLOW_POLL, stop=stop)
     sse = accept is not None and "text/event-stream" in accept
     if sse:
-        return StreamingResponse(_sse(chunks, deps, job.id), media_type="text/event-stream")
+        return StreamingResponse(_sse(chunks, deps, job.id, stop), media_type="text/event-stream")
     return StreamingResponse(chunks, media_type="text/plain; charset=utf-8")
 
 
@@ -951,16 +1015,97 @@ def _status(deps: Deps, job_id: str) -> str:
         return s.get(Job, job_id).status
 
 
-def _follow(deps: Deps, job_id: str, poll: float = 2) -> Iterator[bytes]:
+def _api_token_ended(deps: Deps, parent_id: str) -> str | None:
+    with deps.sessions() as s:
+        job = s.get(Job, parent_id)
+        return "this API token's job is gone" if job is None else api_token_problem(job, s, deps)
+
+
+def _follow(
+    deps: Deps,
+    job_id: str,
+    poll: float = 2,
+    stop: Callable[[], str | None] | None = None,
+) -> Iterator[bytes]:
+    """Follow a job's log. With `stop` (a follow opened with an operator job's API
+    token), it's asked every `poll` seconds, while waiting and while streaming, and the
+    follow ends as soon as it gives a reason."""
     while (status := _status(deps, job_id)) == QUEUED:
+        if stop is not None and (reason := stop()):
+            yield f"[drella] {reason}\n".encode()
+            return
         time.sleep(poll)
     try:
-        yield from _log_source(deps, job_id, status, follow=True)
+        source = _log_source(deps, job_id, status, follow=True)
     except HTTPException as e:
         yield f"[drella] {e.detail}\n".encode()
+        return
+    if stop is None:
+        yield from source
+    else:
+        yield from _until(source, stop, poll)
 
 
-def _sse(chunks: Iterator[bytes], deps: Deps, job_id: str) -> Iterator[bytes]:
+_DONE = object()
+
+
+def _until(
+    source: Iterator[bytes], stop: Callable[[], str | None], poll: float
+) -> Iterator[bytes]:
+    """Pass on `source`'s chunks until `stop` gives a reason, asking it every `poll`
+    seconds even while the source is silent. The source is read in a daemon thread, so
+    a blocked read can't hold the follow open; once stopped, that thread drops what it
+    reads and ends with the source (the followed pod's log, which ends with its job)."""
+    chunks: queue.Queue = queue.Queue(maxsize=16)
+    stopped = threading.Event()
+
+    def pump() -> None:
+        try:
+            for chunk in source:
+                while not stopped.is_set():
+                    try:
+                        chunks.put(chunk, timeout=poll)
+                        break
+                    except queue.Full:
+                        pass
+                if stopped.is_set():
+                    break
+        except Exception as e:  # noqa: BLE001 - reported in the stream, like _follow
+            detail = e.detail if isinstance(e, HTTPException) else "the log stream failed"
+            chunks.put(f"[drella] {detail}\n".encode())
+        finally:
+            try:
+                chunks.put(_DONE, timeout=poll)
+            except queue.Full:
+                pass
+
+    threading.Thread(target=pump, daemon=True, name="drella-log-follow").start()
+    last_check = time.monotonic()
+    try:
+        while True:
+            try:
+                item = chunks.get(timeout=poll)
+            except queue.Empty:
+                item = None
+            if item is _DONE:
+                return
+            if item is not None:
+                yield item
+            if time.monotonic() - last_check >= poll or item is None:
+                last_check = time.monotonic()
+                if reason := stop():
+                    yield f"[drella] {reason}; stopped following\n".encode()
+                    return
+    finally:
+        stopped.set()
+
+
+def _sse(
+    chunks: Iterator[bytes],
+    deps: Deps,
+    job_id: str,
+    stop: Callable[[], str | None] | None = None,
+) -> Iterator[bytes]:
     buf = b""
     for chunk in chunks:
         buf += chunk
@@ -973,6 +1118,8 @@ def _sse(chunks: Iterator[bytes], deps: Deps, job_id: str) -> Iterator[bytes]:
     for _ in range(15):
         if (status := _status(deps, job_id)) in TERMINAL:
             break
+        if stop is not None and stop():
+            break  # a follow cut off with its API token: the job may run on
         time.sleep(2)
     yield f"event: end\ndata: {status}\n\n".encode()
 

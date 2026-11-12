@@ -411,7 +411,7 @@ def test_only_an_operator_job_gets_its_api_token_from_the_secret(k8s):
     # issue #74: the API token reaches the pod from the job's Secret, never the manifest.
     import dataclasses
 
-    from drella.runner import API_TOKEN_KEY
+    from drella.runner import API_TOKEN_KEY, BUILDER_TOKEN_KEY
 
     r, batch, _ = k8s
 
@@ -422,5 +422,10 @@ def test_only_an_operator_job_gets_its_api_token_from_the_secret(k8s):
         return {e["name"]: e.get("valueFrom") for e in c["env"] if "valueFrom" in e}
 
     assert "DRELLA_API_TOKEN" not in secret_env(SPEC)
+    assert "DRELLA_BUILDER_TOKEN" not in secret_env(SPEC)
     env = secret_env(dataclasses.replace(SPEC, api_token=True))
     assert env["DRELLA_API_TOKEN"] == {"secretKeyRef": {"name": NAME, "key": API_TOKEN_KEY}}
+    # Only in the Secret if the operator stored a `drella-builder` credential.
+    assert env["DRELLA_BUILDER_TOKEN"] == {
+        "secretKeyRef": {"name": NAME, "key": BUILDER_TOKEN_KEY, "optional": True}
+    }

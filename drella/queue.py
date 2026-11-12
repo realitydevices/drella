@@ -22,7 +22,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from drella.adapters import Interface, ModelSpec
-from drella.github import PROFILES, GitHubApp, GitHubAppError
+from drella.github import PROFILES, SUPERSTAR, GitHubApp, GitHubAppError, covers
 from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, Token
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState, is_transient
 from drella.storage import CHUNK, NotFound, Storage
@@ -271,16 +271,30 @@ class Queue:
     def _mint_github_token(self, s: Session, job: Job, spec: JobSpec) -> JobSpec:
         """The job's GitHub token, minted at dispatch rather than at job creation: a
         queued job can wait longer than a token lasts (an hour). Its permissions are its
-        Drella token's GitHub profile (or the one its parent job chose), read now, so a profile an admin has narrowed
-        applies to jobs still queued. It goes into the job's Secret where a caller's
+        Drella token's GitHub profile, read now, so a profile an admin has narrowed
+        applies to jobs still queued. A job that asked for its own profile (`profile` on
+        POST /jobs, or a child's default `reader`) gets it only if the token's profile,
+        read now, still covers it; otherwise the job fails rather than mint more than the
+        token may now have. The token goes into the job's Secret where a caller's
         `github` credential would be, and never into the database. The job's deadline is
         capped at the token's expiry, so the token outlasts everything the job does."""
         token_row = s.get(Token, job.token_id)
-        # A job queued with an operator job's API token has the profile its parent chose.
-        name = job.github_profile or (token_row.github_profile if token_row else None)
-        profile = PROFILES.get(name) if name else None
-        if profile is None:
+        own = PROFILES.get(token_row.github_profile) if token_row else None
+        if own is None:
             raise RuntimeError("the job's Drella token has no known GitHub profile")
+        profile = own
+        if job.github_profile:
+            asked = PROFILES.get(job.github_profile)
+            if (
+                asked is None
+                or not covers(own, asked)
+                or (job.parent_job_id is not None and asked.name == SUPERSTAR)
+            ):
+                raise RuntimeError(
+                    f"the job asked for the GitHub profile '{job.github_profile}', which its"
+                    f" Drella token's profile ('{own.name}') no longer covers"
+                )
+            profile = asked
         app = self.github_apps.get(profile.app)
         if app is None:
             raise RuntimeError(
