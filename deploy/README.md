@@ -325,10 +325,21 @@ and operator tokens (#74). It never tags or deploys.
    label an issue `superstar` and the next run picks it up. Anything it can't decide it
    labels `needs-kirk` and comments why.
 
-It may merge any PR with two approving reviews from different models on the current head,
-green CI and no open confirmed medium-or-worse finding, so the superstar App needs the
-ruleset bypass described under **Approvals and branch protection**. Tagging and deploying
-stay with you.
+It may merge any PR, protected paths included, once it has two approving reviews from
+different models on the current head, a green `pytest` check on that head, and no open
+confirmed medium-or-worse finding. The exception is a PR that changes `docs/superstar.md`
+(its own prompt): the superstar labels that `needs-kirk` and never merges it, and that holds
+even when your comment says to merge. Tagging and deploying stay with you.
+
+It merges with `gh pr merge --admin --match-head-commit <sha>`. The `--admin` is required:
+GitHub only uses the App's ruleset bypass when the merge passes `--admin`, and without it the
+merge is refused. So the superstar App needs the bypass described under **Approvals and branch
+protection**.
+
+Its review jobs run with the `reader` profile (a read-only GitHub token), and its build, fix
+and update jobs with `builder`, so it never runs a child job with its own `superstar` profile.
+Approvals on an earlier head carry over a merge of main only if the merge was clean, which it
+checks mechanically (`git merge-tree --write-tree`); otherwise two fresh reviews are needed.
 
 ## Reaching Drella
 

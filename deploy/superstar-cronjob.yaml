@@ -84,7 +84,7 @@ spec:
                   fi
                   # JSON-encode the prompt: escape \ and ", turn newlines into \n.
                   prompt=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' /prompt/superstar.md | awk 'BEGIN{ORS="\\n"} {print}')
-                  printf '{"prompt":"%s","model":"claude-opus","repo":"realitydevices/drella"}' "$prompt" > /tmp/job.json
+                  printf '{"prompt":"%s","model":"claude-opus","repo":"realitydevices/drella","profile":"superstar"}' "$prompt" > /tmp/job.json
                   curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
                     --data-binary @/tmp/job.json "$DRELLA_URL/jobs"
                   echo
