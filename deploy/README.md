@@ -204,9 +204,21 @@ choose one, and can't ask for permissions per job:
 
 ```sh
 kubectl -n drella exec deploy/drella -- drella token create --name <name> --github-profile builder
-kubectl -n drella exec deploy/drella -- drella token list                    # id, profile, name
+kubectl -n drella exec deploy/drella -- drella token list                    # id, profile, role, name
 kubectl -n drella exec deploy/drella -- drella token set-profile <id> reader
 ```
+
+A token also has a **role** (issue #74): `member` (the default) or `operator`, whose jobs
+get a job-scoped API token to queue and read the token's jobs
+([docs/v0.3.md](../docs/v0.3.md#operator-tokens)). Like the profile, only the CLI sets it:
+
+```sh
+kubectl -n drella exec deploy/drella -- drella token create --name superstar \
+  --github-profile superstar --role operator
+kubectl -n drella exec deploy/drella -- drella token set-role <id> member
+```
+
+`DRELLA_OPERATOR_MAX_CHILD_JOBS` (default 6) caps how many jobs one operator job may queue.
 
 A new token is a `reader` unless you say otherwise. Tokens that existed before profiles
 (migration 0005) became `builder`s, so they work as before. The profile is read when a
