@@ -255,6 +255,25 @@ def test_0006_adds_nullable_usage_columns_and_downgrades(settings):
     engine.dispose()
 
 
+def test_0008_adds_launch_retry_columns_and_downgrades(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "0007")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "queued")
+    _upgrade(engine, "0008")
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT launch_attempts, not_before FROM jobs")).one()
+        assert tuple(row) == (0, None)
+        conn.execute(text("UPDATE jobs SET launch_attempts = 2, not_before = :t"),
+                     {"t": datetime.now(UTC)})
+    _downgrade(engine, "0007")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT id FROM jobs")).scalar() == "j1"
+        with pytest.raises(Exception):
+            conn.execute(text("SELECT not_before FROM jobs"))
+    engine.dispose()
+
+
 def test_0007_adds_nullable_pr_column_and_downgrades(settings):
     engine = make_engine(settings.database_url)
     _upgrade(engine, "0006")
@@ -273,12 +292,12 @@ def test_0007_adds_nullable_pr_column_and_downgrades(settings):
     engine.dispose()
 
 
-def test_0008_adds_roles_parent_jobs_and_api_tokens_and_downgrades(settings):
+def test_0009_adds_roles_parent_jobs_and_api_tokens_and_downgrades(settings):
     engine = make_engine(settings.database_url)
-    _upgrade(engine, "0007")
+    _upgrade(engine, "0008")
     _seed_token(engine)
     _insert_v02_job(engine, "j1", "succeeded")
-    _upgrade(engine, "0008")
+    _upgrade(engine, "0009")
     with engine.begin() as conn:
         # Existing tokens are members; existing jobs have no parent and no API token.
         assert conn.execute(text("SELECT role FROM tokens")).scalar() == "member"
@@ -294,7 +313,7 @@ def test_0008_adds_roles_parent_jobs_and_api_tokens_and_downgrades(settings):
         assert conn.execute(
             text("SELECT parent_job_id FROM jobs WHERE id = 'j2'")
         ).scalar() == "j1"
-    _downgrade(engine, "0007")
+    _downgrade(engine, "0008")
     with engine.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM jobs")).scalar() == 2
         for col, table in (("role", "tokens"), ("parent_job_id", "jobs"),

@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Integer,
     ForeignKey,
     Integer,
     LargeBinary,
@@ -118,6 +119,9 @@ class Job(Base):
     api_token_hash: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     api_key_wrap: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=_now, index=True)
+    # Transient launch failures so far, and the earliest time to try again.
+    launch_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    not_before: Mapped[datetime | None]
     started_at: Mapped[datetime | None]
     finished_at: Mapped[datetime | None]
 

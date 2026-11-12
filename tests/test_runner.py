@@ -92,13 +92,97 @@ def test_launch_creates_job_with_limits_and_hands_it_the_secret(k8s):
     assert owner == {"apiVersion": "batch/v1", "kind": "Job", "name": NAME, "uid": "uid-1"}
 
 
-def test_launch_cleans_up_if_secret_cannot_be_adopted(k8s):
+def _ordered(batch, core):
+    """One mock recording the calls to both, in order."""
+    calls = MagicMock()
+    calls.attach_mock(batch.delete_namespaced_job, "delete_job")
+    calls.attach_mock(core.patch_namespaced_secret, "patch_secret")
+    return calls
+
+
+def test_launch_undoes_the_job_if_secret_cannot_be_adopted(k8s):
+    # Only the Job: the Secret stays, keys and all, so the queue can retry a transient
+    # failure; it deletes the Secret itself when it gives up.
     r, batch, core = k8s
-    core.patch_namespaced_secret.side_effect = ApiException(status=500)
+    calls = _ordered(batch, core)
+    core.patch_namespaced_secret.side_effect = [ApiException(status=500), None]
     with pytest.raises(ApiException):
         r.launch(SPEC)
     batch.delete_namespaced_job.assert_called_once()
-    core.delete_namespaced_secret.assert_called_once()
+    core.delete_namespaced_secret.assert_not_called()
+    # The adoption may have gone through anyway: the Secret is orphaned before the Job
+    # is deleted, so the garbage collector doesn't take it along.
+    names = [c[0] for c in calls.mock_calls]
+    assert names == ["patch_secret", "patch_secret", "delete_job"]
+    assert calls.mock_calls[1].args[2] == {"metadata": {"ownerReferences": None}}
+    for c in calls.mock_calls:
+        assert "data" not in (c.args[2] if c[0] == "patch_secret" else {})
+
+
+def test_launch_raises_the_original_error_if_undoing_fails(k8s):
+    r, batch, core = k8s
+    core.patch_namespaced_secret.side_effect = ApiException(status=503)
+    batch.delete_namespaced_job.side_effect = RuntimeError("cleanup broke")
+    original = ApiException(status=422)
+    batch.create_namespaced_job.side_effect = original
+    with pytest.raises(ApiException) as got:
+        r.launch(SPEC)
+    assert got.value is original
+
+
+def test_reset_launch_orphans_the_secret_then_deletes_the_job_and_keeps_its_keys(k8s):
+    r, batch, core = k8s
+    calls = _ordered(batch, core)
+    r.reset_launch(JOB_ID)
+    assert [c[0] for c in calls.mock_calls] == ["patch_secret", "delete_job"]
+    assert calls.mock_calls[0].args[2] == {"metadata": {"ownerReferences": None}}
+    core.delete_namespaced_secret.assert_not_called()
+
+
+def test_reset_launch_removes_a_minted_token_first(k8s):
+    r, batch, core = k8s
+    calls = _ordered(batch, core)
+    r.reset_launch(JOB_ID, remove_github=True)
+    assert [c[0] for c in calls.mock_calls] == ["patch_secret", "patch_secret", "delete_job"]
+    assert calls.mock_calls[0].args[2] == {"data": {"github": None}}
+    assert calls.mock_calls[1].args[2] == {"metadata": {"ownerReferences": None}}
+    core.delete_namespaced_secret.assert_not_called()
+
+
+def test_reset_launch_tries_every_step_then_raises(k8s):
+    r, batch, core = k8s
+    first = ApiException(status=503)
+    core.patch_namespaced_secret.side_effect = [first, None]
+    with pytest.raises(ApiException) as got:
+        r.reset_launch(JOB_ID, remove_github=True)
+    assert got.value is first
+    batch.delete_namespaced_job.assert_called_once()
+
+
+def test_reset_launch_keeps_the_job_if_the_secret_cannot_be_orphaned(k8s):
+    # Deleting the Job would take the Secret with it; the next launch adopts the Job.
+    r, batch, core = k8s
+    core.patch_namespaced_secret.side_effect = ApiException(status=503)
+    with pytest.raises(ApiException):
+        r.reset_launch(JOB_ID)
+    batch.delete_namespaced_job.assert_not_called()
+
+
+def test_reset_launch_ignores_what_is_already_gone(k8s):
+    r, batch, core = k8s
+    core.patch_namespaced_secret.side_effect = ApiException(status=404)
+    batch.delete_namespaced_job.side_effect = ApiException(status=404)
+    r.reset_launch(JOB_ID, remove_github=True)
+
+
+def test_a_launch_after_a_reset_owns_the_secret_again(k8s):
+    r, batch, core = k8s
+    r.reset_launch(JOB_ID)
+    batch.create_namespaced_job.side_effect = ApiException(status=409)  # adopted, too
+    batch.read_namespaced_job.return_value = V1Job(metadata=V1ObjectMeta(name=NAME, uid="uid-2"))
+    r.launch(SPEC)
+    patch = core.patch_namespaced_secret.call_args.args[2]
+    assert patch["metadata"]["ownerReferences"][0]["uid"] == "uid-2"
 
 
 @pytest.mark.parametrize(

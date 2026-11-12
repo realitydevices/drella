@@ -186,6 +186,16 @@ token is the job's only one: there's no way to ask for another. Instead, the job
 deadline is capped at the token's expiry, so the wrapper has finished everything (the
 PR check, auto-merge, the final report) while the token is still valid.
 
+Launch backoff: a transient Kubernetes error while launching a job (the API server down
+or overloaded, a network failure) leaves the job queued, not failed. Drella retries it
+at 30 s, doubling each time up to 600 s, 6 attempts in all (about 15.5 min of waiting).
+After the 6th failure the job fails with "launch failed after 6 attempts". Errors that
+can't pass on a retry (a 4xx, or a bad CA or URL) fail the job at once. Each job row
+records `launch_attempts` (the failed attempts so far) and `not_before` (the earliest
+next try). Each failed attempt also removes the Job it created and any GitHub token
+Drella minted; that removal is best effort, so during an outage the token can stay in
+the Secret until the next attempt overwrites it.
+
 A caller who stored a `github` credential before the App was set up has to delete it
 (`DELETE /credentials/github`) to get App tokens: a stored one always wins.
 

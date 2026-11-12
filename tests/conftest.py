@@ -23,15 +23,24 @@ class FakeRunner:
         self.pod_logs: dict[str, bytes] = {}
         self.cleaned: list[str] = []
         self.fail_launch = False
+        # Exceptions for the next launch calls, one each, oldest first.
+        self.launch_errors: list[Exception] = []
+        self.reset: list[str] = []
+        # Exceptions for the next add_secrets calls, one each, oldest first.
+        self.add_secrets_errors: list[Exception] = []
 
     def prepare(self, job_id, secrets):
         self.secrets[job_id] = dict(secrets)
         self.secret_created[job_id] = datetime.now(UTC)
 
     def add_secrets(self, job_id, secrets):
+        if self.add_secrets_errors:
+            raise self.add_secrets_errors.pop(0)
         self.secrets[job_id].update(secrets)
 
     def launch(self, spec):
+        if self.launch_errors:
+            raise self.launch_errors.pop(0)
         if self.fail_launch:
             raise RuntimeError("cluster says no")
         self.launched.append(spec)
@@ -47,6 +56,12 @@ class FakeRunner:
 
     def cleanup(self, job_id):
         self.cleaned.append(job_id)
+
+    def reset_launch(self, job_id, remove_github=False):
+        # Like KubernetesRunner: the Secret's other keys are never touched.
+        self.reset.append(job_id)
+        if remove_github:
+            self.secrets.get(job_id, {}).pop("github", None)
 
     def job_secrets(self):
         return {j: t for j, t in self.secret_created.items() if j not in self.cleaned}
