@@ -4,6 +4,78 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from sqlalchemy.engine import URL
+
+
+_PART_SETTINGS = ("PORT", "NAME", "USER", "PASSWORD", "PASSWORD_FILE")
+
+
+def _database_url() -> str:
+    """The database URL: DRELLA_DATABASE_URL, or built from the separate
+    DRELLA_DATABASE_* settings when DRELLA_DATABASE_HOST is set (which quotes the
+    password correctly, unlike a password pasted into a URL)."""
+    env = os.environ
+    host = env.get("DRELLA_DATABASE_HOST", "").strip()
+    if not host:
+        # Any of the other separate settings without a host is a mistake, not a
+        # request for the SQLite default.
+        given = [f"DRELLA_DATABASE_{n}" for n in _PART_SETTINGS if f"DRELLA_DATABASE_{n}" in env]
+        if given:
+            raise ValueError(
+                f"{', '.join(given)} set but DRELLA_DATABASE_HOST is unset or empty; "
+                "set DRELLA_DATABASE_HOST too"
+            )
+        return env.get("DRELLA_DATABASE_URL", "sqlite:///drella.db")
+    if "DRELLA_DATABASE_URL" in env:
+        raise ValueError(
+            "Both DRELLA_DATABASE_URL and DRELLA_DATABASE_HOST are set; use one or the other"
+        )
+    if host.startswith("/"):
+        raise ValueError(
+            "DRELLA_DATABASE_HOST must be a host name or address, not a Unix socket path; "
+            "for a socket use DRELLA_DATABASE_URL"
+        )
+    if "DRELLA_DATABASE_PASSWORD" in env and "DRELLA_DATABASE_PASSWORD_FILE" in env:
+        raise ValueError(
+            "Both DRELLA_DATABASE_PASSWORD and DRELLA_DATABASE_PASSWORD_FILE are set; "
+            "use one or the other"
+        )
+    for name in ("NAME", "USER"):
+        if not env.get(f"DRELLA_DATABASE_{name}"):
+            raise ValueError(f"DRELLA_DATABASE_{name} is required when DRELLA_DATABASE_HOST is set")
+    # Both sources are normalised the same way: only a trailing line ending (as
+    # left by `echo` or an editor) is dropped; any other spaces are kept.
+    password = env.get("DRELLA_DATABASE_PASSWORD")
+    if password is not None:
+        password = password.rstrip("\r\n")
+    if "DRELLA_DATABASE_PASSWORD_FILE" in env:
+        path = env["DRELLA_DATABASE_PASSWORD_FILE"]
+        try:
+            with open(path) as f:
+                password = f.read().rstrip("\r\n")
+        except OSError as e:
+            raise ValueError(
+                f"DRELLA_DATABASE_PASSWORD_FILE: can't read {path!r}: {e.strerror or e}"
+            ) from e
+        if not password.strip():
+            raise ValueError(f"DRELLA_DATABASE_PASSWORD_FILE: {path!r} is empty")
+    try:
+        port = int(env.get("DRELLA_DATABASE_PORT") or 5432)
+    except ValueError:
+        raise ValueError("DRELLA_DATABASE_PORT must be an integer") from None
+    if not 1 <= port <= 65535:
+        raise ValueError("DRELLA_DATABASE_PORT must be between 1 and 65535")
+    url = URL.create(
+        "postgresql+psycopg",
+        username=env["DRELLA_DATABASE_USER"],
+        password=password,
+        host=host,
+        port=port,
+        database=env["DRELLA_DATABASE_NAME"],
+    )
+    return url.render_as_string(hide_password=False)
+
+
 # DRELLA_GITHUB_APP_<NAME>_ID and DRELLA_GITHUB_APP_<NAME>_KEY_FILE configure a GitHub App
 # named <name> in lower case (issue #73). DRELLA_GITHUB_APP_ID is not one of these: it's
 # the App named "builder" (drella/github.py).
@@ -63,9 +135,8 @@ def _github_apps_from_env() -> tuple[GitHubAppConfig, ...]:
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str = field(
-        default_factory=lambda: os.environ.get("DRELLA_DATABASE_URL", "sqlite:///drella.db")
-    )
+    # Not in repr: it contains the database password.
+    database_url: str = field(default_factory=_database_url, repr=False)
     # Root directory for the local-filesystem storage backend.
     storage_path: str = field(
         default_factory=lambda: os.environ.get("DRELLA_STORAGE_PATH", "./data")
