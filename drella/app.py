@@ -522,7 +522,13 @@ def api_token_problem(job: Job, db: Session, deps: Deps) -> str | None:
     """Why an operator job's API token no longer works, or None if it does: only while
     its job runs, until the job's deadline, and while its token is still an operator."""
     if job.status != RUNNING or job.api_key_wrap is None:
-        return f"this API token's job is {job.status}; it works only while the job runs"
+        if job.status == QUEUED:
+            state = "hasn't started"
+        elif job.status in TERMINAL:
+            state = f"has finished ({job.status})"
+        else:
+            state = "is no longer running"
+        return f"this API token's job {state}; it works only while the job runs"
     deadline = job_deadline(job, deps)
     if deadline is not None and datetime.now(UTC) >= deadline:
         return "this API token's job has reached its deadline"
@@ -583,6 +589,17 @@ def _job_profile(body: JobIn, c: Caller, stored_github: bool) -> str | None:
     if stored_github:
         # Repo jobs use the stored credential as is: no token is minted, so a profile
         # would change nothing. Say so rather than pretend.
+        if api and body.repo:
+            # A child would get the caller's own credential, with whatever it can do on
+            # GitHub, where a child is meant to get a reader token by default.
+            raise HTTPException(
+                422,
+                f"the caller has a stored '{GITHUB_CREDENTIAL}' credential, so a repo job"
+                " queued with an operator job's API token would get that credential rather"
+                " than a reader (or other narrowed) token from Drella's GitHub App; such a"
+                " caller's API token can only queue jobs without a repo. Delete the"
+                " credential (DELETE /credentials/github) to use the App",
+            )
         if asked is not None and asked != c.token.github_profile:
             raise HTTPException(
                 422,
@@ -1035,49 +1052,56 @@ def _follow(
             yield f"[drella] {reason}\n".encode()
             return
         time.sleep(poll)
+    if stop is not None:
+        # Opened in _until's reader thread: runner.logs() can itself wait minutes for
+        # a pending pod, and the stop checks must go on meanwhile.
+        yield from _until(lambda: _log_source(deps, job_id, status, follow=True), stop, poll)
+        return
     try:
         source = _log_source(deps, job_id, status, follow=True)
     except HTTPException as e:
         yield f"[drella] {e.detail}\n".encode()
         return
-    if stop is None:
-        yield from source
-    else:
-        yield from _until(source, stop, poll)
+    yield from source
 
 
 _DONE = object()
 
 
 def _until(
-    source: Iterator[bytes], stop: Callable[[], str | None], poll: float
+    open_source: Callable[[], Iterator[bytes]],
+    stop: Callable[[], str | None],
+    poll: float,
+    maxsize: int = 16,
 ) -> Iterator[bytes]:
-    """Pass on `source`'s chunks until `stop` gives a reason, asking it every `poll`
-    seconds even while the source is silent. The source is read in a daemon thread, so
-    a blocked read can't hold the follow open; once stopped, that thread drops what it
-    reads and ends with the source (the followed pod's log, which ends with its job)."""
-    chunks: queue.Queue = queue.Queue(maxsize=16)
+    """Pass on the chunks of the source `open_source` returns until `stop` gives a
+    reason, asking it every `poll` seconds even while the source is silent or still
+    being opened. The source is opened and read in a daemon thread, so a blocked call
+    can't hold the follow open; once stopped, that thread drops what it reads and ends
+    with the source (the followed pod's log, which ends with its job)."""
+    chunks: queue.Queue = queue.Queue(maxsize=maxsize)
     stopped = threading.Event()
+
+    def put(item) -> None:
+        # Waits for room while anyone is still reading; gives up once the follow ended.
+        while not stopped.is_set():
+            try:
+                chunks.put(item, timeout=poll)
+                return
+            except queue.Full:
+                pass
 
     def pump() -> None:
         try:
-            for chunk in source:
-                while not stopped.is_set():
-                    try:
-                        chunks.put(chunk, timeout=poll)
-                        break
-                    except queue.Full:
-                        pass
+            for chunk in open_source():
+                put(chunk)
                 if stopped.is_set():
                     break
         except Exception as e:  # noqa: BLE001 - reported in the stream, like _follow
             detail = e.detail if isinstance(e, HTTPException) else "the log stream failed"
-            chunks.put(f"[drella] {detail}\n".encode())
+            put(f"[drella] {detail}\n".encode())
         finally:
-            try:
-                chunks.put(_DONE, timeout=poll)
-            except queue.Full:
-                pass
+            put(_DONE)
 
     threading.Thread(target=pump, daemon=True, name="drella-log-follow").start()
     last_check = time.monotonic()

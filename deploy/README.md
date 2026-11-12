@@ -253,7 +253,9 @@ job's token is minted, so changing it also changes the token's queued jobs: a jo
 `profile` of its own gets the new one, and a job whose `profile` the token's new profile
 no longer covers fails at launch rather than get more than the token now may. It only
 applies to App tokens: a caller's own `github` credential can do whatever it can do, so
-a caller that stored one can't set a `profile` other than its token's own (422).
+a caller that stored one can't set a `profile` other than its token's own (422), and an
+operator job's API token can't queue repo jobs for it (422), since they'd get the
+credential rather than a `reader` token.
 
 A profile only limits the tokens Drella mints from the App. If a Drella token stores its
 own `github` credential, that credential takes precedence: its jobs get whatever that
