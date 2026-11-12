@@ -65,6 +65,10 @@ BAD_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f"\\{}]')
 MAX_TOKENS = 10_000_000
 MAX_COST = 100_000
 MAX_USAGE_TOKENS = 10**13
+# The prompt reaches the pod as the env var DRELLA_PROMPT. Linux limits a single env
+# var or argument to 128 KiB (MAX_ARG_STRLEN); we cap at half that to leave room for
+# the rest of the command line and other env vars.
+MAX_PROMPT_BYTES = 64 * 1024
 
 
 # -- schemas -----------------------------------------------------------------
@@ -125,6 +129,14 @@ class JobIn(BaseModel):
     @classmethod
     def _no_null(cls, v):
         return _no_null(v)
+
+    @field_validator("prompt")
+    @classmethod
+    def _max_bytes(cls, v):
+        encoded = v.encode("utf-8")
+        if len(encoded) > MAX_PROMPT_BYTES:
+            raise ValueError(f"prompt must be at most {MAX_PROMPT_BYTES // 1024} KiB (byte limit)")
+        return v
 
     @field_validator("repo")
     @classmethod
