@@ -334,9 +334,13 @@ and operator tokens (#74). It never tags or deploys.
 
    It prints the token once. Its jobs get a short-lived API token (`DRELLA_API_TOKEN`) to
    read its jobs and queue review jobs with a read-only (`reader`) GitHub token, a limited
-   number per run; the token itself is never in the job. Don't store a `github` credential
-   on this token: Drella refuses `profile` on `POST /jobs` for a caller that has one, and
-   the run's review jobs need it.
+   number per run; the token itself is never in the job.
+
+   **The superstar token must not store a `github` credential.** If it has one, Drella
+   answers 422 to every job its API token queues with a `repo`, so no review job can be
+   queued (a child would otherwise get that credential instead of a read-only token). The
+   run job itself gets its GitHub token from the superstar App. If one was stored, delete
+   it: `curl -X DELETE -H "Authorization: Bearer $TOKEN" $DRELLA/credentials/github`.
 
 2. **Create a builder Drella token for its builds**, and store it on the superstar token
    as the credential `drella-builder`. Build, fix and update jobs need a GitHub token that

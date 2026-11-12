@@ -255,7 +255,9 @@ jq -n --rawfile prompt /tmp/review-N.txt --arg model MODEL \
 ```
 
 Your API token can queue only a limited number of jobs per run (429 when it's used up);
-leave the rest for the next run.
+leave the rest for the next run. If Drella answers 422 saying the caller has a stored
+`github` credential, no review can be queued this run: queue none, and say in the report
+that Kirk must delete that credential from the superstar token.
 
 The response has the job `id`. Build the prompt in `/tmp/review-N.txt` from the **review
 prompt template** at the end of this document, filling in the PR number, the head sha, and
@@ -621,11 +623,12 @@ for queued jobs, and do not start a second pass.
 ## Setup and accepted risk (for Kirk; not part of the routine)
 
 This run needs two Drella tokens (deploy/README.md, "Superstar"): the superstar token
-(`superstar` profile, `operator` role, no stored `github` credential), which the CronJob
-posts the run with, and a separate `builder` token, stored on the superstar token as its
+(`superstar` profile, `operator` role), which the CronJob posts the run with, and a separate `builder` token, stored on the superstar token as its
 credential `drella-builder` (`PUT /credentials/drella-builder` as the superstar token).
 Drella gives that credential to the run job, and only to it, as `DRELLA_BUILDER_TOKEN`.
-Each token has its own models. Accepted risk: the builder token is long-lived and is in the
+Each token has its own models. **The superstar token must not store a `github`
+credential**: if it does, Drella refuses (422) every repo job its API token queues, so no
+review can be queued. Accepted risk: the builder token is long-lived and is in the
 run's environment for the whole run, so a run steered by prompt injection could use it to
 queue builder jobs or leak it; rotate it if a run misbehaves. Jobs queued with the builder
 token aren't linked to the run in Drella (issue #82); the PR ledger is the link.
