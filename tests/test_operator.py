@@ -107,6 +107,7 @@ def test_the_api_token_queues_jobs_as_its_caller(client, op_auth, running, api_a
     assert secrets["github"] == "ghp_x" and secrets[LLM_KEY_SECRET] == "sk-llm"
     # A child gets no API token of its own: no fan-out beyond one level.
     assert API_TOKEN_KEY not in secrets
+    assert _row(app, child["id"]).api_token_hash is None
     # The caller sees it too, with its parent.
     got = client.get(f"/jobs/{child['id']}", headers=op_auth).json()
     assert got["parent_job_id"] == running["id"]
@@ -199,3 +200,36 @@ def test_the_child_limit_is_a_setting(client, running, api_auth, app):
     deps.settings = dataclasses.replace(deps.settings, operator_max_child_jobs=1)
     assert client.post("/jobs", json=JOB, headers=api_auth).status_code == 201
     assert client.post("/jobs", json=JOB, headers=api_auth).status_code == 429
+
+
+def _child(client, api_auth, **extra):
+    return client.post("/jobs", json={**JOB, **extra}, headers=api_auth)
+
+
+def test_a_child_defaults_to_the_reader_profile(client, running, api_auth, op_job, op_auth):
+    child = _child(client, api_auth).json()
+    assert child["github_profile"] == "reader"
+    assert client.get(f"/jobs/{child['id']}", headers=op_auth).json()["github_profile"] == "reader"
+    # Not its parent's: the operator token here is a builder, and its own job has none set.
+    assert op_job["github_profile"] is None
+
+
+@pytest.mark.parametrize("profile", ["superstar", "admin", "", "Builder", 1])
+def test_a_child_cant_ask_for_other_profiles(client, running, api_auth, profile):
+    assert _child(client, api_auth, profile=profile).status_code == 422
+
+
+def test_a_non_operator_caller_cant_send_a_profile(client, auth, op_auth):
+    _setup(client, auth)
+    for a in (auth, op_auth):  # a member, and an operator using its own token
+        r = _child(client, a, profile="reader")
+        assert r.status_code == 422 and "profile" in r.text
+
+
+def test_a_pr_child_needs_builder(client, running, api_auth):
+    r = _child(client, api_auth, pr=5)
+    assert r.status_code == 422 and "builder" in r.json()["detail"]
+    r = _child(client, api_auth, pr=5, profile="reader")
+    assert r.status_code == 422
+    r = _child(client, api_auth, pr=5, profile="builder")
+    assert r.status_code == 201 and r.json()["pr"] == 5

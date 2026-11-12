@@ -200,12 +200,14 @@ class Queue:
     def _mint_github_token(self, s: Session, job: Job, spec: JobSpec) -> JobSpec:
         """The job's GitHub token, minted at dispatch rather than at job creation: a
         queued job can wait longer than a token lasts (an hour). Its permissions are its
-        Drella token's GitHub profile, read now, so a profile an admin has narrowed
+        Drella token's GitHub profile (or the one its parent job chose), read now, so a profile an admin has narrowed
         applies to jobs still queued. It goes into the job's Secret where a caller's
         `github` credential would be, and never into the database. The job's deadline is
         capped at the token's expiry, so the token outlasts everything the job does."""
         token_row = s.get(Token, job.token_id)
-        profile = PROFILES.get(token_row.github_profile) if token_row else None
+        # A job queued with an operator job's API token has the profile its parent chose.
+        name = job.github_profile or (token_row.github_profile if token_row else None)
+        profile = PROFILES.get(name) if name else None
         if profile is None:
             raise RuntimeError("the job's Drella token has no known GitHub profile")
         app = self.github_apps.get(profile.app)

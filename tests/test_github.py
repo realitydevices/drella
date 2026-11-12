@@ -818,3 +818,33 @@ def test_a_superstar_token_is_checked_like_any_other(two_apps_client, superstar_
     got = two_apps_client.get(f"/jobs/{jid}", headers=superstar_auth).json()
     assert got["status"] == "failed"
     assert "granted more than the 'superstar' profile" in got["message"]
+
+
+def test_a_superstar_operators_children_get_the_profile_they_ask_for(
+    two_apps_client, superstar_settings, runner, github
+):
+    """Issue #74: a child never inherits the superstar profile; it's reader or builder."""
+    from drella.cli import create_token
+
+    op = create_token(superstar_settings, "sam", "superstar", role="operator")
+    auth = {"Authorization": f"Bearer {op}"}
+    c = two_apps_client
+    assert c.put("/models/local", json=LOCAL, headers=auth).status_code == 200
+    jid = c.post("/jobs", json=JOB, headers=auth).json()["id"]
+    c.queue.concurrency = 10
+    c.queue.tick()
+    api = {"Authorization": f"Bearer {runner.secrets[jid]['_api-token']}"}
+
+    reader = c.post("/jobs", json=JOB, headers=api).json()
+    builder = c.post("/jobs", json={**JOB, "profile": "builder"}, headers=api).json()
+    fix = c.post("/jobs", json={**JOB, "profile": "builder", "pr": 3}, headers=api)
+    assert fix.status_code == 201
+    assert c.post("/jobs", json={**JOB, "pr": 3}, headers=api).status_code == 422
+    c.queue.tick()
+    specs = {s.job_id: s for s in runner.launched}
+    assert specs[reader["id"]].opens_prs is False and specs[reader["id"]].read_only is True
+    assert specs[builder["id"]].opens_prs is True and specs[builder["id"]].read_only is False
+    assert specs[fix.json()["id"]].opens_prs is True
+    perms = [r[2]["permissions"] for r in github.requests if r[2]]
+    assert perms[-3:] == [READER.permissions, BUILDER.permissions, BUILDER.permissions]
+    assert github.issuers[-3:] == [APP_ID] * 3  # the builder App, never superstar's

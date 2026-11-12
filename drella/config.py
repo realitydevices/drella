@@ -22,6 +22,17 @@ class GitHubAppConfig:
     key_file: str
 
 
+def _max_child_jobs() -> int:
+    raw = os.environ.get("DRELLA_OPERATOR_MAX_CHILD_JOBS", "6")
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise ValueError(f"DRELLA_OPERATOR_MAX_CHILD_JOBS must be an integer >= 1, not {raw!r}")
+    return n
+
+
 def _github_apps_from_env() -> tuple[GitHubAppConfig, ...]:
     """The Apps configured by DRELLA_GITHUB_APP_<NAME>_ID, each with its key from
     DRELLA_GITHUB_APP_<NAME>_KEY_FILE or, by default, the Secret mounted at
@@ -100,9 +111,7 @@ class Settings:
     # it). The Apps together: drella/github.py's app_configs.
     github_apps: tuple[GitHubAppConfig, ...] = field(default_factory=_github_apps_from_env)
     # How many jobs an operator token's job may queue with its API token (issue #74).
-    operator_max_child_jobs: int = field(
-        default_factory=lambda: int(os.environ.get("DRELLA_OPERATOR_MAX_CHILD_JOBS", "6"))
-    )
+    operator_max_child_jobs: int = field(default_factory=lambda: _max_child_jobs())
     # Default limits [23].
     job_timeout_seconds: int = 3600
     job_memory: str = "2Gi"

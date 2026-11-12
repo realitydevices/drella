@@ -20,6 +20,7 @@ def upgrade() -> None:
         b.add_column(sa.Column("role", sa.String(16), nullable=False, server_default="member"))
     with op.batch_alter_table("jobs") as b:
         b.add_column(sa.Column("parent_job_id", sa.String(32), nullable=True))
+        b.add_column(sa.Column("github_profile", sa.String(32), nullable=True))
         b.add_column(sa.Column("api_token_hash", sa.String(64), nullable=True))
         b.add_column(sa.Column("api_key_wrap", sa.LargeBinary(), nullable=True))
         b.create_foreign_key(
@@ -38,6 +39,7 @@ def downgrade() -> None:
         b.drop_constraint("fk_jobs_parent_job_id", type_="foreignkey")
         b.drop_column("api_key_wrap")
         b.drop_column("api_token_hash")
+        b.drop_column("github_profile")
         b.drop_column("parent_job_id")
     with op.batch_alter_table("tokens") as b:
         b.drop_column("role")

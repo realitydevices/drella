@@ -74,3 +74,14 @@ def test_token_roles_are_set_only_by_the_cli(monkeypatch, tmp_path, capsys):
     capsys.readouterr()
     main(["token", "list"])
     assert capsys.readouterr().out == "1\treader\toperator\trita\n2\tsuperstar\tmember\tsuperstar\n"
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "abc", "", "1.5"])
+def test_the_child_job_limit_must_be_a_positive_integer(monkeypatch, raw):
+    from drella.config import Settings
+
+    monkeypatch.setenv("DRELLA_OPERATOR_MAX_CHILD_JOBS", raw)
+    with pytest.raises(ValueError, match="DRELLA_OPERATOR_MAX_CHILD_JOBS"):
+        Settings()
+    monkeypatch.setenv("DRELLA_OPERATOR_MAX_CHILD_JOBS", "3")
+    assert Settings().operator_max_child_jobs == 3

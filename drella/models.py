@@ -108,6 +108,9 @@ class Job(Base):
     parent_job_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # The GitHub profile of a job queued with an API token: reader or builder, chosen by
+    # its parent. Null for other jobs, which use their Drella token's profile.
+    github_profile: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # An operator token's job only: sha256 of its job-scoped API token (never the token)
     # and the caller's credential key, wrapped with a key derived from that API token, so
     # the job can create jobs that use the caller's credentials. The wrapped key is

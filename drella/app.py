@@ -128,6 +128,12 @@ class JobIn(BaseModel):
         " drella/ branch instead of opening a new PR. Needs `repo` and a builder token.",
     )
 
+    profile: Literal["reader", "builder"] | None = Field(
+        default=None,
+        description="Only for a job queued with an operator job's API token: the GitHub profile"
+        " of the new job's token, reader (the default) or builder. Other callers can't set it.",
+    )
+
     @model_validator(mode="after")
     def _pr_needs_repo(self):
         if self.pr is not None and not self.repo:
@@ -271,6 +277,9 @@ class JobOut(BaseModel):
     pr: int | None = None
     # The job that queued this one with its API token (issue #74), if any.
     parent_job_id: str | None = None
+    # The GitHub profile a job queued with an API token was given (issue #74); null for
+    # other jobs, which use their Drella token's profile.
+    github_profile: str | None = None
     model: JobModelOut
     message: str | None
     usage: UsageOut | None = None
@@ -341,6 +350,7 @@ def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
         repo=job.repo,
         pr=job.pr,
         parent_job_id=job.parent_job_id,
+        github_profile=job.github_profile,
         model=JobModelOut(
             alias=job.model,
             interface=job.interface,
@@ -623,6 +633,10 @@ def list_credentials(c: CallerDep, db: DbDep) -> list[str]:
 @router.post("/jobs", status_code=201)
 def create_job(body: JobIn, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     parent = c.parent_job
+    if parent is None and body.profile is not None:
+        raise HTTPException(
+            422, "`profile` can be set only by an operator job, with its API token"
+        )
     if parent is not None:
         # An operator job queues jobs as its caller, up to a limit per run. On Postgres
         # the parent's row lock serialises its creates, so the count can't be raced
@@ -652,13 +666,20 @@ def create_job(body: JobIn, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOu
             f"model '{model.alias}' no longer passes validation; register it again"
             " (PUT /models)",
         ) from None
+    # A job queued with an API token gets a reader token unless it asks for builder: never
+    # its parent's profile (a supervisor's may write and open no PRs).
+    child_profile = (body.profile or "reader") if parent is not None else None
     if body.pr is not None:
-        profile = PROFILES.get(c.token.github_profile)
+        profile = PROFILES.get(child_profile or c.token.github_profile)
         if profile is None or not profile.opens_prs:
             raise HTTPException(
                 422,
-                "`pr` needs a Drella token whose GitHub profile can push branches and open PRs"
-                " (builder); this token's profile can't",
+                "`pr` needs a GitHub profile that can push branches and open PRs (builder); "
+                + (
+                    f"this job would get '{child_profile}' (set `profile` to builder)"
+                    if child_profile
+                    else "this Drella token's profile can't"
+                ),
             )
     creds = {
         cred.name: cred
@@ -733,6 +754,7 @@ def create_job(body: JobIn, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOu
         job_token_hash=crypto.lookup_hash(job_token),
         github_app=github_app,
         parent_job_id=parent.id if parent is not None else None,
+        github_profile=child_profile,
         api_token_hash=crypto.lookup_hash(api_token) if api_token else None,
         api_key_wrap=crypto.wrap_key(api_token, c.cred_key) if api_token else None,
     )

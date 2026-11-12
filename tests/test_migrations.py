@@ -283,9 +283,9 @@ def test_0008_adds_roles_parent_jobs_and_api_tokens_and_downgrades(settings):
         # Existing tokens are members; existing jobs have no parent and no API token.
         assert conn.execute(text("SELECT role FROM tokens")).scalar() == "member"
         row = conn.execute(
-            text("SELECT parent_job_id, api_token_hash, api_key_wrap FROM jobs")
+            text("SELECT parent_job_id, api_token_hash, api_key_wrap, github_profile FROM jobs")
         ).one()
-        assert tuple(row) == (None, None, None)
+        assert tuple(row) == (None, None, None, None)
     _insert_v02_job(engine, "j2", "running")
     with engine.begin() as conn:
         conn.execute(text("UPDATE tokens SET role = 'operator'"))
@@ -298,7 +298,8 @@ def test_0008_adds_roles_parent_jobs_and_api_tokens_and_downgrades(settings):
     with engine.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM jobs")).scalar() == 2
         for col, table in (("role", "tokens"), ("parent_job_id", "jobs"),
-                           ("api_token_hash", "jobs"), ("api_key_wrap", "jobs")):
+                           ("api_token_hash", "jobs"), ("api_key_wrap", "jobs"),
+                           ("github_profile", "jobs")):
             with pytest.raises(Exception):
                 conn.execute(text(f"SELECT {col} FROM {table}"))
             conn.rollback()

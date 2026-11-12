@@ -97,8 +97,8 @@ api() {
 # Replace the job's secrets (the model's API key, the GitHub token, the job token and an
 # operator job's API token) with [redacted] in a stream, line by line. The agent can read
 # them all from its environment; this keeps them out of the transcript, the session
-# record and the archived log if it prints them. Best effort: a secret split across lines, or encoded, gets through, and
-# so does anything the agent writes to other files in /out, sends to the Drella API
+# record and the archived log if it prints them. Best effort: a secret split across
+# lines, or encoded, gets through, and so does anything the agent writes to other files in /out, sends to the Drella API
 # with the job token, or writes straight to the pod's log (docs/v0.2.md#security).
 # Values come from ENVIRON and are matched as fixed strings, so any character is safe.
 # A single huge line full of secrets is slow to filter (each match copies the rest of
@@ -401,7 +401,7 @@ fi
 # An operator token's job (issue #74) can queue and read its caller's jobs with its own
 # job-scoped API token.
 if [ -n "${DRELLA_API_TOKEN:-}" ]; then
-  STANDING+=$'\n'"- You can create and read Drella jobs as the caller who queued you, with the Drella API at \$DRELLA_API_URL and \$DRELLA_API_TOKEN as a bearer token: POST /jobs, GET /jobs, GET /jobs/{id}, GET /jobs/{id}/logs and GET /jobs/{id}/outputs/{name}. It works only until this job ends, and only for a limited number of new jobs. Never print it."
+  STANDING+=$'\n'"- You can create and read Drella jobs as the caller who queued you, with the Drella API at \$DRELLA_API_URL and \$DRELLA_API_TOKEN as a bearer token: POST /jobs, GET /jobs, GET /jobs/{id}, GET /jobs/{id}/logs and GET /jobs/{id}/outputs/{name}. A job you queue gets a read-only GitHub token unless you pass \"profile\": \"builder\" in the POST /jobs body (needed for a job that opens a PR or has \"pr\"). The token works only until this job ends, and only for a limited number of new jobs. Never print it."
 fi
 
 # The message starts with a fixed line, so a prompt beginning with "-" can't be
