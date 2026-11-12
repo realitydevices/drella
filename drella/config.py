@@ -35,7 +35,9 @@ def _github_apps_from_env() -> tuple[GitHubAppConfig, ...]:
         elif m := _APP_KEY_VAR.match(var):
             keys[m.group(1)] = value.strip()
     for name in sorted(set(keys) - set(ids)):
-        raise ValueError(f"DRELLA_GITHUB_APP_{name}_KEY_FILE is set, but not DRELLA_GITHUB_APP_{name}_ID")
+        raise ValueError(
+            f"DRELLA_GITHUB_APP_{name}_KEY_FILE is set, but not DRELLA_GITHUB_APP_{name}_ID"
+        )
     apps = []
     for var in sorted(ids):
         if not ids[var]:

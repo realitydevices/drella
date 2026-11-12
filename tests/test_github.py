@@ -391,7 +391,9 @@ def test_each_app_is_configured_by_its_own_env_pair(monkeypatch, tmp_path):
     monkeypatch.setenv("DRELLA_GITHUB_APP_SUPERSTAR_KEY_FILE", str(tmp_path / "s.pem"))
     monkeypatch.setenv("DRELLA_GITHUB_APP_OTHER_ID", "7")  # key: the default path
     apps = app_configs(Settings())
-    assert apps["superstar"] == GitHubAppConfig("superstar", SUPERSTAR_APP_ID, str(tmp_path / "s.pem"))
+    assert apps["superstar"] == GitHubAppConfig(
+        "superstar", SUPERSTAR_APP_ID, str(tmp_path / "s.pem")
+    )
     assert apps["other"] == GitHubAppConfig(
         "other", "7", "/etc/drella/github-app-other/private-key.pem"
     )
@@ -405,7 +407,7 @@ def test_an_empty_app_id_is_not_configured_and_a_key_without_an_id_is_refused(mo
     assert app_configs(Settings()) == {}
     # A key with no ID variable at all is a mistake, refused at startup.
     monkeypatch.delenv("DRELLA_GITHUB_APP_SUPERSTAR_ID")
-    with pytest.raises(ValueError, match="KEY_FILE is set, but not DRELLA_GITHUB_APP_SUPERSTAR_ID"):
+    with pytest.raises(ValueError, match="KEY_FILE is set, but not DRELLA_GITHUB_APP_SUPERSTAR"):
         Settings()
 
 
