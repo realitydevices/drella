@@ -513,7 +513,8 @@ def test_a_reader_tokens_job_gets_a_read_only_token_and_opens_no_pr(
 
 
 def test_a_caller_cannot_choose_the_jobs_github_access(app_client, reader_auth, github):
-    # Not per job: the request can't name a profile or permissions.
+    # The request can't name permissions, nor a profile wider than its token's (a reader
+    # here; narrowing is covered below).
     for extra in (
         {"github_profile": "builder"},
         {"github_profile": "superstar"},
@@ -534,7 +535,7 @@ def test_the_profile_is_read_when_the_job_launches(app_client, app_auth, app_set
     from drella.cli import list_tokens, set_profile
 
     app_client.post("/jobs", json=JOB, headers=app_auth)
-    ((tid, name, profile),) = list_tokens(app_settings)
+    ((tid, name, profile, _role),) = list_tokens(app_settings)
     assert (name, profile) == ("alice", "builder")
     set_profile(app_settings, tid, "reader")
     app_client.queue.tick()
@@ -885,6 +886,36 @@ def test_a_superstar_token_is_checked_like_any_other(two_apps_client, superstar_
     assert "granted more than the 'superstar' profile" in got["message"]
 
 
+def test_a_superstar_operators_children_get_the_profile_they_ask_for(
+    two_apps_client, superstar_settings, runner, github
+):
+    """Issue #74: a child never inherits the superstar profile; it's reader or builder."""
+    from drella.cli import create_token
+
+    op = create_token(superstar_settings, "sam", "superstar", role="operator")
+    auth = {"Authorization": f"Bearer {op}"}
+    c = two_apps_client
+    assert c.put("/models/local", json=LOCAL, headers=auth).status_code == 200
+    jid = c.post("/jobs", json=JOB, headers=auth).json()["id"]
+    c.queue.concurrency = 10
+    c.queue.tick()
+    api = {"Authorization": f"Bearer {runner.secrets[jid]['_api-token']}"}
+
+    reader = c.post("/jobs", json=JOB, headers=api).json()
+    builder = c.post("/jobs", json={**JOB, "profile": "builder"}, headers=api).json()
+    fix = c.post("/jobs", json={**JOB, "profile": "builder", "pr": 3}, headers=api)
+    assert fix.status_code == 201
+    assert c.post("/jobs", json={**JOB, "pr": 3}, headers=api).status_code == 422
+    c.queue.tick()
+    specs = {s.job_id: s for s in runner.launched}
+    assert specs[reader["id"]].opens_prs is False and specs[reader["id"]].read_only is True
+    assert specs[builder["id"]].opens_prs is True and specs[builder["id"]].read_only is False
+    assert specs[fix.json()["id"]].opens_prs is True
+    perms = [r[2]["permissions"] for r in github.requests if r[2]]
+    assert perms[-3:] == [READER.permissions, BUILDER.permissions, BUILDER.permissions]
+    assert github.issuers[-3:] == [APP_ID] * 3  # the builder App, never superstar's
+
+
 def test_a_transient_launch_error_re_mints_a_superstar_token_from_its_own_app(
     two_apps_client, superstar_auth, runner, github
 ):
@@ -902,3 +933,160 @@ def test_a_transient_launch_error_re_mints_a_superstar_token_from_its_own_app(
     (spec,) = runner.launched
     assert spec.opens_prs is False
     assert two_apps_client.get(f"/jobs/{jid}", headers=superstar_auth).json()["status"] == "running"
+
+
+# -- a job's own profile (`profile` on POST /jobs, issue #74) ----------------------
+
+
+def _token_id(settings, name):
+    from drella.cli import list_tokens
+
+    return next(t[0] for t in list_tokens(settings) if t[1] == name)
+
+
+def _auth_for(c, settings, name, profile, role="member"):
+    from drella.cli import create_token
+
+    auth = {"Authorization": f"Bearer {create_token(settings, name, profile, role=role)}"}
+    assert c.put("/models/local", json=LOCAL, headers=auth).status_code == 200
+    return auth
+
+
+def _running_api_auth(c, runner, auth):
+    """Queue and launch an operator token's job; its API token's bearer header."""
+    jid = c.post("/jobs", json=JOB, headers=auth).json()["id"]
+    c.queue.concurrency = 10
+    c.queue.tick()
+    assert c.get(f"/jobs/{jid}", headers=auth).json()["status"] == "running"
+    return {"Authorization": f"Bearer {runner.secrets[jid]['_api-token']}"}
+
+
+def test_a_builder_token_may_queue_a_reader_job_and_it_mints_read_only(
+    app_client, app_auth, runner, github
+):
+    r = app_client.post("/jobs", json={**JOB, "profile": "reader"}, headers=app_auth)
+    assert r.status_code == 201, r.text
+    assert r.json()["github_profile"] == "reader" and r.json()["parent_job_id"] is None
+    app_client.queue.tick()
+    assert github.requests[-1][2] == {
+        "repositories": ["widgets"],
+        "permissions": {"contents": "read", "pull_requests": "read", "issues": "read"},
+    }
+    (spec,) = runner.launched
+    assert spec.read_only is True and spec.opens_prs is False
+    assert runner.secrets[r.json()["id"]]["github"] == "ghs_minted0001"
+
+
+def test_a_wider_profile_is_refused(app_client, app_auth, reader_auth, github):
+    for auth, profile, own in ((reader_auth, "builder", "reader"), (app_auth, "superstar", "builder")):
+        r = app_client.post("/jobs", json={**JOB, "profile": profile}, headers=auth)
+        assert r.status_code == 422, (profile, r.text)
+        assert "wider" in r.json()["detail"] and f"'{own}'" in r.json()["detail"]
+    # Its own profile is fine.
+    assert app_client.post("/jobs", json={**JOB, "profile": "reader"}, headers=reader_auth).status_code == 201
+    assert github.requests == []
+
+
+def test_a_superstar_token_may_queue_builder_and_reader_jobs(
+    two_apps_client, superstar_settings, superstar_auth, runner, github
+):
+    c = two_apps_client
+    c.queue.concurrency = 10
+    ids = [
+        c.post("/jobs", json={**JOB, "profile": p}, headers=superstar_auth).json()["id"]
+        for p in ("builder", "reader", "superstar")
+    ]
+    c.queue.tick()
+    perms = [r[2]["permissions"] for r in github.requests if r[2]]
+    assert perms == [BUILDER.permissions, READER.permissions, SUPERSTAR.permissions]
+    assert github.issuers == [APP_ID] * 4 + [SUPERSTAR_APP_ID] * 2  # two calls per mint
+    specs = {s.job_id: s for s in runner.launched}
+    assert specs[ids[0]].opens_prs is True and specs[ids[1]].read_only is True
+
+
+def test_an_api_token_child_is_never_superstar(two_apps_client, superstar_settings, runner):
+    c = two_apps_client
+    op = _auth_for(c, superstar_settings, "sam", "superstar", role="operator")
+    api = _running_api_auth(c, runner, op)
+    r = c.post("/jobs", json={**JOB, "profile": "superstar"}, headers=api)
+    assert r.status_code == 422 and "superstar" in r.json()["detail"]
+    # The operator itself, with its own token, may.
+    assert c.post("/jobs", json={**JOB, "profile": "superstar"}, headers=op).status_code == 201
+
+
+def test_a_reader_operators_children_cant_be_builders(app_client, app_settings, runner, github):
+    op = _auth_for(app_client, app_settings, "rob", "reader", role="operator")
+    api = _running_api_auth(app_client, runner, op)
+    r = app_client.post("/jobs", json={**JOB, "profile": "builder"}, headers=api)
+    assert r.status_code == 422 and "wider" in r.json()["detail"]
+    r = app_client.post("/jobs", json={**JOB, "pr": 3, "profile": "builder"}, headers=api)
+    assert r.status_code == 422
+    child = app_client.post("/jobs", json=JOB, headers=api).json()
+    assert child["github_profile"] == "reader"
+
+
+def test_a_job_whose_profile_its_token_no_longer_covers_fails_at_mint(
+    app_client, app_auth, app_settings, runner, github
+):
+    from drella.cli import set_profile
+
+    asked = app_client.post("/jobs", json={**JOB, "profile": "builder"}, headers=app_auth).json()
+    own = app_client.post("/jobs", json=JOB, headers=app_auth).json()
+    set_profile(app_settings, _token_id(app_settings, "alice"), "reader")
+    app_client.queue.concurrency = 10
+    app_client.queue.tick()
+    got = app_client.get(f"/jobs/{asked['id']}", headers=app_auth).json()
+    assert got["status"] == "failed"
+    assert "'builder'" in got["message"] and "no longer covers" in got["message"]
+    # The job without a profile of its own just follows the token, narrowed.
+    assert [r[2]["permissions"] for r in github.requests if r[2]] == [READER.permissions]
+    assert [s.job_id for s in runner.launched] == [own["id"]]
+
+
+def test_a_child_whose_profile_its_operator_no_longer_covers_fails_at_mint(
+    app_client, app_settings, runner, github
+):
+    from drella.cli import set_profile
+
+    op = _auth_for(app_client, app_settings, "bob", "builder", role="operator")
+    api = _running_api_auth(app_client, runner, op)
+    builder = app_client.post("/jobs", json={**JOB, "profile": "builder"}, headers=api).json()
+    reader = app_client.post("/jobs", json=JOB, headers=api).json()
+    set_profile(app_settings, _token_id(app_settings, "bob"), "reader")
+    app_client.queue.tick()
+    assert app_client.get(f"/jobs/{builder['id']}", headers=op).json()["status"] == "failed"
+    assert app_client.get(f"/jobs/{reader['id']}", headers=op).json()["status"] == "running"
+    assert github.requests[-1][2]["permissions"] == READER.permissions
+
+
+def test_a_launch_retry_checks_the_profile_again(app_client, app_auth, app_settings, runner, github):
+    from drella.cli import set_profile
+
+    jid = app_client.post("/jobs", json={**JOB, "profile": "builder"}, headers=app_auth).json()["id"]
+    runner.launch_errors = [_api_error(503)]
+    app_client.queue.tick()
+    assert runner.reset == [jid] and github.minted == 1
+    set_profile(app_settings, _token_id(app_settings, "alice"), "reader")
+    _backoff_over(app_client.queue, jid)
+    app_client.queue.tick()
+    got = app_client.get(f"/jobs/{jid}", headers=app_auth).json()
+    assert got["status"] == "failed" and "no longer covers" in got["message"]
+    assert github.minted == 1 and runner.launched == []
+
+
+def test_a_launch_retry_keeps_the_operators_builder_token(app_client, app_settings, runner, github):
+    from drella.runner import BUILDER_TOKEN_KEY
+
+    op = _auth_for(app_client, app_settings, "bob", "builder", role="operator")
+    app_client.put("/credentials/drella-builder", json={"value": "drt_builderbuilder"}, headers=op)
+    jid = app_client.post("/jobs", json=JOB, headers=op).json()["id"]
+    runner.launch_errors = [_api_error(503)]
+    app_client.queue.tick()
+    assert "github" not in runner.secrets[jid]
+    assert runner.secrets[jid][BUILDER_TOKEN_KEY] == "drt_builderbuilder"
+    _backoff_over(app_client.queue, jid)
+    app_client.queue.tick()
+    (spec,) = runner.launched
+    assert spec.api_token is True
+    assert runner.secrets[jid][BUILDER_TOKEN_KEY] == "drt_builderbuilder"
+    assert runner.secrets[jid]["github"] == "ghs_minted0002"

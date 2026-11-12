@@ -43,3 +43,13 @@ def test_database_holds_neither_token_nor_plaintext(client, settings, token, aut
     assert token not in dump
     assert "ghp_secret" not in dump
     assert crypto.lookup_hash(token) in dump
+
+
+def test_a_wrapped_credential_key_opens_only_with_its_api_token():
+    token, salt = crypto.new_token(), crypto.new_salt()
+    ciphertext = crypto.encrypt(token, salt, "ghp_secret")
+    api = crypto.new_token(crypto.API_TOKEN_PREFIX)
+    wrapped = crypto.wrap_key(api, crypto.credential_key(token, salt))
+    assert crypto.decrypt_with_key(crypto.unwrap_key(api, wrapped), ciphertext) == "ghp_secret"
+    with pytest.raises(Exception):
+        crypto.unwrap_key(crypto.new_token(crypto.API_TOKEN_PREFIX), wrapped)
