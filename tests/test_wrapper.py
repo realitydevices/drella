@@ -155,8 +155,19 @@ def test_a_read_only_repo_job_writes_results_instead_of_a_pr():
     # agent is told so, the job succeeds on its outputs, and auto-merge isn't touched.
     assert '[ "${DRELLA_REPO_READ_ONLY:-}" = 1 ] && READ_ONLY=1' in WRAPPER
     assert "Your GitHub access is read-only" in WRAPPER
-    assert 'if [ -n "$REPO" ] && [ -z "$READ_ONLY" ]; then' in WRAPPER
-    assert 'elif [ -z "$REPO" ] || [ -n "$READ_ONLY" ]; then' in WRAPPER
+    assert 'if [ -n "$REPO" ] && [ -z "$REPORT" ]; then' in WRAPPER
+    assert 'elif [ -z "$REPO" ] || [ -n "$REPORT" ]; then' in WRAPPER
+
+
+def test_a_report_job_can_write_to_github_but_succeeds_on_its_report():
+    # superstar (issue #73): its token can write, so the standing instructions don't say
+    # it's read-only, but its outcome is its report, as for a reader: no PR is looked for,
+    # and the job succeeds on the files it wrote to /out.
+    assert '[ -n "$READ_ONLY" ] || [ "${DRELLA_REPO_REPORT:-}" = 1 ]' in WRAPPER
+    assert 'elif [ -n "$REPORT" ]; then' in WRAPPER
+    assert "Your result is a report: write it as files in $OUT." in WRAPPER
+    report_branch = WRAPPER.split('elif [ -n "$REPORT" ]; then', 1)[1].split("elif [ -n", 1)[0]
+    assert "Your GitHub access is read-only" not in report_branch
 
 
 def test_the_wrapper_never_asks_drella_for_another_github_token():

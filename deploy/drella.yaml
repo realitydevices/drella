@@ -101,6 +101,16 @@ spec:
                   optional: true
             - name: DRELLA_GITHUB_APP_KEY_FILE
               value: /etc/drella/github-app/private-key.pem
+            # A second GitHub App, for the superstar profile (issue #73), from the optional
+            # drella-github-app-superstar Secret. Its key is mounted below at the default
+            # path, /etc/drella/github-app-superstar/private-key.pem. Without the Secret the
+            # App isn't configured, and a superstar job fails at launch.
+            - name: DRELLA_GITHUB_APP_SUPERSTAR_ID
+              valueFrom:
+                secretKeyRef:
+                  name: drella-github-app-superstar
+                  key: app-id
+                  optional: true
           ports:
             - name: http
               containerPort: 8000
@@ -128,6 +138,9 @@ spec:
             - name: github-app
               mountPath: /etc/drella/github-app
               readOnly: true
+            - name: github-app-superstar
+              mountPath: /etc/drella/github-app-superstar
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -140,6 +153,14 @@ spec:
               - key: private-key.pem
                 path: private-key.pem
             # Readable by Drella (fsGroup 1000) only.
+            defaultMode: 0440
+        - name: github-app-superstar
+          secret:
+            secretName: drella-github-app-superstar
+            optional: true
+            items:
+              - key: private-key.pem
+                path: private-key.pem
             defaultMode: 0440
 ---
 apiVersion: v1
