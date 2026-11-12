@@ -33,6 +33,8 @@ class JobSpec:
     # When the job's GitHub App token expires (epoch seconds), if it has one. The job's
     # deadline is capped at it, so the token outlasts everything the wrapper does.
     github_token_expires: float | None = None
+    # An existing PR in `repo` for the job to push fixes to, instead of opening a new one.
+    pr: int | None = None
 
 
 class RunState(StrEnum):
@@ -233,6 +235,8 @@ class KubernetesRunner:
             env["DRELLA_REPO"] = spec.repo
             if not spec.opens_prs:
                 env["DRELLA_REPO_READ_ONLY"] = "1"
+            if spec.pr is not None:
+                env["DRELLA_PR"] = str(spec.pr)
         # The soft limit: the wrapper stops the agent this long before the hard limit
         # (activeDeadlineSeconds), which runs from roughly now. The wrapper finishes
         # everything (PR check, auto-merge, report) before DRELLA_DEADLINE, so capping it

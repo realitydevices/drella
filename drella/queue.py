@@ -204,7 +204,7 @@ class Queue:
 
     def _launch(self, s: Session, job: Job) -> bool:
         """Launch the job. False if it stays queued to be retried later."""
-        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt)
+        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt, pr=job.pr)
         try:
             if job.github_app and job.repo:
                 spec = self._mint_github_token(s, job, spec)

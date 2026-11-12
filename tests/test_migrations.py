@@ -255,20 +255,38 @@ def test_0006_adds_nullable_usage_columns_and_downgrades(settings):
     engine.dispose()
 
 
-def test_0007_adds_launch_retry_columns_and_downgrades(settings):
+def test_0008_adds_launch_retry_columns_and_downgrades(settings):
     engine = make_engine(settings.database_url)
-    _upgrade(engine, "0006")
+    _upgrade(engine, "0007")
     _seed_token(engine)
     _insert_v02_job(engine, "j1", "queued")
-    _upgrade(engine, "0007")
+    _upgrade(engine, "0008")
     with engine.begin() as conn:
         row = conn.execute(text("SELECT launch_attempts, not_before FROM jobs")).one()
         assert tuple(row) == (0, None)
         conn.execute(text("UPDATE jobs SET launch_attempts = 2, not_before = :t"),
                      {"t": datetime.now(UTC)})
-    _downgrade(engine, "0006")
+    _downgrade(engine, "0007")
     with engine.connect() as conn:
         assert conn.execute(text("SELECT id FROM jobs")).scalar() == "j1"
         with pytest.raises(Exception):
             conn.execute(text("SELECT not_before FROM jobs"))
+    engine.dispose()
+
+
+def test_0007_adds_nullable_pr_column_and_downgrades(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "0006")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "succeeded")
+    _upgrade(engine, "0007")
+    with engine.begin() as conn:
+        assert conn.execute(text("SELECT pr FROM jobs")).scalar() is None
+        conn.execute(text("UPDATE jobs SET pr = 58"))
+        assert conn.execute(text("SELECT pr FROM jobs")).scalar() == 58
+    _downgrade(engine, "0006")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT id FROM jobs")).scalar() == "j1"
+        with pytest.raises(Exception):
+            conn.execute(text("SELECT pr FROM jobs"))
     engine.dispose()

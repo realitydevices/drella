@@ -181,3 +181,34 @@ def test_wrapper_retries_the_status_without_usage():
 
 def test_usage_is_parsed_after_the_pr_lookup():
     assert WRAPPER.index("gh pr list") < WRAPPER.index("usage-claude-code.jq") < WRAPPER.index("# -- 5. report")
+
+
+# -- fixing an existing PR (issue #58) ------------------------------------------------
+
+
+def test_fix_pr_only_touches_drella_branches_of_open_same_repo_prs():
+    assert "--json state,headRefName,headRepositoryOwner,isCrossRepository" in WRAPPER
+    assert '[ "$state" = OPEN ]' in WRAPPER
+    assert '[ "$cross" = false ]' in WRAPPER
+    assert "drella/*) ;;" in WRAPPER
+    assert '"$PR_BRANCH" = "$DEFAULT_BRANCH"' in WRAPPER and '"$PR_BRANCH" = main' in WRAPPER
+
+
+def test_fix_pr_pushes_with_force_with_lease_and_never_plain_force():
+    assert "git push --force-with-lease origin $PR_BRANCH" in WRAPPER
+    assert "--force " not in WRAPPER.replace("--force-with-lease", "")
+    assert "Do not open a new pull request." in WRAPPER
+
+
+def test_fix_pr_rebases_then_merges_then_leaves_the_branch():
+    assert 'git rebase "origin/$DEFAULT_BRANCH"' in WRAPPER
+    assert "git rebase --abort" in WRAPPER
+    assert 'git merge --no-edit "origin/$DEFAULT_BRANCH"' in WRAPPER
+    assert "git merge --abort" in WRAPPER
+
+
+def test_fix_pr_succeeds_when_the_remote_head_moves_and_comments_without_failing():
+    assert 'git ls-remote origin "refs/heads/$PR_BRANCH"' in WRAPPER
+    assert '"$remote_head" != "$PR_HEAD"' in WRAPPER
+    assert "Updated by Drella job $DRELLA_JOB_ID." in WRAPPER
+    assert "couldn't comment on PR" in WRAPPER
