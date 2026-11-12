@@ -315,6 +315,17 @@ from the default branch.
    has approved and `pytest` has passed, and a new push dismisses the approval. Without
    a required review, auto-merge has nothing to wait for, and a job's PR can merge with
    no human looking at it.
+5. **Only if you run the superstar** (below): it merges PRs that no code owner has
+   approved, so it must be allowed past the `main` rules. Those rules must then be a
+   **ruleset** (Rules → Rulesets → the branch ruleset targeting `main`, with the settings
+   in step 1), since a classic branch protection rule can't name an App as a bypass
+   actor. Add the **drella-superstar** App to that ruleset's bypass list with the mode
+   **For pull requests only**: it can then merge a PR with `gh pr merge --admin` without
+   the code-owner review or the required checks, but can't push to `main` directly. This
+   makes the superstar's own merge rule (two approving reviews from different models on
+   the PR's head, a green `pytest` check it checks itself, no open medium-or-worse
+   finding, never a change to `docs/superstar.md`) the only gate on the PRs it merges.
+   That's your decision (#75). Never add drella-bot to the bypass list.
 
 ## Superstar (optional)
 
@@ -360,6 +371,9 @@ and operator tokens (#74). It never tags or deploys.
    **Accepted risk:** unlike the API token, the builder token is long-lived and is in the
    run's environment for the whole run, so anything the run's agent reads (prompt
    injection in an issue, PR or review) could steer it to queue builder jobs, or leak it.
+   The run's own API token can't queue builder jobs: Drella gives a job queued with an API
+   token only the `reader` profile (from the `drella/jobs-status-filter` PR, part of #75),
+   and the run never checks out or runs PR code itself.
    Keep the builder token's models narrow, and rotate it (`drella token create`, store the
    new one, delete the old) if a run ever misbehaves. Builder jobs and the run aren't
    linked in Drella (issue #82); the PR ledger comment is the link.
@@ -378,11 +392,21 @@ and operator tokens (#74). It never tags or deploys.
    kubectl -n drella create secret generic superstar-token --from-literal=token=<the token>
    ```
 
-5. **Enable the CronJob** in an overlay (the commented example at the top of
-   `deploy/superstar-cronjob.yaml`): add `superstar-cronjob.yaml` to `resources`, and a
-   `configMapGenerator` entry named `superstar-prompt` with `superstar.md=docs/superstar.md`.
-   The CronJob (`concurrencyPolicy: Forbid`) posts the job, and skips the run if a
-   superstar job is still queued or running. Run it once by hand to try it:
+5. **Enable the CronJob.** From the repo root, create the `superstar-prompt` ConfigMap
+   from `docs/superstar.md` and apply the CronJob (it isn't in the default
+   kustomization, and kustomize won't read `docs/` from an overlay):
+
+   ```sh
+   kubectl -n drella create configmap superstar-prompt \
+     --from-file=superstar.md=docs/superstar.md --dry-run=client -o yaml | kubectl apply -f -
+   kubectl apply -f deploy/superstar-cronjob.yaml
+   ```
+
+   Run the first command again whenever `docs/superstar.md` changes on `main`. The CronJob
+   (`concurrencyPolicy: Forbid`) asks Drella for its queued and running jobs
+   (`GET /jobs?status=queued,running`, from the `drella/jobs-status-filter` PR, part of #75:
+   deploy a Drella with it first), skips the run if a superstar job is among them, and
+   otherwise posts the job. Run it once by hand to try it:
    `kubectl -n drella create job --from=cronjob/superstar superstar-try`.
 
 6. **Hand it work with the `superstar` label.** GitHub Apps can't be assigned issues, so
@@ -397,12 +421,14 @@ even when your comment says to merge. Tagging and deploying stay with you.
 
 It merges with `gh pr merge --admin --match-head-commit <sha>`. The `--admin` is required:
 GitHub only uses the App's ruleset bypass when the merge passes `--admin`, and without it the
-merge is refused. So the superstar App needs the bypass described under **Approvals and branch
+merge is refused. So the superstar App needs the bypass in step 5 of **Approvals and branch
 protection**.
 
 The run job itself takes its token's `superstar` profile (the CronJob sets no `profile`).
-Its review jobs run with the `reader` profile (a read-only GitHub token, because reviewers
-run the PR's code), and its build, fix and update jobs are ordinary jobs of the builder
+The run itself never checks out or runs PR code: it holds the App token, the builder token
+and its API token, so it only reads code, and queues a reader verify job when something has
+to be run. Its review and verify jobs run with the `reader` profile (a read-only GitHub
+token, because they run the PR's code), and its build, fix and update jobs are ordinary jobs of the builder
 token, so no child job ever gets the `superstar` profile. It only touches PRs from this
 repo (not forks) opened by `drella-bot`, and checks that again just before merging: a fork
 can name its branch `drella/...` too.

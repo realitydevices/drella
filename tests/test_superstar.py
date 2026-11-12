@@ -55,13 +55,18 @@ def test_every_pr_selection_checks_it_is_ours_and_not_a_fork():
     for cmd in lists:
         assert "isCrossRepository" in cmd and "author" in cmd, cmd
         assert OWNERSHIP in cmd, cmd
-    views = [c for c in _commands(text, "gh pr view N") if "statusCheckRollup,headRefOid" not in c]
+    # (Not the CI check or the merge subject: they read a PR already chosen.)
+    views = [
+        c for c in _commands(text, "gh pr view N")
+        if "statusCheckRollup,headRefOid" not in c and "--json title,number" not in c
+    ]
     assert views
     for cmd in views:
         assert "isCrossRepository" in cmd and "author" in cmd, cmd
     # The check is repeated right before the merge, with isDraft fetched where it's used.
     merge_at = text.index("gh pr merge N --repo")
-    recheck = text.rindex("gh pr view N", 0, merge_at)
+    recheck = text.index("gh pr view N", text.index("**Immediately before merging**"))
+    assert recheck < merge_at
     block = text[recheck:merge_at]
     assert "isDraft" in block and '.isDraft==false' in block
     assert '.isCrossRepository==false and .author.login=="app/drella-bot"' in block
@@ -98,15 +103,35 @@ def test_the_prompt_change_check_pages_through_all_files():
         assert "files" not in fields, cmd
 
 
-def test_reviews_dont_stall_and_are_bounded():
+def test_the_review_rule_always_leads_somewhere():
+    """Each rule that holds reviews back names what happens instead: a verify job, a fix,
+    a fresh review, or needs-kirk. Text checks, since the prompt is prose."""
     text = (ROOT / "docs" / "superstar.md").read_text()
-    assert "approvals + in flight < 2" in text
-    assert "has reached 4 for this head" in text
+    reviews = text[text.index("### 2e. Reviews on the current head") : text.index("### 2f. Fix")]
+    assert "approvals + in flight < 2" in reviews
+    assert "has reached 4 for this head" in reviews and "needs-kirk" in reviews
+    assert "waiting on a verify job" in reviews and "2f queues the fix" in reviews
+    findings = text[text.index("### 2d. Bring open findings") : text.index("### 2e. Reviews")]
+    # Old findings get re-checked against the new head, so a fix unblocks reviews...
+    assert "whose `head` isn't `HEAD`" in findings and "set `fixed_in` to `HEAD`" in findings
+    # ...and an unverified finding gets one real attempt, then a decision or needs-kirk.
+    assert "one verify job" in findings and "label the" in findings and "needs-kirk" in findings
+    assert "never left `unverified` with nothing in flight" in findings
 
 
-def test_update_jobs_dont_merge_main_themselves():
+def test_the_run_never_checks_out_or_runs_pr_code():
     text = (ROOT / "docs" / "superstar.md").read_text()
-    assert "git merge origin/main" not in text
+    assert "**You never check out or run PR code.**" in text
+    # Only the reviewer and verify-job prompts (which run with reader tokens) check out a PR.
+    own_steps = text[: text.index("## The review prompt template")]
+    rule = own_steps.index("**You never check out or run PR code.**")
+    verify = own_steps.index("**Verify jobs.**")
+    allowed = [(rule, rule + 900), (verify, verify + 1500)]
+    import re
+
+    for m in re.finditer(r"gh\s+pr\s+checkout", own_steps):
+        assert any(a < m.start() < b for a, b in allowed), own_steps[m.start() - 200 : m.end()]
+    assert "run it." not in own_steps and "running the test it names" not in own_steps
 
 
 def test_the_cronjob_parses_and_is_not_in_the_default_kustomization():
@@ -143,8 +168,22 @@ class _StubDrella(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        from urllib.parse import parse_qs, urlparse
+
         self.server.auths.append(self.headers.get("Authorization"))
-        self._send(self.server.jobs)
+        self.server.paths.append(self.path)
+        if self.server.fail_get:
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        # Like Drella's GET /jobs?status=a,b: only jobs with those statuses.
+        wanted = parse_qs(urlparse(self.path).query).get("status")
+        jobs = self.server.jobs
+        if wanted:
+            statuses = wanted[0].split(",")
+            jobs = [j for j in jobs if j.get("status") in statuses]
+        self._send(jobs)
 
     def do_POST(self):
         self.server.auths.append(self.headers.get("Authorization"))
@@ -154,11 +193,10 @@ class _StubDrella(BaseHTTPRequestHandler):
 
 
 def _job(status: str, prompt: str) -> dict:
-    # Same key order as JobOut: "status" directly before "prompt".
-    return {"id": "job-1", "status": status, "prompt": prompt}
+    return {"id": "job-1", "status": status, "repo": None, "prompt": prompt}
 
 
-def _run_cronjob(tmp_path: Path, jobs: list[dict]):
+def _run_cronjob(tmp_path: Path, jobs: list[dict], fail_get: bool = False):
     if shutil.which("curl") is None:
         pytest.skip("the CronJob script needs curl")
     prompt_file = tmp_path / "superstar.md"
@@ -174,6 +212,8 @@ def _run_cronjob(tmp_path: Path, jobs: list[dict]):
     server.jobs = jobs
     server.posted = []
     server.auths = []
+    server.paths = []
+    server.fail_get = fail_get
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -189,6 +229,8 @@ def _run_cronjob(tmp_path: Path, jobs: list[dict]):
         server.shutdown()
         server.server_close()
     assert server.auths and set(server.auths) == {"Bearer test-token"}
+    # Only queued and running jobs are fetched, never the whole history.
+    assert server.paths == ["/jobs?status=queued,running"]
     return result, server.posted
 
 
@@ -207,6 +249,7 @@ def test_the_cronjob_posts_the_run_when_no_superstar_job_is_running(tmp_path):
     assert job["model"] == "claude-opus"
     assert job["repo"] == "realitydevices/drella"
     assert "profile" not in job
+    assert "\t" not in job["prompt"]
     # The body must be one the real API accepts (JobIn forbids unknown fields).
     from drella.app import JobIn
 
@@ -232,6 +275,8 @@ def test_the_api_scripts_send_the_right_token(tmp_path):
     server.jobs = [{"id": "j"}]
     server.posted = []
     server.auths = []
+    server.paths = []
+    server.fail_get = False
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -257,3 +302,31 @@ def test_the_api_scripts_send_the_right_token(tmp_path):
     assert json.loads(got.stdout) == [{"id": "j"}]
     assert server.auths == ["Bearer api-token", "Bearer builder-token"]
     assert server.posted == [{"prompt": "x", "model": "m"}]
+
+
+def test_the_cronjob_posts_nothing_when_it_cant_list_jobs(tmp_path):
+    result, posted = _run_cronjob(tmp_path, [], fail_get=True)
+    assert result.returncode != 0
+    assert posted == []
+
+
+def test_the_prompt_has_no_control_characters_the_cronjob_cant_encode():
+    """The CronJob JSON-encodes only backslashes, quotes and newlines."""
+    text = (ROOT / "docs" / "superstar.md").read_text()
+    bad = sorted({hex(ord(c)) for c in text if ord(c) < 0x20 and c != "\n" or ord(c) == 0x7F})
+    assert bad == []
+
+
+def test_the_cronjob_and_readme_install_it_the_same_way():
+    """kustomize refuses files outside an overlay, so it's a ConfigMap and kubectl apply."""
+    yaml_text = (ROOT / "deploy" / "superstar-cronjob.yaml").read_text()
+    readme = (ROOT / "deploy" / "README.md").read_text()
+    for text in (yaml_text, readme):
+        flat = " ".join(text.replace("#", " ").replace("\\\n", " ").split())
+        assert (
+            "kubectl -n drella create configmap superstar-prompt"
+            " --from-file=superstar.md=docs/superstar.md --dry-run=client -o yaml"
+            " | kubectl apply -f -" in flat
+        )
+        assert "kubectl apply -f deploy/superstar-cronjob.yaml" in flat
+        assert "configMapGenerator" not in text

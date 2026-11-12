@@ -2,20 +2,15 @@
 # default kustomization. Every 30 minutes it POSTs one Drella job whose prompt is
 # docs/superstar.md, unless a superstar job is still queued or running.
 #
-# To enable it, add an overlay next to this directory (see "Superstar" in deploy/README.md):
+# To enable it, from the repo root (see "Superstar" in deploy/README.md), create the
+# ConfigMap the CronJob mounts from docs/superstar.md, then apply this file. Run the first
+# line again whenever docs/superstar.md changes on main:
 #
-#   # overlays/superstar/kustomization.yaml
-#   apiVersion: kustomize.config.k8s.io/v1beta1
-#   kind: Kustomization
-#   resources:
-#     - ../../deploy
-#     - ../../deploy/superstar-cronjob.yaml
-#   configMapGenerator:
-#     - name: superstar-prompt            # the name the CronJob below mounts
-#       files:
-#         - superstar.md=../../docs/superstar.md
-#   generatorOptions:
-#     disableNameSuffixHash: true         # the CronJob names the ConfigMap as it is
+#   kubectl -n drella create configmap superstar-prompt \
+#     --from-file=superstar.md=docs/superstar.md --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl apply -f deploy/superstar-cronjob.yaml
+#
+# It needs Drella with `GET /jobs?status=` (the drella/jobs-status-filter PR, part of #75).
 #
 # It also needs the Secret `superstar-token` (key: token): a Drella API token with the
 # `superstar` profile and `operator` role, which also stores a builder Drella token as its
@@ -79,15 +74,27 @@ spec:
                 - |
                   auth="Authorization: Bearer $DRELLA_TOKEN"
                   marker=$(head -n 1 /prompt/superstar.md)
-                  # Skip if a superstar job is already queued or running. JobOut lists
-                  # "status" before "prompt", and the marker is the prompt's first line.
-                  jobs=$(curl -fsS -H "$auth" "$DRELLA_URL/jobs")
-                  if printf '%s' "$jobs" | grep -Eq "\"status\": ?\"(queued|running)\", ?\"prompt\": ?\"$marker"; then
+                  # Skip if a superstar job is already queued or running: ask Drella for
+                  # only those jobs, and look for a prompt that starts with the marker
+                  # (its first line). The answer streams through awk, never held in a
+                  # variable. A failed request stops the run (nothing is posted).
+                  found=$({ curl -fsS -H "$auth" "$DRELLA_URL/jobs?status=queued,running" \
+                            || echo "__drella_jobs_request_failed__"; } \
+                          | awk -v m="$marker" '
+                              index($0, "__drella_jobs_request_failed__") { e = 1 }
+                              index($0, "\"prompt\":\"" m) || index($0, "\"prompt\": \"" m) { f = 1 }
+                              END { print (e ? "error" : (f ? "yes" : "no")) }')
+                  if [ "$found" = error ]; then
+                    echo "couldn't list Drella's queued and running jobs" >&2
+                    exit 1
+                  fi
+                  if [ "$found" = yes ]; then
                     echo "a superstar job is already queued or running; skipping"
                     exit 0
                   fi
-                  # JSON-encode the prompt: escape \ and ", turn newlines into \n.
-                  prompt=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' /prompt/superstar.md | awk 'BEGIN{ORS="\\n"} {print}')
+                  # JSON-encode the prompt: escape \ and ", turn newlines into \n. The
+                  # prompt has no tabs or other control characters (a test checks).
+                  prompt=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' /prompt/superstar.md | awk 'BEGIN{ORS="\\n"} {print}')
                   printf '{"prompt":"%s","model":"claude-opus","repo":"realitydevices/drella"}' "$prompt" > /tmp/job.json
                   curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
                     --data-binary @/tmp/job.json "$DRELLA_URL/jobs"
