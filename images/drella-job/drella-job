@@ -7,12 +7,14 @@
 #      by Drella (DRELLA_PREFLIGHT_*, DRELLA_OPENCODE_CONFIG; docs/v0.2.md); or Claude
 #      Code with the model's OAuth token (DRELLA_AGENT_MODEL; docs/v0.3.md);
 #   3. runs the agent with the prompt and standing instructions: with a repo, work on
-#      a branch, push it and open a PR with gh; without one, or with a read-only
-#      GitHub token (DRELLA_REPO_READ_ONLY), write results to /out;
+#      a branch, push it and open a PR with gh; without one, or with a GitHub token
+#      that doesn't open PRs (DRELLA_REPO_REPORT), write results to /out. A read-only
+#      token (DRELLA_REPO_READ_ONLY) can't write to GitHub at all; a report job's token
+#      can (superstar, issue #73), and it acts on GitHub with gh during the run;
 #   4. collects /out (transcript, plus diff and PR URL for a repo job);
 #   5. reports the final status with the job-scoped token, then uploads /out to the
 #      Drella API. A repo job succeeds only if a PR exists; a job without a repo, or
-#      a read-only one, succeeds if the agent exits cleanly and wrote at least one
+#      a report job, succeeds if the agent exits cleanly and wrote at least one
 #      output.
 #
 # Time limits (docs/v0.md): the agent runs under a timer that stops it
@@ -44,9 +46,13 @@ OUT=${DRELLA_OUT:-/out}
 WORK=${DRELLA_WORK:-/work}
 CREDS=${DRELLA_CREDS:-/creds}
 REPO=${DRELLA_REPO:-}
-# The GitHub token can't push or open PRs (a read-only profile): results go to /out.
+# The GitHub token can't write at all (a read-only profile).
 READ_ONLY=""
 [ -n "$REPO" ] && [ "${DRELLA_REPO_READ_ONLY:-}" = 1 ] && READ_ONLY=1
+# The job's outcome is its results in /out, not a PR: a read-only token, or a token that
+# doesn't open PRs (superstar).
+REPORT=""
+[ -n "$REPO" ] && { [ -n "$READ_ONLY" ] || [ "${DRELLA_REPO_REPORT:-}" = 1 ]; } && REPORT=1
 BRANCH="drella/${DRELLA_JOB_ID:0:8}"
 STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 NOW=$(date +%s)
@@ -290,6 +296,21 @@ Standing instructions from Drella (always follow these):
   standing instructions).
 - gh is already authenticated. Nobody can answer questions: decide for yourself.
 INSTRUCTIONS
+elif [ -n "$REPORT" ]; then
+read -r -d '' STANDING <<INSTRUCTIONS
+---
+Standing instructions from Drella (always follow these):
+- You are in a clone of https://github.com/$REPO. Its default branch is $DEFAULT_BRANCH.
+- Your GitHub access is to this repo only, through gh, which is already authenticated.
+  Use it for what the task asks (e.g. comments, reviews, merging a PR). Don't push
+  branches to the repo or open pull requests unless the task says to.
+- Your result is a report: write it as files in $OUT. Anything outside $OUT is thrown
+  away.
+- Before you start, read AGENTS.md, CLAUDE.md and CONTRIBUTING.md at the root of the
+  repo, if they exist, and follow their conventions (they don't override these
+  standing instructions).
+- Nobody can answer questions: decide for yourself.
+INSTRUCTIONS
 elif [ -n "$REPO" ]; then
 read -r -d '' STANDING <<INSTRUCTIONS
 ---
@@ -432,7 +453,7 @@ if [ -n "$REPO" ]; then
   fi
 fi
 
-if [ -n "$REPO" ] && [ -z "$READ_ONLY" ]; then
+if [ -n "$REPO" ] && [ -z "$REPORT" ]; then
   branch=$(git branch --show-current)
   pr_lookup_failed=""
   for b in "$BRANCH" "$branch"; do
@@ -471,7 +492,7 @@ jq -e 'type == "object" and
 reason=$(failure)
 if [ -n "$reason" ]; then
   finish failed "$reason${pr:+; PR: $pr}$diff_note"
-elif [ -z "$REPO" ] || [ -n "$READ_ONLY" ]; then
+elif [ -z "$REPO" ] || [ -n "$REPORT" ]; then
   # The agent's results are files in /out; the transcript and session are ours, and
   # so is the diff of a repo job. Counts exactly what upload_outputs uploads
   # (is_output).
