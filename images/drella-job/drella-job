@@ -480,7 +480,18 @@ if [ "$AGENT" = claude-code ]; then
   [ -s "$OUT/session.jsonl" ] || rm -f "$OUT/session.jsonl"
 else
   session=$(within 20 opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id // empty')
-  [ -n "$session" ] && within 20 opencode export "$session" 2>/dev/null | redact >"$OUT/session.json"
+  if [ -n "$session" ]; then
+    raw=$(mktemp) || { log "mktemp failed, skipping session export"; }
+    if [ -n "$raw" ]; then
+      within 20 opencode export "$session" 2>/dev/null >"$raw"
+      redact <"$raw" >"$OUT/session.json"
+      rm -f "$raw"
+      [ -s "$OUT/session.json" ] || rm -f "$OUT/session.json"
+      if [ -f "$OUT/session.json" ] && ! jq -e . "$OUT/session.json" >/dev/null 2>&1; then
+        log "session.json is not valid JSON ($(wc -c <"$OUT/session.json") bytes)"
+      fi
+    fi
+  fi
 fi
 
 pr="" diff_note="" pr_lookup_failed=""

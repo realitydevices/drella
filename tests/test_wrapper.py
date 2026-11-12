@@ -165,6 +165,21 @@ def test_the_wrapper_never_asks_drella_for_another_github_token():
     assert "github-token" not in WRAPPER
 
 
+def test_opencode_export_writes_to_file_before_redact():
+    # Piping opencode export straight into redact truncates at ~64 KiB because the
+    # process exits before stdout is drained when stdout is a pipe. The fix writes to
+    # a temp file from mktemp first, then redacts it (issue #55).
+    assert 'opencode export "$session" 2>/dev/null | redact' not in WRAPPER
+    assert 'session.raw.json' not in WRAPPER
+    assert 'mktemp' in WRAPPER
+    # mktemp must appear in the session export block (within 10 lines before "opencode export")
+    lines = WRAPPER.split('\n')
+    for i, line in enumerate(lines):
+        if 'opencode export' in line:
+            block = '\n'.join(lines[max(0, i - 10):i])
+            assert 'mktemp' in block, "mktemp must appear within 10 lines before opencode export"
+
+
 def test_wrapper_keeps_usage_only_within_the_apis_limits():
     # drella/app.py rejects anything else (MAX_USAGE_TOKENS = 10**13, MAX_COST = 100_000).
     assert "1e13" in WRAPPER and "<= 100000" in WRAPPER
