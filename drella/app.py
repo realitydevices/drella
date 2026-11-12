@@ -6,7 +6,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
@@ -65,6 +65,10 @@ BAD_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f"\\{}]')
 MAX_TOKENS = 10_000_000
 MAX_COST = 100_000
 MAX_USAGE_TOKENS = 10**13
+# The prompt reaches the pod as the env var DRELLA_PROMPT. Linux limits a single env
+# var or argument to 128 KiB (MAX_ARG_STRLEN); we cap at half that to leave room for
+# the rest of the command line and other env vars.
+MAX_PROMPT_BYTES = 64 * 1024
 
 
 # -- schemas -----------------------------------------------------------------
@@ -125,6 +129,14 @@ class JobIn(BaseModel):
     @classmethod
     def _no_null(cls, v):
         return _no_null(v)
+
+    @field_validator("prompt")
+    @classmethod
+    def _max_bytes(cls, v):
+        encoded = v.encode("utf-8")
+        if len(encoded) > MAX_PROMPT_BYTES:
+            raise ValueError(f"prompt must be at most {MAX_PROMPT_BYTES // 1024} KiB (byte limit)")
+        return v
 
     @field_validator("repo")
     @classmethod
@@ -354,8 +366,8 @@ class Deps:
     runner: Runner
     storage: Storage
     queue: Queue
-    # Drella's GitHub App, if configured: mints repo jobs' tokens (issue #50).
-    github_app: GitHubApp | None = None
+    # Drella's GitHub Apps by name, if configured: mint repo jobs' tokens (issues #50, #73).
+    github_apps: dict[str, GitHubApp] = field(default_factory=dict)
 
 
 def create_app(
@@ -368,7 +380,7 @@ def create_app(
     engine = make_engine(settings.database_url)
     sessions = make_sessionmaker(engine)
     storage = storage or LocalStorage(settings.storage_path)
-    github_app = GitHubApp.from_settings(settings)
+    github_apps = GitHubApp.from_settings(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -392,9 +404,9 @@ def create_app(
         settings.queue_interval,
         log_snapshot_seconds=settings.log_snapshot_seconds,
         stall_seconds=settings.queue_stall_seconds,
-        github_app=github_app,
+        github_apps=github_apps,
     )
-    app.state.deps = Deps(settings, sessions, runner, storage, queue, github_app)
+    app.state.deps = Deps(settings, sessions, runner, storage, queue, github_apps)
     app.include_router(router)
 
     @app.exception_handler(RequestValidationError)
@@ -563,7 +575,7 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     # they stored one (it wins), otherwise a token from Drella's GitHub App, minted at
     # launch.
     github_app = bool(body.repo) and GITHUB_CREDENTIAL not in creds
-    if github_app and deps.github_app is None:
+    if github_app and not deps.github_apps:
         raise HTTPException(
             422,
             f"a job with a repo needs a '{GITHUB_CREDENTIAL}' credential (this Drella has no"

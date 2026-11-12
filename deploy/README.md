@@ -127,6 +127,17 @@ key at startup and refuses to start if it can't read it. The key is read again f
 every token, so a rotated key takes effect without a restart (a new App ID needs one).
 Neither the key nor any token is stored in the database.
 
+**More Apps.** Drella can hold a second App, for the `superstar` profile below (issue #73).
+Each App has a name: the one above is `builder`, and it's the App the `builder` and
+`reader` profiles mint from. The second is `superstar`, configured by two variables
+per App, `DRELLA_GITHUB_APP_<NAME>_ID` and, if its key isn't at
+`/etc/drella/github-app-<name>/private-key.pem`, `DRELLA_GITHUB_APP_<NAME>_KEY_FILE`.
+Its App ID comes from the optional `drella-github-app-superstar` Secret, which is the
+same shape as `drella-github-app` (`private-key.pem` and `app-id`), and `drella.yaml`
+mounts its key at that default path. Create it the same way as the first Secret; it's
+optional, and without it a `superstar` job fails at launch saying which App is missing.
+Each App is checked at startup and minted from the same way, with the same checks.
+
 For each repo job without a `github` credential, Drella mints a token when it launches
 the job (not when it's queued: a queued job can wait longer than an hour). The token is
 for the job's repo only, with the permissions of the job's Drella token's GitHub
@@ -158,10 +169,16 @@ read the App's own user), and PRs are opened by `<app name>[bot]`.
 Each Drella token has a GitHub profile, which decides what the App tokens minted for its
 jobs may do. Profiles are a fixed set in code (`PROFILES` in `drella/github.py`):
 
-| Profile | Contents | Pull requests | Issues | The job |
-|---|---|---|---|---|
-| `builder` | write | write | read | pushes a branch and opens a PR (drella-bot's normal use) |
-| `reader` | read | read | read | can't push or open PRs; writes its results (a review, a report) to `/out` and succeeds if it wrote any |
+| Profile | App | Contents | Pull requests | Issues | Checks, statuses | The job |
+|---|---|---|---|---|---|---|
+| `builder` | `builder` | write | write | read | | pushes a branch and opens a PR (drella-bot's normal use) |
+| `reader` | `builder` | read | read | read | | can't push or open PRs; writes its results (a review, a report) to `/out` and succeeds if it wrote any |
+| `superstar` | `superstar` | write | write | write | read | the supervisor: acts on GitHub through `gh` during its run (comments, merges), and succeeds if it wrote its report to `/out`, as a `reader` does. Its token can write, so it isn't read-only and doesn't open a PR |
+
+The `superstar` App needs Contents, Pull requests and Issues write, and Checks and Commit
+statuses read (nothing else, and no Workflows). Install it on the repos it may act on.
+It can approve and merge PRs, so the rules in **Approvals and branch protection** below
+apply to it too.
 
 Only an admin sets a token's profile, with the CLI inside Drella's pod. A caller can't
 choose one, and can't ask for permissions per job:
@@ -181,9 +198,9 @@ A profile only limits the tokens Drella mints from the App. If a Drella token st
 own `github` credential, that credential takes precedence: its jobs get whatever that
 credential can do on GitHub, and the profile doesn't apply.
 
-To add a profile (say a `reviewer` that comments on PRs), add it to `PROFILES`. Anything
-with Pull requests write can also approve PRs; see below for why that approval mustn't
-count.
+To add a profile (say a `reviewer` that comments on PRs), add it to `PROFILES`, with the
+App it mints from. Anything with Pull requests write can also approve PRs; see below for
+why that approval mustn't count.
 
 ### Approvals and branch protection
 

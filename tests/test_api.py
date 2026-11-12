@@ -816,6 +816,26 @@ def test_listing_models_survives_a_row_that_predates_a_rule(client, auth):
     assert {m["alias"]: m["base_url"] for m in r.json()}["claude"] == "https:"
 
 
+def test_prompt_size_limits(client, auth):
+    # Exactly 64 KiB of ASCII (1 byte per char) is accepted.
+    big_ascii = "a" * (64 * 1024)
+    r = client.post("/jobs", json={"prompt": big_ascii, "model": "local"}, headers=auth)
+    assert r.status_code == 201, r.text
+
+    # One byte over is rejected.
+    too_big = "a" * (64 * 1024 + 1)
+    r = client.post("/jobs", json={"prompt": too_big, "model": "local"}, headers=auth)
+    assert r.status_code == 422
+    assert "64" in r.json()["detail"][0].get("msg", "")
+
+    # A prompt under 64 Ki characters but over 64 KiB in UTF-8 is rejected.
+    # "é😀" is 6 bytes in UTF-8 (é=2, 😀=4); 30000 repetitions = 180000 bytes.
+    multi_byte = ("é😀" * 30000)
+    r = client.post("/jobs", json={"prompt": multi_byte, "model": "local"}, headers=auth)
+    assert r.status_code == 422
+    assert "64" in r.json()["detail"][0].get("msg", "")
+
+
 @pytest.mark.parametrize("value", [
     "hello\x00world",
     "line1\n\x00\nline3",

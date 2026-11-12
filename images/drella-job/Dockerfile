@@ -1,8 +1,15 @@
 # The job image [20]: uv, Python 3.13, OpenCode, Claude Code [28], git, gh and the job wrapper.
 #   docker build -t drella-job images/drella-job
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 ARG OPENCODE_VERSION=1.15.11
+# SHA-256 of opencode-linux-{x64,arm64}.tar.gz for that version, as published in the
+# GitHub release's asset digests.
+ARG OPENCODE_SHA256_AMD64=49317253722c698394980e1921ff28e919d79bb29d5c3f4cf314a4adaf7037cd
+ARG OPENCODE_SHA256_ARM64=93e4399f308c49387c25ec2b570602bf0f9dd5f57989427946c0c28dbf259ff4
+# Fingerprints GitHub publishes for the gh apt repository's signing keys
+# (https://github.com/cli/cli/blob/trunk/docs/install_linux.md).
+ARG GH_APT_KEY_FPRS="2C6106201985B60E6C7AC87323F3D4EA75716059 7F38BBB59D064DBCB3D84D725612B36462313325"
 # Claude Code's native build, pinned, with the SHA-256 checksums from that release's
 # manifest (https://downloads.claude.ai/claude-code-releases/<version>/manifest.json).
 ARG CLAUDE_CODE_VERSION=2.1.319
@@ -12,10 +19,16 @@ ARG TARGETARCH
 
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bash ca-certificates curl git jq ripgrep \
+ && apt-get install -y --no-install-recommends bash ca-certificates curl git gnupg jq ripgrep \
  && mkdir -p -m 755 /etc/apt/keyrings \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && fprs=$(gpg --show-keys --with-colons /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+      | awk -F: '$1=="pub"{p=1;next} $1=="fpr"&&p{print $10;p=0}') \
+ && test -n "$fprs" \
+ && for f in $fprs; do \
+      case " $GH_APT_KEY_FPRS " in *" $f "*) ;; *) echo "unexpected gh apt key fingerprint: $f" >&2; exit 1;; esac; \
+    done \
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list \
  && apt-get update \
@@ -23,7 +36,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # uv
-COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.8.22@sha256:9874eb7afe5ca16c363fe80b294fe700e460df29a55532bbfea234a0f12eddb1 /uv /usr/local/bin/uv
 
 # Python 3.13, installed into a shared directory so all users can use it
 ENV UV_PYTHON_INSTALL_DIR=/usr/share/python
@@ -33,9 +46,16 @@ RUN uv python install 3.13 \
 
 # OpenCode, from the same release artifacts its install script uses
 # (https://opencode.ai/install), pinned. The x64 build needs AVX2.
-RUN arch=$(case "${TARGETARCH:-$(dpkg --print-architecture)}" in amd64) echo x64;; arm64) echo arm64;; esac) \
- && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${arch}.tar.gz" \
-    | tar -xz -C /usr/local/bin opencode \
+RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+      amd64) arch=x64; sum=$OPENCODE_SHA256_AMD64;; \
+      arm64) arch=arm64; sum=$OPENCODE_SHA256_ARM64;; \
+      *) echo "unsupported architecture" >&2; exit 1;; \
+    esac \
+ && curl -fsSL -o /tmp/opencode.tar.gz \
+      "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${arch}.tar.gz" \
+ && echo "$sum  /tmp/opencode.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/opencode.tar.gz -C /usr/local/bin opencode \
+ && rm /tmp/opencode.tar.gz \
  && opencode --version
 
 # Claude Code, the same binary its install script (https://claude.ai/install.sh)
