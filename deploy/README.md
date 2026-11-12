@@ -43,8 +43,8 @@ kubectl get nodes
 ## Deploy
 
 The manifests pin a released image (see **Versions** below), so deploy from a release:
-the first is `v0.1.0`. Images on `main` are published too, as `:main` and
-`:sha-<commit>`, for testing.
+the first is `v0.1.0`, and these manifests need `v0.5.0` or later. Images on `main`
+are published too, as `:main` and `:sha-<commit>`, for testing.
 
 From a checkout of this repo:
 
@@ -60,8 +60,9 @@ logs in that namespace. The images come from GHCR: `ghcr.io/realitydevices/drell
 `ghcr.io/realitydevices/drella-job`. Both are public, so no pull secret is needed.
 
 **Versions:** `kustomization.yaml` pins the `drella` image to a release tag (e.g.
-`v0.1.0`), and Drella launches the `drella-job` image with the same tag. To upgrade,
+`v0.5.0`), and Drella launches the `drella-job` image with the same tag. To upgrade,
 change `newTag` and apply again.
+These manifests need Drella v0.5.0 or later; with an older image keep DRELLA_DATABASE_URL.
 
 **Job network:** job pods can reach DNS, the Drella API, the public internet, and port
 11434 (Ollama's default) on private networks outside the cluster, and nothing else on
@@ -74,7 +75,8 @@ The Postgres password is set in `deploy/kustomization.yaml` and **the default
 (`drella`) must be changed**: this repository is public, so the default is known to
 everyone. Replace the `password=drella` literal in the `postgres` `secretGenerator`
 (ideally in an overlay, not this checkout) with a long random one, e.g.
-`openssl rand -base64 24`, before your first deploy. Any characters are fine: Drella
+`openssl rand -base64 24`, before your first deploy. In an overlay, that's
+`secretGenerator: [{name: postgres, behavior: replace, literals: [password=<yours>]}]`. Any characters are fine: Drella
 builds the database URL from separate settings and quotes the password. Changing it
 after the first deploy does not change the password in the existing database; alter it
 there too (`ALTER USER drella PASSWORD '...'`) or recreate the volume. Only the Drella

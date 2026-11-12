@@ -10,8 +10,10 @@ resources:
   - drella.yaml
   - job-network.yaml
 secretGenerator:
+  # The default password MUST be changed before the first deploy: this repo is
+  # public, so everyone knows it. Override it in an overlay (see deploy/README.md).
   # Postgres is only reachable from the drella pod (see the NetworkPolicy in
-  # postgres.yaml). Change the password here before deploying if you like.
+  # postgres.yaml), which limits the exposure but doesn't replace a real password.
   - name: postgres
     literals:
       - password=drella
@@ -25,7 +27,9 @@ secretGenerator:
   #     literals:
   #       - app-id=<the App's ID>
 # Pinned to a release. The drella image launches the drella-job image with the
-# same tag, so pinning this one pins both.
+# same tag, so pinning this one pins both. drella.yaml uses the separate
+# DRELLA_DATABASE_* settings, so this must be a release that includes #13
+# (v0.5.0 or later); older images ignore them.
 images:
   - name: ghcr.io/realitydevices/drella
-    newTag: v0.1.0
+    newTag: v0.5.0
