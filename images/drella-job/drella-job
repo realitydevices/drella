@@ -21,7 +21,9 @@
 # agent shares whatever time is left: until the deadline, or until the pod's grace
 # period (DRELLA_TERM_GRACE) ends. If the job has already failed when the agent ends
 # (stopped, out of time, killed), that status is reported straight away, before
-# step 4. Step 4 stops RESERVE seconds early, leaving the final status that long to
+# step 4. DRELLA_DRAIN_GRACE (default 10) is how long the agent's output gets to drain
+# once it has exited, before leftover processes are stopped; never into the last RESERVE
+# seconds. Step 4 stops RESERVE seconds early, leaving the final status that long to
 # reach the Drella API (less if the provisional report used it up).
 set -uo pipefail
 
@@ -428,10 +430,12 @@ agent_started=$(date +%s)
   echo $! >"$WORK/agent.pid"
   wait $!
   echo $? >"$WORK/agent.rc"
-} 2>&1 | redact | tee "$WORK/agent.out" | render | tee "$OUT/transcript.txt" &
+} 2>&1 | redact | tee "$WORK/agent.out" | render | tee -a "$OUT/transcript.txt" &
 pipe_pid=$!
 for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
+# Read once, now: the agent can write to this file. Never kill 0, 1 or -1, or a non-number.
 agent_pid=$(cat "$WORK/agent.pid" 2>/dev/null)
+{ [[ "$agent_pid" =~ ^[0-9]+$ ]] && [ "$agent_pid" -ge 2 ]; } || agent_pid=""
 # Told to stop before the pid was known.
 [ -n "$stopped" ] && [ -n "$agent_pid" ] && kill -TERM "$agent_pid" 2>/dev/null
 # wait_for_agent: wait for the agent's exit code file, not for the pipeline: a process
@@ -442,22 +446,40 @@ agent_pid=$(cat "$WORK/agent.pid" 2>/dev/null)
 DRAIN_GRACE=${DRELLA_DRAIN_GRACE:-10}
 pipeline_running() { kill -0 "$pipe_pid" 2>/dev/null; }
 wait_for_agent() {
-  local i p
-  # The agent is bounded by its own timer, and the pipeline (the code file's writer)
-  # ending without a file means it died; FINISH_BY bounds the rest.
-  while [ ! -s "$WORK/agent.rc" ] && pipeline_running && [ "$(left)" -gt 0 ]; do sleep 0.2; done
-  for ((i = 0; i < DRAIN_GRACE * 5; i++)); do pipeline_running || break; sleep 0.2; done
+  local i p still_running=""
+  # The agent is bounded by its own timer, and the subshell that writes the exit code
+  # ending without a file means it died; FINISH_BY bounds the rest, and the last
+  # RESERVE seconds belong to the final report.
+  while [ ! -s "$WORK/agent.rc" ] && pipeline_running && [ "$(left)" -gt "$RESERVE" ]; do sleep 0.2; done
+  # Out of time with the agent still going: no drain, stop it at once.
+  if [ ! -s "$WORK/agent.rc" ] && pipeline_running; then
+    still_running=1
+  else
+    for ((i = 0; i < DRAIN_GRACE * 5 && $(left) > RESERVE; i++)); do pipeline_running || break; sleep 0.2; done
+  fi
   pipeline_running || return 0
-  log "the agent left processes running; stopped them" | tee -a "$OUT/transcript.txt"
-  [[ "$agent_pid" =~ ^[0-9]+$ ]] && kill -KILL -- "-$agent_pid" 2>/dev/null
+  [ -n "$agent_pid" ] && kill -KILL -- "-$agent_pid" 2>/dev/null
   for ((i = 0; i < 10; i++)); do pipeline_running || break; sleep 0.2; done
-  pipeline_running || return 0
-  # The pipeline's own processes are the wrapper's only children.
-  for p in /proc/[0-9]*; do
-    p=${p#/proc/}
-    [ "$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null)" = "$$" ] && kill -KILL "$p" 2>/dev/null
-  done
-  for ((i = 0; i < 10; i++)); do pipeline_running || break; sleep 0.2; done
+  local escaped=""
+  pipeline_running && escaped=1
+  if pipeline_running; then
+    # The pipeline's own processes are the wrapper's only children.
+    for p in /proc/[0-9]*; do
+      p=${p#/proc/}
+      [ "$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null)" = "$$" ] && kill -KILL "$p" 2>/dev/null
+    done
+    for ((i = 0; i < 10; i++)); do pipeline_running || break; sleep 0.2; done
+  fi
+  # Anything of the agent's group still alive, or holding the pipe after the group was
+  # killed, left the group (setsid, a daemon).
+  sleep 0.3
+  [ -n "$agent_pid" ] && kill -0 -- "-$agent_pid" 2>/dev/null && escaped=1
+  if [ -n "$still_running" ]; then
+    log "the agent was still running at the deadline; stopped it" | tee -a "$OUT/transcript.txt"
+  elif [ -z "$escaped" ]; then
+    log "the agent left processes running; stopped the agent's leftover processes" | tee -a "$OUT/transcript.txt"
+  fi
+  [ -n "$escaped" ] && log "stopped what it could; processes that left the agent's process group may still be running" | tee -a "$OUT/transcript.txt"
   return 0
 }
 wait_for_agent

@@ -216,6 +216,7 @@ def test_fix_pr_succeeds_when_the_remote_head_moves_and_comments_without_failing
 
 # -- the wait for the agent [15] ----------------------------------------------------
 
+import os
 import re
 import time
 
@@ -226,19 +227,25 @@ def _wait_logic():
     return m.group(0)
 
 
-def _run_wait(tmp_path, agent_body, grace=2):
+def _run_wait(tmp_path, agent_body, grace=2, finish_in=None, reserve=2, real_timeout=None):
     """Run the wrapper's real pipeline shape and wait_for_agent with a fake agent."""
     (tmp_path / "out").mkdir()
+    if real_timeout:
+        agent_cmd = f"setsid timeout --signal=TERM --kill-after=30 {real_timeout} bash -c '{agent_body}'"
+    else:
+        agent_cmd = f"setsid bash -c '{agent_body}'"
     script = f"""
 set -uo pipefail
 WORK={tmp_path}; OUT={tmp_path}/out
-left() {{ echo 1000; }}
+RESERVE={reserve}
+FINISH_BY=$(($(date +%s) + {finish_in if finish_in is not None else 1000}))
+left() {{ echo $((FINISH_BY - $(date +%s))); }}
 log() {{ echo "[drella] $*"; }}
 redact() {{ cat; }}; render() {{ cat; }}
 DRELLA_DRAIN_GRACE={grace}
 {_wait_logic()}
 {{
-  setsid bash -c '{agent_body}' &
+  {agent_cmd} &
   echo $! >"$WORK/agent.pid"
   wait $!
   echo $? >"$WORK/agent.rc"
@@ -247,7 +254,7 @@ pipe_pid=$!
 for _ in $(seq 100); do [ -s "$WORK/agent.pid" ] && break; sleep 0.1; done
 agent_pid=$(cat "$WORK/agent.pid")
 wait_for_agent
-echo "rc=$(cat "$WORK/agent.rc")"
+echo "rc=$(cat "$WORK/agent.rc" 2>/dev/null) left=$(left)"
 """
     t = time.monotonic()
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
@@ -258,7 +265,7 @@ def test_wait_returns_when_the_agent_left_a_process_holding_stdout(tmp_path):
     r, took = _run_wait(tmp_path, "sleep 300 & echo hi; exit 0")
     assert "rc=0" in r.stdout, r.stdout + r.stderr
     assert took < 15
-    assert "the agent left processes running; stopped them" in (tmp_path / "out/transcript.txt").read_text()
+    assert "stopped the agent's leftover processes" in (tmp_path / "out/transcript.txt").read_text()
     assert "hi" in (tmp_path / "out/transcript.txt").read_text()
     time.sleep(0.5)
     left = [p for p in Path("/proc").glob("[0-9]*/cmdline") if b"sleep\x00300" in _read(p)]
@@ -277,3 +284,36 @@ def test_wait_is_unchanged_when_nothing_is_left_running(tmp_path):
     assert "rc=3" in r.stdout
     assert took < 5
     assert "left processes" not in (tmp_path / "out/transcript.txt").read_text()
+
+
+def _pids(pattern):
+    return [p for p in Path("/proc").glob("[0-9]*/cmdline") if pattern in _read(p)]
+
+
+def test_wait_respects_the_deadline_and_leaves_the_reserve(tmp_path):
+    r, took = _run_wait(tmp_path, "sleep 61", grace=10, finish_in=6, reserve=3)
+    m = re.search(r"left=(-?\d+)", r.stdout)
+    assert m and int(m.group(1)) >= 3, r.stdout + r.stderr
+    assert took < 10
+    assert "the agent was still running at the deadline; stopped it" in (tmp_path / "out/transcript.txt").read_text()
+    time.sleep(0.5)
+    assert _pids(b"sleep\x0061") == []
+
+
+def test_wait_does_not_claim_success_when_a_process_escaped(tmp_path):
+    try:
+        r, _ = _run_wait(tmp_path, "setsid sleep 30 & echo hi; exit 0")
+        text = (tmp_path / "out/transcript.txt").read_text()
+        assert "may still be running" in text, r.stdout + r.stderr
+        assert "stopped the agent's leftover processes" not in text
+    finally:
+        for p in _pids(b"sleep\x0030"):
+            os.kill(int(p.parent.name), 9)
+
+
+def test_wait_with_the_real_timeout_command_line(tmp_path):
+    r, took = _run_wait(tmp_path, "sleep 62 & echo hi; exit 0", real_timeout=5)
+    assert "rc=0" in r.stdout, r.stdout + r.stderr
+    assert took < 20
+    time.sleep(0.5)
+    assert _pids(b"sleep\x0062") == []
