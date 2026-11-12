@@ -308,30 +308,55 @@ and operator tokens (#74). It never tags or deploys.
    ```
 
    It prints the token once. Its jobs get a short-lived API token (`DRELLA_API_TOKEN`) to
-   queue and read their own child jobs, at most 6 per run; the token itself is never in
-   the job.
+   read its jobs and queue review jobs with a read-only (`reader`) GitHub token, a limited
+   number per run; the token itself is never in the job. Don't store a `github` credential
+   on this token: Drella refuses `profile` on `POST /jobs` for a caller that has one, and
+   the run's review jobs need it.
 
-2. **Give it models and a Claude credential**, as a normal user does (see **Run a job**
-   below), authenticating as the superstar token. The CronJob asks for the alias
-   `claude-opus`, so register that, with its Claude OAuth credential (`claude setup-token`).
-   Also register the models it may choose for builds and reviews (e.g. `claude-sonnet`,
-   `claude-haiku`, and local ones such as `qwen` and `gemma`): models are per token, and
-   it rotates reviewers across all it can see.
+2. **Create a builder Drella token for its builds**, and store it on the superstar token
+   as the credential `drella-builder`. Build, fix and update jobs need a GitHub token that
+   can push branches and open PRs, which the superstar's own jobs never get, so the run
+   queues them as ordinary builder jobs with this second token:
 
-3. **Create the `superstar-token` Secret** from the token in step 1:
+   ```sh
+   kubectl -n drella exec deploy/drella -- drella token create --name superstar-builder \
+     --github-profile builder
+   # as the superstar token (TOKEN=<superstar token>, see Run a job below):
+   curl -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"value": "<the superstar-builder token>"}' $DRELLA/credentials/drella-builder
+   ```
+
+   Drella puts that credential only into the superstar token's own run jobs (not into the
+   jobs they queue), as `DRELLA_BUILDER_TOKEN`, and the wrapper redacts it from logs.
+   **Accepted risk:** unlike the API token, the builder token is long-lived and is in the
+   run's environment for the whole run, so anything the run's agent reads (prompt
+   injection in an issue, PR or review) could steer it to queue builder jobs, or leak it.
+   Keep the builder token's models narrow, and rotate it (`drella token create`, store the
+   new one, delete the old) if a run ever misbehaves. Builder jobs and the run aren't
+   linked in Drella (issue #82); the PR ledger comment is the link.
+
+3. **Give both tokens models and a Claude credential**, as a normal user does (see **Run a
+   job** below); models and credentials are per token. On the superstar token: the alias
+   `claude-opus` (the CronJob asks for it), with its Claude OAuth credential (`claude
+   setup-token`), and the models it may choose for reviews (e.g. `claude-sonnet`,
+   `claude-haiku`, and local ones such as `qwen` and `gemma`): it rotates reviewers across
+   all it can see. On the builder token: the models it may choose for builds, fixes and
+   updates, with their credentials.
+
+4. **Create the `superstar-token` Secret** from the token in step 1:
 
    ```sh
    kubectl -n drella create secret generic superstar-token --from-literal=token=<the token>
    ```
 
-4. **Enable the CronJob** in an overlay (the commented example at the top of
+5. **Enable the CronJob** in an overlay (the commented example at the top of
    `deploy/superstar-cronjob.yaml`): add `superstar-cronjob.yaml` to `resources`, and a
    `configMapGenerator` entry named `superstar-prompt` with `superstar.md=docs/superstar.md`.
    The CronJob (`concurrencyPolicy: Forbid`) posts the job, and skips the run if a
    superstar job is still queued or running. Run it once by hand to try it:
    `kubectl -n drella create job --from=cronjob/superstar superstar-try`.
 
-5. **Hand it work with the `superstar` label.** GitHub Apps can't be assigned issues, so
+6. **Hand it work with the `superstar` label.** GitHub Apps can't be assigned issues, so
    label an issue `superstar` and the next run picks it up. Anything it can't decide it
    labels `needs-kirk` and comments why.
 
@@ -346,8 +371,12 @@ GitHub only uses the App's ruleset bypass when the merge passes `--admin`, and w
 merge is refused. So the superstar App needs the bypass described under **Approvals and branch
 protection**.
 
-Its review jobs run with the `reader` profile (a read-only GitHub token), and its build, fix
-and update jobs with `builder`, so it never runs a child job with its own `superstar` profile.
+The run job itself takes its token's `superstar` profile (the CronJob sets no `profile`).
+Its review jobs run with the `reader` profile (a read-only GitHub token, because reviewers
+run the PR's code), and its build, fix and update jobs are ordinary jobs of the builder
+token, so no child job ever gets the `superstar` profile. It only touches PRs from this
+repo (not forks) opened by `drella-bot`, and checks that again just before merging: a fork
+can name its branch `drella/...` too.
 Approvals on an earlier head carry over a merge of main only if the merge was clean, which it
 checks mechanically (`git merge-tree --write-tree`); otherwise two fresh reviews are needed.
 

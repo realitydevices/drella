@@ -18,7 +18,11 @@
 #     disableNameSuffixHash: true         # the CronJob names the ConfigMap as it is
 #
 # It also needs the Secret `superstar-token` (key: token): a Drella API token with the
-# `superstar` profile and `operator` role. Create it first.
+# `superstar` profile and `operator` role, which also stores a builder Drella token as its
+# `drella-builder` credential. Create both first (deploy/README.md, "Superstar").
+#
+# The posted job sets no `profile`: the run job gets its token's own (`superstar`). Its
+# review jobs ask for `reader`; its builds, fixes and updates go through the builder token.
 #
 # The job's prompt starts with the marker line `drella-superstar-run:v1` (the first line of
 # docs/superstar.md). Both the "already running?" check below and the prompt use it: keep
@@ -84,7 +88,7 @@ spec:
                   fi
                   # JSON-encode the prompt: escape \ and ", turn newlines into \n.
                   prompt=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' /prompt/superstar.md | awk 'BEGIN{ORS="\\n"} {print}')
-                  printf '{"prompt":"%s","model":"claude-opus","repo":"realitydevices/drella","profile":"superstar"}' "$prompt" > /tmp/job.json
+                  printf '{"prompt":"%s","model":"claude-opus","repo":"realitydevices/drella"}' "$prompt" > /tmp/job.json
                   curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
                     --data-binary @/tmp/job.json "$DRELLA_URL/jobs"
                   echo
