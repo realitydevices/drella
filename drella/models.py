@@ -39,7 +39,14 @@ class Token(Base):
     # What the GitHub App tokens minted for this token's jobs may do: a name in
     # drella.github.PROFILES. Set by an admin with the CLI, never through the API.
     github_profile: Mapped[str] = mapped_column(String(32), default="reader")
+    # What the token may do in Drella itself: MEMBER or OPERATOR (issue #74). An
+    # operator token's jobs get a job-scoped API token. Set only with the CLI.
+    role: Mapped[str] = mapped_column(String(16), default="member")
     created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+MEMBER, OPERATOR = "member", "operator"
+ROLES = (MEMBER, OPERATOR)
 
 
 class Credential(Base):
@@ -97,6 +104,16 @@ class Job(Base):
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
     # sha256 of the job-scoped token.
     job_token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    # The job that queued this one with its API token (issue #74), if any.
+    parent_job_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # An operator token's job only: sha256 of its job-scoped API token (never the token)
+    # and the caller's credential key, wrapped with a key derived from that API token, so
+    # the job can create jobs that use the caller's credentials. The wrapped key is
+    # erased when the job finishes.
+    api_token_hash: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    api_key_wrap: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=_now, index=True)
     started_at: Mapped[datetime | None]
     finished_at: Mapped[datetime | None]

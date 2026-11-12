@@ -7,7 +7,7 @@ import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -33,9 +33,18 @@ from drella.adapters import LLM_KEY_SECRET, Interface
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
 from drella.github import PROFILES, GitHubApp
-from drella.models import QUEUED, RUNNING, TERMINAL, Credential, Job, Model, Token
+from drella.models import (
+    OPERATOR,
+    QUEUED,
+    RUNNING,
+    TERMINAL,
+    Credential,
+    Job,
+    Model,
+    Token,
+)
 from drella.queue import Queue, archived_log, output_prefix
-from drella.runner import JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
+from drella.runner import API_TOKEN_KEY, JOB_TOKEN_KEY, KubernetesRunner, LogsUnavailable, Runner
 from drella.storage import CHUNK, LocalStorage, NotFound, Storage
 
 log = logging.getLogger(__name__)
@@ -260,6 +269,8 @@ class JobOut(BaseModel):
     prompt: str
     repo: str | None
     pr: int | None = None
+    # The job that queued this one with its API token (issue #74), if any.
+    parent_job_id: str | None = None
     model: JobModelOut
     message: str | None
     usage: UsageOut | None = None
@@ -329,6 +340,7 @@ def job_out(job: Job, outputs: list[str] | None = None) -> JobOut:
         prompt=job.prompt,
         repo=job.repo,
         pr=job.pr,
+        parent_job_id=job.parent_job_id,
         model=JobModelOut(
             alias=job.model,
             interface=job.interface,
@@ -442,16 +454,79 @@ def bearer(authorization: Annotated[str | None, Header()] = None) -> str:
 @dataclass
 class Caller:
     token: Token
-    secret: str  # the raw token: needed to derive the credential key
+    # The key the token's credentials are encrypted with: derived from the raw token,
+    # or unwrapped with an operator job's API token.
+    cred_key: bytes
+    # The raw token, needed to encrypt credentials. None when the caller is an operator
+    # job acting with its API token, which can't manage credentials.
+    secret: str | None = None
+    # The operator token's job whose API token made this request (issue #74), if any.
+    parent_job: Job | None = None
+
+
+def _unauthorized(detail: str = "invalid token") -> HTTPException:
+    return HTTPException(401, detail, {"WWW-Authenticate": "Bearer"})
+
+
+def _token_caller(raw: str, db: Session) -> Caller | None:
+    token = db.scalar(select(Token).where(Token.lookup_hash == crypto.lookup_hash(raw)))
+    if token is None:
+        return None
+    return Caller(token, crypto.credential_key(raw, token.salt), secret=raw)
 
 
 def caller(
     raw: Annotated[str, Depends(bearer)], db: Annotated[Session, Depends(get_db)]
 ) -> Caller:
-    token = db.scalar(select(Token).where(Token.lookup_hash == crypto.lookup_hash(raw)))
-    if token is None:
-        raise HTTPException(401, "invalid token", {"WWW-Authenticate": "Bearer"})
-    return Caller(token, raw)
+    """A Drella token. Never an operator job's API token: routes that take this
+    (credentials, models) are out of that token's reach."""
+    c = _token_caller(raw, db)
+    if c is None:
+        raise _unauthorized()
+    return c
+
+
+def job_deadline(job: Job, deps: Deps) -> datetime | None:
+    """When a running job's Kubernetes Job is killed (activeDeadlineSeconds from
+    launch)."""
+    if job.started_at is None:
+        return None
+    started = job.started_at
+    if started.tzinfo is None:  # SQLite drops the time zone
+        started = started.replace(tzinfo=UTC)
+    return started + timedelta(seconds=deps.settings.job_timeout_seconds)
+
+
+def jobs_caller(
+    raw: Annotated[str, Depends(bearer)],
+    db: Annotated[Session, Depends(get_db)],
+    deps: Annotated[Deps, Depends(get_deps)],
+) -> Caller:
+    """A Drella token, or an operator token's job acting as its caller with its
+    job-scoped API token (issue #74). Only the routes that create and read jobs take
+    this. The API token works only while its job runs, until the job's deadline, and
+    only while its token is still an operator."""
+    c = _token_caller(raw, db)
+    if c is not None:
+        return c
+    job = db.scalar(select(Job).where(Job.api_token_hash == crypto.lookup_hash(raw)))
+    if job is None:
+        raise _unauthorized()
+    if job.status != RUNNING or job.api_key_wrap is None:
+        raise _unauthorized(
+            f"this API token's job is {job.status}; it works only while the job runs"
+        )
+    deadline = job_deadline(job, deps)
+    if deadline is not None and datetime.now(UTC) >= deadline:
+        raise _unauthorized("this API token's job has reached its deadline")
+    token = db.get(Token, job.token_id)
+    if token is None or token.role != OPERATOR:
+        raise _unauthorized("this API token's Drella token is no longer an operator")
+    try:
+        key = crypto.unwrap_key(raw, job.api_key_wrap)
+    except Exception:
+        raise _unauthorized() from None
+    return Caller(token, key, parent_job=job)
 
 
 def own_job(job_id: str, c: Caller, db: Session) -> Job:
@@ -476,6 +551,8 @@ def job_itself(
 
 
 CallerDep = Annotated[Caller, Depends(caller)]
+# The routes an operator job's API token may also use: creating and reading jobs.
+JobsCallerDep = Annotated[Caller, Depends(jobs_caller)]
 DbDep = Annotated[Session, Depends(get_db)]
 DepsDep = Annotated[Deps, Depends(get_deps)]
 
@@ -544,7 +621,23 @@ def list_credentials(c: CallerDep, db: DbDep) -> list[str]:
 
 
 @router.post("/jobs", status_code=201)
-def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
+def create_job(body: JobIn, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOut:
+    parent = c.parent_job
+    if parent is not None:
+        # An operator job queues jobs as its caller, up to a limit per run. On Postgres
+        # the parent's row lock serialises its creates, so the count can't be raced
+        # (SQLite ignores FOR UPDATE; see put_model).
+        db.execute(select(Job).where(Job.id == parent.id).with_for_update())
+        children = db.scalar(
+            select(func.count()).select_from(Job).where(Job.parent_job_id == parent.id)
+        )
+        limit = deps.settings.operator_max_child_jobs
+        if children >= limit:
+            raise HTTPException(
+                429,
+                f"job {parent.id} has already queued {children} jobs, the most one job may"
+                f" queue (DRELLA_OPERATOR_MAX_CHILD_JOBS={limit})",
+            )
     # Only the caller's own models [27].
     model = own_model(body.model, c, db)
     if model is None:
@@ -596,7 +689,7 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     # model's API key, if the model has one [27].
     def decrypt(name: str) -> str:
         # Stripped on read too, so credentials stored before stripping was added work.
-        return crypto.decrypt(c.secret, c.token.salt, creds[name].ciphertext).strip()
+        return crypto.decrypt_with_key(c.cred_key, creds[name].ciphertext).strip()
 
     secrets = {}
     if body.repo and not github_app:
@@ -613,6 +706,15 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         secrets[LLM_KEY_SECRET] = key
     job_token = crypto.new_token(crypto.JOB_TOKEN_PREFIX)
     secrets[JOB_TOKEN_KEY] = job_token
+    # An operator token's job gets a job-scoped API token (issue #74): never the
+    # caller's own token, and only its hash and the wrapped credential key are stored.
+    # It's made now, while the request holds the key, and works only while the job
+    # runs. A job queued with an API token gets none, so operator jobs can't fan out
+    # beyond one level.
+    api_token = None
+    if c.token.role == OPERATOR and parent is None:
+        api_token = crypto.new_token(crypto.API_TOKEN_PREFIX)
+        secrets[API_TOKEN_KEY] = api_token
     job = Job(
         token_id=c.token.id,
         prompt=body.prompt,
@@ -630,6 +732,9 @@ def create_job(body: JobIn, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
         cost_out_per_mtok=model.cost_out_per_mtok,
         job_token_hash=crypto.lookup_hash(job_token),
         github_app=github_app,
+        parent_job_id=parent.id if parent is not None else None,
+        api_token_hash=crypto.lookup_hash(api_token) if api_token else None,
+        api_key_wrap=crypto.wrap_key(api_token, c.cred_key) if api_token else None,
     )
     db.add(job)
     db.flush()
@@ -765,7 +870,7 @@ def delete_model(alias: str, c: CallerDep, db: DbDep) -> Response:
 
 
 @router.get("/jobs")
-def list_jobs(c: CallerDep, db: DbDep) -> list[JobOut]:
+def list_jobs(c: JobsCallerDep, db: DbDep) -> list[JobOut]:
     jobs = db.scalars(
         select(Job).where(Job.token_id == c.token.id).order_by(Job.created_at.desc())
     )
@@ -773,7 +878,7 @@ def list_jobs(c: CallerDep, db: DbDep) -> list[JobOut]:
 
 
 @router.get("/jobs/{job_id}")
-def get_job(job_id: str, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
+def get_job(job_id: str, c: JobsCallerDep, db: DbDep, deps: DepsDep) -> JobOut:
     job = own_job(job_id, c, db)
     prefix = output_prefix(job.id)
     outputs = [k.removeprefix(prefix) for k in deps.storage.list(prefix)]
@@ -783,7 +888,7 @@ def get_job(job_id: str, c: CallerDep, db: DbDep, deps: DepsDep) -> JobOut:
 @router.get("/jobs/{job_id}/logs")
 def job_logs(
     job_id: str,
-    c: CallerDep,
+    c: JobsCallerDep,
     db: DbDep,
     deps: DepsDep,
     follow: bool = False,
@@ -852,7 +957,11 @@ def _sse(chunks: Iterator[bytes], deps: Deps, job_id: str) -> Iterator[bytes]:
 
 @router.get("/jobs/{job_id}/outputs/{name}")
 def get_output(
-    job_id: str, name: Annotated[str, Path(pattern=OUTPUT_RE)], c: CallerDep, db: DbDep, deps: DepsDep
+    job_id: str,
+    name: Annotated[str, Path(pattern=OUTPUT_RE)],
+    c: JobsCallerDep,
+    db: DbDep,
+    deps: DepsDep,
 ) -> StreamingResponse:
     job = own_job(job_id, c, db)
     try:

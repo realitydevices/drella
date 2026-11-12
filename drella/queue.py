@@ -172,7 +172,14 @@ class Queue:
         self._last_tick = time.monotonic()
 
     def _launch(self, s: Session, job: Job) -> None:
-        spec = JobSpec(job.id, job.repo, model_spec(job), job.prompt, pr=job.pr)
+        spec = JobSpec(
+            job.id,
+            job.repo,
+            model_spec(job),
+            job.prompt,
+            pr=job.pr,
+            api_token=job.api_token_hash is not None,
+        )
         try:
             if job.github_app and job.repo:
                 spec = self._mint_github_token(s, job, spec)
@@ -323,5 +330,8 @@ class Queue:
         job.status = status
         job.message = message
         job.finished_at = datetime.now(UTC)
+        # The API token of an operator token's job dies with it: its status already
+        # refuses it, and without the wrapped key it couldn't decrypt anything anyway.
+        job.api_key_wrap = None
         s.commit()
         log.info("job %s %s: %s", job.id, status, message)

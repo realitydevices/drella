@@ -532,7 +532,7 @@ def test_the_profile_is_read_when_the_job_launches(app_client, app_auth, app_set
     from drella.cli import list_tokens, set_profile
 
     app_client.post("/jobs", json=JOB, headers=app_auth)
-    ((tid, name, profile),) = list_tokens(app_settings)
+    ((tid, name, profile, _role),) = list_tokens(app_settings)
     assert (name, profile) == ("alice", "builder")
     set_profile(app_settings, tid, "reader")
     app_client.queue.tick()

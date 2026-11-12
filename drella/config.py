@@ -99,6 +99,10 @@ class Settings:
     # More GitHub Apps, besides the one above (e.g. superstar, for profiles that name
     # it). The Apps together: drella/github.py's app_configs.
     github_apps: tuple[GitHubAppConfig, ...] = field(default_factory=_github_apps_from_env)
+    # How many jobs an operator token's job may queue with its API token (issue #74).
+    operator_max_child_jobs: int = field(
+        default_factory=lambda: int(os.environ.get("DRELLA_OPERATOR_MAX_CHILD_JOBS", "6"))
+    )
     # Default limits [23].
     job_timeout_seconds: int = 3600
     job_memory: str = "2Gi"

@@ -271,3 +271,36 @@ def test_0007_adds_nullable_pr_column_and_downgrades(settings):
         with pytest.raises(Exception):
             conn.execute(text("SELECT pr FROM jobs"))
     engine.dispose()
+
+
+def test_0008_adds_roles_parent_jobs_and_api_tokens_and_downgrades(settings):
+    engine = make_engine(settings.database_url)
+    _upgrade(engine, "0007")
+    _seed_token(engine)
+    _insert_v02_job(engine, "j1", "succeeded")
+    _upgrade(engine, "0008")
+    with engine.begin() as conn:
+        # Existing tokens are members; existing jobs have no parent and no API token.
+        assert conn.execute(text("SELECT role FROM tokens")).scalar() == "member"
+        row = conn.execute(
+            text("SELECT parent_job_id, api_token_hash, api_key_wrap FROM jobs")
+        ).one()
+        assert tuple(row) == (None, None, None)
+    _insert_v02_job(engine, "j2", "running")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE tokens SET role = 'operator'"))
+        conn.execute(text("UPDATE jobs SET parent_job_id = 'j1', api_token_hash = 'ah',"
+                          " api_key_wrap = :w WHERE id = 'j2'"), {"w": b"wrapped"})
+        assert conn.execute(
+            text("SELECT parent_job_id FROM jobs WHERE id = 'j2'")
+        ).scalar() == "j1"
+    _downgrade(engine, "0007")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM jobs")).scalar() == 2
+        for col, table in (("role", "tokens"), ("parent_job_id", "jobs"),
+                           ("api_token_hash", "jobs"), ("api_key_wrap", "jobs")):
+            with pytest.raises(Exception):
+                conn.execute(text(f"SELECT {col} FROM {table}"))
+            conn.rollback()
+    _upgrade(engine, "head")
+    engine.dispose()

@@ -31,8 +31,29 @@ def test_agent_output_is_never_read_through_a_symlink():
 
 
 def test_wrapper_redacts_every_job_secret():
-    for name in ("DRELLA_LLM_KEY", "GH_TOKEN", "DRELLA_JOB_TOKEN"):
+    for name in ("DRELLA_LLM_KEY", "GH_TOKEN", "DRELLA_JOB_TOKEN", "DRELLA_API_TOKEN"):
         assert f'ENVIRON["{name}"]' in WRAPPER
+
+
+def test_redact_hides_an_operator_jobs_api_token():
+    # issue #74: the API token can queue jobs as the caller, so it's redacted like the
+    # others. Run the wrapper's own redact() on a line that prints it.
+    import os
+    import subprocess
+
+    fn = "redact() {" + WRAPPER.split("\nredact() {", 1)[1].split("\n}\n", 1)[0] + "\n}"
+    env = {**os.environ, "DRELLA_API_TOKEN": "dra_secretsecret", "DRELLA_JOB_TOKEN": "drj_jobjobjob"}
+    r = subprocess.run(
+        ["bash", "-c", fn + "\nredact"],
+        input="token dra_secretsecret and drj_jobjobjob\n",
+        capture_output=True, text=True, env=env, check=True,
+    )
+    assert r.stdout == "token [redacted] and [redacted]\n"
+
+
+def test_an_operator_job_is_told_about_its_api_token():
+    assert 'if [ -n "${DRELLA_API_TOKEN:-}" ]; then' in WRAPPER
+    assert "$DRELLA_API_TOKEN as a bearer token" in WRAPPER
 
 
 def test_wrapper_turns_on_auto_merge_on_success():
