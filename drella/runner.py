@@ -92,7 +92,13 @@ def is_transient(e: Exception) -> bool:
     from urllib3.exceptions import HTTPError, LocationValueError, MaxRetryError, SSLError
 
     if isinstance(e, ApiException):
-        return not e.status or e.status == 429 or e.status >= 500
+        if not e.status:
+            # The client wraps urllib3's SSLError and LocationValueError (a bad CA or
+            # URL) as status 0, with the exception's name as the first line of the
+            # reason: configuration, not an outage. Other status-0 errors stay transient.
+            first_line = str(e.reason or "").split("\n", 1)[0]
+            return not any(name in first_line for name in ("SSLError", "LocationValueError"))
+        return e.status == 429 or e.status >= 500
     if isinstance(e, MaxRetryError) and isinstance(e.reason, Exception):
         # urllib3 gave up retrying: what failed decides.
         return is_transient(e.reason)
@@ -422,8 +428,11 @@ class KubernetesRunner:
 
         errors: list[Exception] = []
         if remove_github:
-            # First, so no live token is left in the Secret while the job backs off.
-            # A null removes the key from a merge patch.
+            # First, so no live token is left in the Secret while the job backs off. Best
+            # effort: if this patch fails (during an outage, say), the token stays in the
+            # Secret during the backoff. The next launch attempt mints and overwrites the
+            # key before anything else, so the stale token is replaced then. A null
+            # removes the key from a merge patch.
             try:
                 self.core.patch_namespaced_secret(
                     k8s_name(job_id), self.ns, {"data": {"github": None}},

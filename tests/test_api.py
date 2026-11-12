@@ -441,6 +441,15 @@ def test_is_transient_api_exceptions(status):
     assert is_transient(_api_error(status))
 
 
+@pytest.mark.parametrize("reason", ["SSLError\nboom", "LocationValueError\nno host"])
+def test_is_not_transient_for_tls_and_url_errors_wrapped_as_status_0(reason):
+    from kubernetes.client.exceptions import ApiException
+
+    from drella.runner import is_transient
+
+    assert not is_transient(ApiException(status=0, reason=reason))
+
+
 @pytest.mark.parametrize("status", [400, 403, 404, 409, 422])
 def test_is_not_transient_for_4xx(status):
     from drella.runner import is_transient
