@@ -281,6 +281,55 @@ from the default branch.
    a required review, auto-merge has nothing to wait for, and a job's PR can merge with
    no human looking at it.
 
+## Superstar (optional)
+
+The superstar is a Claude that supervises the build loop on a schedule (issue #75): every
+30 minutes it reviews and merges PRs, queues builds, fixes and reviews for issues labelled
+`superstar`, and writes a report. Its routine is the prompt in `docs/superstar.md`, so
+changes to it are reviewed like code. It needs the superstar GitHub profile (#73, above)
+and operator tokens (#74). It never tags or deploys.
+
+1. **Create its Drella token**, with the `superstar` profile and the `operator` role (both set
+   only by the admin CLI):
+
+   ```sh
+   kubectl -n drella exec deploy/drella -- drella token create --name superstar \
+     --github-profile superstar --role operator
+   ```
+
+   It prints the token once. Its jobs get a short-lived API token (`DRELLA_API_TOKEN`) to
+   queue and read their own child jobs, at most 6 per run; the token itself is never in
+   the job.
+
+2. **Give it models and a Claude credential**, as a normal user does (see **Run a job**
+   below), authenticating as the superstar token. The CronJob asks for the alias
+   `claude-opus`, so register that, with its Claude OAuth credential (`claude setup-token`).
+   Also register the models it may choose for builds and reviews (e.g. `claude-sonnet`,
+   `claude-haiku`, and local ones such as `qwen` and `gemma`): models are per token, and
+   it rotates reviewers across all it can see.
+
+3. **Create the `superstar-token` Secret** from the token in step 1:
+
+   ```sh
+   kubectl -n drella create secret generic superstar-token --from-literal=token=<the token>
+   ```
+
+4. **Enable the CronJob** in an overlay (the commented example at the top of
+   `deploy/superstar-cronjob.yaml`): add `superstar-cronjob.yaml` to `resources`, and a
+   `configMapGenerator` entry named `superstar-prompt` with `superstar.md=docs/superstar.md`.
+   The CronJob (`concurrencyPolicy: Forbid`) posts the job, and skips the run if a
+   superstar job is still queued or running. Run it once by hand to try it:
+   `kubectl -n drella create job --from=cronjob/superstar superstar-try`.
+
+5. **Hand it work with the `superstar` label.** GitHub Apps can't be assigned issues, so
+   label an issue `superstar` and the next run picks it up. Anything it can't decide it
+   labels `needs-kirk` and comments why.
+
+It may merge any PR with two approving reviews from different models on the current head,
+green CI and no open confirmed medium-or-worse finding, so the superstar App needs the
+ruleset bypass described under **Approvals and branch protection**. Tagging and deploying
+stay with you.
+
 ## Reaching Drella
 
 Drella exposes one HTTP service, `drella` on port 8000. What sits in front of it is up

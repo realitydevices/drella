@@ -1,0 +1,99 @@
+# Optional: the superstar's scheduled run (issue #75, docs/superstar.md). Not in the
+# default kustomization. Every 30 minutes it POSTs one Drella job whose prompt is
+# docs/superstar.md, unless a superstar job is still queued or running.
+#
+# To enable it, add an overlay next to this directory (see "Superstar" in deploy/README.md):
+#
+#   # overlays/superstar/kustomization.yaml
+#   apiVersion: kustomize.config.k8s.io/v1beta1
+#   kind: Kustomization
+#   resources:
+#     - ../../deploy
+#     - ../../deploy/superstar-cronjob.yaml
+#   configMapGenerator:
+#     - name: superstar-prompt            # the name the CronJob below mounts
+#       files:
+#         - superstar.md=../../docs/superstar.md
+#   generatorOptions:
+#     disableNameSuffixHash: true         # the CronJob names the ConfigMap as it is
+#
+# It also needs the Secret `superstar-token` (key: token): a Drella API token with the
+# `superstar` profile and `operator` role. Create it first.
+#
+# The job's prompt starts with the marker line `drella-superstar-run:v1` (the first line of
+# docs/superstar.md). Both the "already running?" check below and the prompt use it: keep
+# them in step if you change it.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: superstar
+  namespace: drella
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100      # curlimages/curl's curl_user
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: post-job
+              # A tiny curl image (busybox sh, grep, sed, awk). Pin it by digest in your overlay.
+              image: curlimages/curl:8.11.1
+              env:
+                - name: DRELLA_URL
+                  value: http://drella.drella.svc:8000
+                - name: DRELLA_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: superstar-token
+                      key: token
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: prompt
+                  mountPath: /prompt
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+              command:
+                - sh
+                - -ec
+                - |
+                  auth="Authorization: Bearer $DRELLA_TOKEN"
+                  marker=$(head -n 1 /prompt/superstar.md)
+                  # Skip if a superstar job is already queued or running. JobOut lists
+                  # "status" before "prompt", and the marker is the prompt's first line.
+                  jobs=$(curl -fsS -H "$auth" "$DRELLA_URL/jobs")
+                  if printf '%s' "$jobs" | grep -Eq "\"status\": ?\"(queued|running)\", ?\"prompt\": ?\"$marker"; then
+                    echo "a superstar job is already queued or running; skipping"
+                    exit 0
+                  fi
+                  # JSON-encode the prompt: escape \ and ", turn newlines into \n.
+                  prompt=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' /prompt/superstar.md | awk 'BEGIN{ORS="\\n"} {print}')
+                  printf '{"prompt":"%s","model":"claude-opus","repo":"realitydevices/drella"}' "$prompt" > /tmp/job.json
+                  curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
+                    --data-binary @/tmp/job.json "$DRELLA_URL/jobs"
+                  echo
+              resources:
+                requests: {cpu: 10m, memory: 16Mi}
+                limits: {memory: 64Mi}
+          volumes:
+            - name: prompt
+              configMap:
+                name: superstar-prompt
+            - name: tmp
+              emptyDir: {}
