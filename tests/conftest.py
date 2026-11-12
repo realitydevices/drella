@@ -26,12 +26,16 @@ class FakeRunner:
         # Exceptions for the next launch calls, one each, oldest first.
         self.launch_errors: list[Exception] = []
         self.reset: list[str] = []
+        # Exceptions for the next add_secrets calls, one each, oldest first.
+        self.add_secrets_errors: list[Exception] = []
 
     def prepare(self, job_id, secrets):
         self.secrets[job_id] = dict(secrets)
         self.secret_created[job_id] = datetime.now(UTC)
 
     def add_secrets(self, job_id, secrets):
+        if self.add_secrets_errors:
+            raise self.add_secrets_errors.pop(0)
         self.secrets[job_id].update(secrets)
 
     def launch(self, spec):
@@ -53,9 +57,11 @@ class FakeRunner:
     def cleanup(self, job_id):
         self.cleaned.append(job_id)
 
-    def reset_launch(self, job_id):
+    def reset_launch(self, job_id, remove_github=False):
+        # Like KubernetesRunner: the Secret's other keys are never touched.
         self.reset.append(job_id)
-        self.secrets.get(job_id, {}).pop("github", None)
+        if remove_github:
+            self.secrets.get(job_id, {}).pop("github", None)
 
     def job_secrets(self):
         return {j: t for j, t in self.secret_created.items() if j not in self.cleaned}

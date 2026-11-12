@@ -373,7 +373,8 @@ def test_a_transient_launch_error_leaves_the_job_queued_and_backs_off(client, au
     assert (status, attempts) == ("queued", 1) and not_before is not None
     # The secret is kept for the retry; the attempt was undone.
     assert runner.reset == [job["id"]] and runner.cleaned == []
-    assert job["id"] in runner.secrets
+    # The caller's stored credential is still there; it can't be recreated.
+    assert runner.secrets[job["id"]]["github"] == "ghp_x"
     # Still backing off: not tried again.
     queue.tick()
     assert runner.launched == [] and _launch_row(queue, job["id"])[1] == 1
@@ -406,18 +407,23 @@ def test_six_transient_launch_errors_fail_the_job(client, auth, job, queue, runn
     assert runner.launched == [] and runner.cleaned == [job["id"]]
 
 
-def test_backoff_doubles_up_to_ten_minutes(client, auth, job, queue, runner):
+def test_backoff_doubles_up_to_ten_minutes(client, auth, job, queue, runner, monkeypatch):
     from datetime import UTC, datetime
 
-    runner.launch_errors = [_api_error(500)] * 5
+    from drella import queue as q
+
+    # 30 s * 2^(attempts-1), capped at 600 s. With the default LAUNCH_ATTEMPTS (6) the
+    # job fails before reaching the cap, so allow more attempts here.
+    monkeypatch.setattr(q, "LAUNCH_ATTEMPTS", 8)
+    runner.launch_errors = [_api_error(500)] * 7
     delays = []
-    for _ in range(5):
+    for _ in range(7):
         before = datetime.now(UTC)
         queue.tick()
         nb = _launch_row(queue, job["id"])[2]
-        delays.append(round((nb.replace(tzinfo=UTC) - before).total_seconds() / 30))
+        delays.append(round((nb.replace(tzinfo=UTC) - before).total_seconds()))
         _backoff_over(queue, job["id"])
-    assert delays == [1, 2, 4, 8, 16]
+    assert delays == [30, 60, 120, 240, 480, 600, 600]
 
 
 def test_a_422_launch_error_fails_the_job_at_once(client, auth, job, queue, runner):
@@ -450,11 +456,25 @@ def test_is_transient_for_network_errors():
     from drella.runner import is_transient
 
     for e in (
-        MaxRetryError(None, "/x"), NewConnectionError(None, "x"), ProtocolError("x"),
-        ReadTimeoutError(None, "/x", "x"), ConnectionResetError(), TimeoutError(), socket.timeout(),
+        MaxRetryError(None, "/x"), MaxRetryError(None, "/x", NewConnectionError(None, "x")),
+        NewConnectionError(None, "x"), ProtocolError("x"), ReadTimeoutError(None, "/x", "x"),
+        ConnectionResetError(), TimeoutError(), socket.timeout(),
+        socket.gaierror(-3, "Temporary failure in name resolution"),
     ):
         assert is_transient(e), e
     assert not is_transient(RuntimeError("x")) and not is_transient(ValueError("x"))
+
+
+def test_is_not_transient_for_configuration_errors():
+    from urllib3.exceptions import LocationParseError, LocationValueError, MaxRetryError, SSLError
+
+    from drella.runner import is_transient
+
+    for e in (
+        SSLError("certificate verify failed"), LocationValueError("no host"),
+        LocationParseError("http://["), MaxRetryError(None, "/x", SSLError("bad cert")),
+    ):
+        assert not is_transient(e), e
 
 
 # -- job-scoped endpoints -------------------------------------------------------

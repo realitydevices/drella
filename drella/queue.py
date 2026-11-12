@@ -36,12 +36,31 @@ REAP_EVERY = 60  # seconds
 # and only for failures that may pass (GitHub 5xx, 429, network errors).
 MINT_ATTEMPTS = 3
 MINT_BACKOFF = (0.5, 1.0)
-# runner.launch failing transiently (the API server is briefly down): the job stays
-# queued and is retried after min(LAUNCH_BACKOFF * 2^attempts, LAUNCH_BACKOFF_MAX)
-# seconds; after LAUNCH_ATTEMPTS failures it fails.
+# runner.launch (or adding a minted GitHub token to the job's Secret) failing
+# transiently, e.g. the API server is briefly down: the job stays queued and is retried
+# after min(LAUNCH_BACKOFF * 2^(attempts-1), LAUNCH_BACKOFF_MAX) seconds, attempts
+# counting this failure (30 s, 60 s, 120 s, ...); after LAUNCH_ATTEMPTS failures it
+# fails.
 LAUNCH_ATTEMPTS = 6
 LAUNCH_BACKOFF = 30
 LAUNCH_BACKOFF_MAX = 600
+
+
+class _RetryLaunch(Exception):
+    """A launch step failed in a way that may pass. `reason` goes into the job's
+    message and `detail` into the log; neither quotes anything secret."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
+def _reason(e: Exception) -> str:
+    reason = type(e).__name__
+    if getattr(e, "status", None):
+        reason += f" {e.status}"
+    return reason
 
 
 def log_key(job_id: str) -> str:
@@ -194,7 +213,9 @@ class Queue:
             except Exception as e:
                 if not is_transient(e):
                     raise
-                return self._retry_launch(s, job, e)
+                raise _RetryLaunch(_reason(e), str(e)) from e
+        except _RetryLaunch as e:
+            return self._retry_launch(s, job, e)
         except Exception as e:
             # A failed mint fails the job rather than leaving it queued: the queue
             # always takes the oldest queued job, so one that can't launch would block
@@ -210,23 +231,23 @@ class Queue:
         log.info("job %s launched", job.id)
         return True
 
-    def _retry_launch(self, s: Session, job: Job, e: Exception) -> bool:
-        """runner.launch failed in a way that may pass. Undo this attempt (not the
-        job's Secret, which a retry needs) and leave the job queued, not to be tried
-        before a backoff has passed; or fail it after LAUNCH_ATTEMPTS."""
+    def _retry_launch(self, s: Session, job: Job, e: _RetryLaunch) -> bool:
+        """Launching failed in a way that may pass. Undo this attempt (not the job's
+        Secret, which a retry needs) and leave the job queued, not to be tried before a
+        backoff has passed; or fail it after LAUNCH_ATTEMPTS."""
         attempts = job.launch_attempts or 0
-        reason = f"{type(e).__name__}"
-        if getattr(e, "status", None):
-            reason += f" {e.status}"
+        reason = e.reason
         try:
-            # No Job, and no GitHub token, left behind.
-            self.runner.reset_launch(job.id)
+            # No Job left behind, nor a GitHub token Drella minted (it's minted again
+            # next time). A caller's own `github` credential stays: it exists only in
+            # the Secret.
+            self.runner.reset_launch(job.id, remove_github=bool(job.github_app and job.repo))
         except Exception:
             log.exception("undoing the launch of job %s failed", job.id)
         attempts += 1
         job.launch_attempts = attempts
         if attempts >= LAUNCH_ATTEMPTS:
-            log.error("launching job %s failed %d times (%s)", job.id, attempts, e)
+            log.error("launching job %s failed %d times (%s)", job.id, attempts, e.detail)
             self._finish(s, job, FAILED, f"launch failed after {attempts} attempts: {reason}")
             self._cleanup(job.id)
             return True
@@ -235,7 +256,7 @@ class Queue:
         s.commit()
         log.warning(
             "launching job %s failed (%s); attempt %d of %d, retrying in %ds",
-            job.id, e, attempts, LAUNCH_ATTEMPTS, delay,
+            job.id, e.detail, attempts, LAUNCH_ATTEMPTS, delay,
         )
         return False
 
@@ -270,6 +291,12 @@ class Queue:
             # Don't pass on the cluster's error text: it may quote the request.
             log.error("adding the GitHub token to job %s's Secret failed (%s)", job.id,
                       type(e).__name__)
+            if is_transient(e):
+                # Retried like a failed launch (which also removes the token, in case
+                # the patch went through).
+                raise _RetryLaunch(
+                    _reason(e), f"adding the GitHub token to the Secret failed ({_reason(e)})"
+                ) from None
             raise RuntimeError("couldn't add the GitHub token to the job's Secret") from None
         log.info(
             "minted a GitHub App token for job %s (%s, profile %s)", job.id, job.repo, profile.name

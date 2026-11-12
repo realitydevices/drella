@@ -6,6 +6,7 @@ import dataclasses
 import json
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -22,6 +23,7 @@ from drella.github import (
     app_jwt,
     load_key,
 )
+from drella.models import Job
 from drella.runner import JOB_TOKEN_KEY, RunState, RunStatus
 
 BUILDER, READER = PROFILES["builder"], PROFILES["reader"]
@@ -645,3 +647,66 @@ def test_there_is_no_token_refresh_route(app_client, app_auth, runner):
     app_client.queue.tick()
     r = app_client.post(f"/jobs/{jid}/github-token", headers=job_auth(runner, jid))
     assert r.status_code in (404, 405)
+
+
+def _api_error(status):
+    from kubernetes.client.exceptions import ApiException
+
+    return ApiException(status=status, reason="nope")
+
+
+def test_a_transient_launch_error_keeps_the_callers_stored_github_credential(
+    app_client, app_auth, runner, github
+):
+    app_client.put("/credentials/github", json={"value": "github_pat_mine"}, headers=app_auth)
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    runner.launch_errors = [_api_error(503)]
+    app_client.queue.tick()
+    assert app_client.get(f"/jobs/{jid}", headers=app_auth).json()["status"] == "queued"
+    assert runner.reset == [jid]
+    # It exists only in the Secret: removing it would lose it for good.
+    assert runner.secrets[jid]["github"] == "github_pat_mine"
+    _backoff_over(app_client.queue, jid)
+    app_client.queue.tick()
+    assert [sp.job_id for sp in runner.launched] == [jid]
+    assert runner.secrets[jid]["github"] == "github_pat_mine"
+    assert github.requests == []
+
+
+def test_a_transient_launch_error_removes_a_minted_token_and_mints_again(
+    app_client, app_auth, runner, github
+):
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    runner.launch_errors = [_api_error(503)]
+    app_client.queue.tick()
+    assert github.minted == 1 and "github" not in runner.secrets[jid]
+    _backoff_over(app_client.queue, jid)
+    app_client.queue.tick()
+    assert github.minted == 2 and runner.secrets[jid]["github"] == "ghs_minted0002"
+    assert app_client.get(f"/jobs/{jid}", headers=app_auth).json()["status"] == "running"
+
+
+@pytest.mark.parametrize("error", [_api_error(503), ConnectionError("down")])
+def test_a_transient_secret_patch_failure_backs_off_instead_of_failing(
+    app_client, app_auth, runner, github, error
+):
+    jid = app_client.post("/jobs", json=JOB, headers=app_auth).json()["id"]
+    runner.add_secrets_errors = [error]
+    app_client.queue.tick()
+    with app_client.queue.sessions() as s:
+        row = s.get(Job, jid)
+        assert (row.status, row.launch_attempts) == ("queued", 1)
+        assert row.not_before is not None and row.message is None
+    # The token is removed in case the patch went through after all.
+    assert runner.reset == [jid] and "github" not in runner.secrets[jid]
+    assert runner.launched == [] and runner.cleaned == []
+    _backoff_over(app_client.queue, jid)
+    app_client.queue.tick()
+    assert runner.secrets[jid]["github"] == "ghs_minted0002"
+    assert app_client.get(f"/jobs/{jid}", headers=app_auth).json()["status"] == "running"
+
+
+def _backoff_over(queue, job_id):
+    with queue.sessions() as s:
+        s.get(Job, job_id).not_before = datetime.now(UTC) - timedelta(seconds=1)
+        s.commit()
