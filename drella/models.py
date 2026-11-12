@@ -63,6 +63,7 @@ class Credential(Base):
 
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 TERMINAL = (SUCCEEDED, FAILED)
+JOB_STATUSES = (QUEUED, RUNNING, SUCCEEDED, FAILED)
 
 
 class Job(Base):

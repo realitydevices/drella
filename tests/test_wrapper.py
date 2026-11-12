@@ -502,7 +502,8 @@ def test_the_operator_paragraph_is_in_the_instructions_only_with_an_api_token():
     assert "Drella API" not in without and "DRELLA_API_TOKEN" not in without
     with_token = run(DRELLA_API_TOKEN="dra_secretsecret")
     assert "$DRELLA_API_TOKEN as a bearer token" in with_token
-    assert '"profile": "builder"' in with_token
+    assert '"profile": "builder"' not in with_token
+    assert 'may only be "reader"' in with_token and "can't open a PR" in with_token
     assert "dra_secretsecret" not in with_token  # told about, never given the value
     assert with_token.startswith(without)
     assert "DRELLA_BUILDER_TOKEN" not in with_token

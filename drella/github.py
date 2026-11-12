@@ -105,6 +105,9 @@ PROFILES = {
 # The supervisor's profile: never given to a job queued with an operator job's API
 # token (issue #74), whatever its caller's profile.
 SUPERSTAR = "superstar"
+# The only GitHub profile a job queued with an operator job's API token may have (issue #75):
+# a supervisor queues builds with a separate builder Drella token, never with its API token.
+CHILD_PROFILE = "reader"
 _LEVELS = {"read": 1, "write": 2}
 
 

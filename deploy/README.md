@@ -222,8 +222,9 @@ Only an admin sets a token's profile, with the CLI inside Drella's pod. A caller
 widen it or ask for permissions per job; it may only narrow it for one job, with
 `profile` on `POST /jobs`: a profile whose permissions are all within its own (a
 `builder` may ask for `reader`, a `superstar` for `builder` or `reader`), never a wider
-one (422). A job queued with an operator job's API token is `reader` unless it asks
-for more, and is never `superstar` ([docs/v0.3.md](../docs/v0.3.md#job-profiles)):
+one (422). A job queued with an operator job's API token is always `reader`: asking for
+`builder` or `superstar` gets 422 ([docs/v0.3.md](../docs/v0.3.md#job-profiles)). An
+operator queues builds with its builder token (below) instead:
 
 ```sh
 kubectl -n drella exec deploy/drella -- drella token create --name <name> --github-profile builder

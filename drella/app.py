@@ -34,8 +34,9 @@ from drella import crypto
 from drella.adapters import LLM_KEY_SECRET, Interface
 from drella.config import Settings
 from drella.db import make_engine, make_sessionmaker, migrate
-from drella.github import PROFILES, SUPERSTAR, GitHubApp, covers
+from drella.github import CHILD_PROFILE, PROFILES, GitHubApp, covers
 from drella.models import (
+    JOB_STATUSES,
     OPERATOR,
     QUEUED,
     RUNNING,
@@ -139,7 +140,7 @@ class JobIn(BaseModel):
         default=None,
         description="The GitHub profile of the job's minted GitHub token: the caller's own"
         " profile or a narrower one (its permissions a subset of the caller's), never a wider"
-        " one, and never superstar with an operator job's API token. Left out, a job gets"
+        " one, and only reader with an operator job's API token. Left out, a job gets"
         " its Drella token's profile, or reader if it's queued with an API token. Can't"
         " differ from the token's own profile if the caller has a stored `github` credential.",
     )
@@ -568,16 +569,20 @@ def _job_profile(body: JobIn, c: Caller, stored_github: bool) -> str | None:
     """The GitHub profile stored on a new job, or None for the Drella token's own
     (read when the token is minted). A caller may ask for its token's profile or a
     narrower one: every permission the asked-for profile has, the token's must grant at
-    the same level or higher. A job queued with an operator job's API token defaults to
-    reader, never its parent's profile, and can't be superstar. The queue checks the
+    the same level or higher. A job queued with an operator job's API token is always
+    reader: never its parent's profile, and never builder (a supervisor queues builds with
+    a separate builder Drella token, as an ordinary caller). The queue checks the
     stored profile again when it mints the token (Queue._mint_github_token)."""
     own = PROFILES.get(c.token.github_profile)
     api = c.parent_job is not None
     asked = body.profile
     if asked is not None:
-        if api and asked == SUPERSTAR:
+        if api and asked != CHILD_PROFILE:
             raise HTTPException(
-                422, f"a job queued with an operator job's API token can't be '{SUPERSTAR}'"
+                422,
+                f"a job queued with an operator job's API token can only be '{CHILD_PROFILE}',"
+                f" not '{asked}': queue builds and fixes with a builder Drella token (the"
+                " operator's `drella-builder` credential, DRELLA_BUILDER_TOKEN) instead",
             )
         if own is None or not covers(own, PROFILES[asked]):
             raise HTTPException(
@@ -611,7 +616,7 @@ def _job_profile(body: JobIn, c: Caller, stored_github: bool) -> str | None:
         return None
     if asked is not None:
         return asked
-    return "reader" if api else None
+    return CHILD_PROFILE if api else None
 
 
 def own_job(job_id: str, c: Caller, db: Session) -> Job:
@@ -968,10 +973,21 @@ def delete_model(alias: str, c: CallerDep, db: DbDep) -> Response:
 
 
 @router.get("/jobs")
-def list_jobs(c: JobsCallerDep, db: DbDep) -> list[JobOut]:
-    jobs = db.scalars(
-        select(Job).where(Job.token_id == c.token.id).order_by(Job.created_at.desc())
-    )
+def list_jobs(c: JobsCallerDep, db: DbDep, status: str | None = None) -> list[JobOut]:
+    """The caller's jobs, newest first. `status` filters by a comma-separated list of
+    statuses (e.g. `queued,running`), so a poller needn't fetch every job's prompt."""
+    q = select(Job).where(Job.token_id == c.token.id)
+    if status is not None:
+        wanted = [s.strip() for s in status.split(",") if s.strip()]
+        bad = sorted({s for s in wanted if s not in JOB_STATUSES})
+        if not wanted or bad:
+            raise HTTPException(
+                422,
+                f"`status` must be a comma-separated list of {', '.join(JOB_STATUSES)}"
+                + (f"; unknown: {', '.join(bad)}" if bad else ""),
+            )
+        q = q.where(Job.status.in_(wanted))
+    jobs = db.scalars(q.order_by(Job.created_at.desc()))
     return [job_out(j) for j in jobs]
 
 

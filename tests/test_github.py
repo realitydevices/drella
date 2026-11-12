@@ -886,10 +886,11 @@ def test_a_superstar_token_is_checked_like_any_other(two_apps_client, superstar_
     assert "granted more than the 'superstar' profile" in got["message"]
 
 
-def test_a_superstar_operators_children_get_the_profile_they_ask_for(
+def test_a_superstar_operators_children_are_only_ever_readers(
     two_apps_client, superstar_settings, runner, github
 ):
-    """Issue #74: a child never inherits the superstar profile; it's reader or builder."""
+    """Issues #74, #75: a child never inherits the superstar profile, and is always
+    reader: builds go through the operator's builder token, never its API token."""
     from drella.cli import create_token
 
     op = create_token(superstar_settings, "sam", "superstar", role="operator")
@@ -902,18 +903,20 @@ def test_a_superstar_operators_children_get_the_profile_they_ask_for(
     api = {"Authorization": f"Bearer {runner.secrets[jid]['_api-token']}"}
 
     reader = c.post("/jobs", json=JOB, headers=api).json()
-    builder = c.post("/jobs", json={**JOB, "profile": "builder"}, headers=api).json()
-    fix = c.post("/jobs", json={**JOB, "profile": "builder", "pr": 3}, headers=api)
-    assert fix.status_code == 201
-    assert c.post("/jobs", json={**JOB, "pr": 3}, headers=api).status_code == 422
+    asked = c.post("/jobs", json={**JOB, "profile": "reader"}, headers=api).json()
+    for extra in ({"profile": "builder"}, {"profile": "builder", "pr": 3}, {"pr": 3}):
+        r = c.post("/jobs", json={**JOB, **extra}, headers=api)
+        assert r.status_code == 422, (extra, r.text)
+    r = c.post("/jobs", json={**JOB, "profile": "builder"}, headers=api)
+    assert "builder Drella token" in r.json()["detail"]
     c.queue.tick()
     specs = {s.job_id: s for s in runner.launched}
-    assert specs[reader["id"]].opens_prs is False and specs[reader["id"]].read_only is True
-    assert specs[builder["id"]].opens_prs is True and specs[builder["id"]].read_only is False
-    assert specs[fix.json()["id"]].opens_prs is True
+    for job in (reader, asked):
+        assert job["github_profile"] == "reader"
+        assert specs[job["id"]].opens_prs is False and specs[job["id"]].read_only is True
     perms = [r[2]["permissions"] for r in github.requests if r[2]]
-    assert perms[-3:] == [READER.permissions, BUILDER.permissions, BUILDER.permissions]
-    assert github.issuers[-3:] == [APP_ID] * 3  # the builder App, never superstar's
+    assert perms[-2:] == [READER.permissions, READER.permissions]
+    assert github.issuers[-2:] == [APP_ID] * 2  # the builder App, never superstar's
 
 
 def test_a_transient_launch_error_re_mints_a_superstar_token_from_its_own_app(
@@ -1018,7 +1021,7 @@ def test_a_reader_operators_children_cant_be_builders(app_client, app_settings, 
     op = _auth_for(app_client, app_settings, "rob", "reader", role="operator")
     api = _running_api_auth(app_client, runner, op)
     r = app_client.post("/jobs", json={**JOB, "profile": "builder"}, headers=api)
-    assert r.status_code == 422 and "wider" in r.json()["detail"]
+    assert r.status_code == 422 and "can only be 'reader'" in r.json()["detail"]
     r = app_client.post("/jobs", json={**JOB, "pr": 3, "profile": "builder"}, headers=api)
     assert r.status_code == 422
     child = app_client.post("/jobs", json=JOB, headers=api).json()
@@ -1050,13 +1053,36 @@ def test_a_child_whose_profile_its_operator_no_longer_covers_fails_at_mint(
 
     op = _auth_for(app_client, app_settings, "bob", "builder", role="operator")
     api = _running_api_auth(app_client, runner, op)
-    builder = app_client.post("/jobs", json={**JOB, "profile": "builder"}, headers=api).json()
     reader = app_client.post("/jobs", json=JOB, headers=api).json()
     set_profile(app_settings, _token_id(app_settings, "bob"), "reader")
     app_client.queue.tick()
-    assert app_client.get(f"/jobs/{builder['id']}", headers=op).json()["status"] == "failed"
     assert app_client.get(f"/jobs/{reader['id']}", headers=op).json()["status"] == "running"
     assert github.requests[-1][2]["permissions"] == READER.permissions
+
+
+def test_a_child_with_any_profile_but_reader_fails_at_mint(
+    app_client, app_settings, runner, github
+):
+    """The mint-time re-check: a child row that somehow says builder (an older Drella
+    allowed it) is refused, even though its operator's profile covers builder."""
+    from sqlalchemy import text
+
+    from drella.db import make_engine
+
+    op = _auth_for(app_client, app_settings, "bea", "builder", role="operator")
+    api = _running_api_auth(app_client, runner, op)
+    child = app_client.post("/jobs", json=JOB, headers=api).json()
+    engine = make_engine(app_settings.database_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE jobs SET github_profile = 'builder' WHERE id = :id"), {"id": child["id"]}
+        )
+    engine.dispose()
+    minted = github.minted
+    app_client.queue.tick()
+    got = app_client.get(f"/jobs/{child['id']}", headers=op).json()
+    assert got["status"] == "failed" and "'builder'" in got["message"]
+    assert github.minted == minted
 
 
 def test_a_launch_retry_checks_the_profile_again(app_client, app_auth, app_settings, runner, github):

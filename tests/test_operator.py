@@ -233,10 +233,12 @@ def test_with_a_stored_github_credential_an_api_token_cant_queue_a_repo_job(
 ):
     """The child would get the caller's own credential, not a reader token."""
     before = set(runner.secrets)
-    for extra in ({}, {"profile": "builder"}, {"profile": "reader"}, {"pr": 5}):
+    for extra in ({}, {"profile": "reader"}, {"pr": 5}):
         r = client.post("/jobs", json={**JOB, **extra}, headers=api_auth)
         assert r.status_code == 422, (extra, r.text)
         assert "stored 'github' credential" in r.json()["detail"]
+    r = client.post("/jobs", json={**JOB, "profile": "builder"}, headers=api_auth)
+    assert r.status_code == 422  # never builder, credential or not
     assert set(runner.secrets) == before  # no Secret was made
     # Without a repo it's fine, and the caller itself may still queue repo jobs.
     child = _child(client, api_auth).json()
@@ -244,7 +246,7 @@ def test_with_a_stored_github_credential_an_api_token_cant_queue_a_repo_job(
     assert client.post("/jobs", json=JOB, headers=op_auth).status_code == 201
 
 
-@pytest.mark.parametrize("profile", ["superstar", "admin", "", "Builder", 1])
+@pytest.mark.parametrize("profile", ["superstar", "builder", "admin", "", "Builder", 1])
 def test_a_child_cant_ask_for_other_profiles(client, running, api_auth, profile):
     assert _child(client, api_auth, profile=profile).status_code == 422
 
@@ -446,3 +448,40 @@ def test_until_reader_thread_ends_after_the_client_goes_away():
     while _follow_threads() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not _follow_threads()
+
+
+# -- GET /jobs?status= (issue #75: pollers needn't fetch every job's prompt) ---------
+
+
+def test_the_job_list_filters_by_status(client, op_auth, running, api_auth, app):
+    queued = client.post("/jobs", json=JOB, headers=op_auth).json()
+    with app.state.deps.sessions() as s:
+        s.get(Job, queued["id"]).status = "failed"
+        s.commit()
+    another = client.post("/jobs", json=JOB, headers=op_auth).json()
+    for auth in (op_auth, api_auth):
+        def ids(q):
+            r = client.get(f"/jobs{q}", headers=auth)
+            assert r.status_code == 200, r.text
+            return [j["id"] for j in r.json()]
+
+        assert ids("?status=queued,running") == [another["id"], running["id"]]
+        assert ids("?status=running") == [running["id"]]
+        assert ids("?status=failed") == [queued["id"]]
+        assert ids("?status=succeeded") == []
+        assert ids("?status=%20queued%20,%20failed") == [another["id"], queued["id"]]
+        assert ids("") == [another["id"], queued["id"], running["id"]]
+
+
+@pytest.mark.parametrize("q", ["", "done", "queued,bogus", ",", "QUEUED"])
+def test_an_unknown_status_filter_is_refused(client, auth, q):
+    r = client.get("/jobs", params={"status": q}, headers=auth)
+    assert r.status_code == 422
+    assert "queued, running, succeeded, failed" in r.json()["detail"]
+
+
+def test_the_status_filter_only_lists_the_callers_jobs(client, auth, op_auth, running):
+    _setup(client, auth)
+    mine = client.post("/jobs", json=JOB, headers=auth).json()
+    r = client.get("/jobs?status=queued,running", headers=auth)
+    assert [j["id"] for j in r.json()] == [mine["id"]]

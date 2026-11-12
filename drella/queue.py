@@ -22,7 +22,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from drella.adapters import Interface, ModelSpec
-from drella.github import PROFILES, SUPERSTAR, GitHubApp, GitHubAppError, covers
+from drella.github import CHILD_PROFILE, PROFILES, GitHubApp, GitHubAppError, covers
 from drella.models import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, Token
 from drella.runner import JobSpec, LogsUnavailable, Runner, RunState, is_transient
 from drella.storage import CHUNK, NotFound, Storage
@@ -274,8 +274,8 @@ class Queue:
         Drella token's GitHub profile, read now, so a profile an admin has narrowed
         applies to jobs still queued. A job that asked for its own profile (`profile` on
         POST /jobs, or a child's default `reader`) gets it only if the token's profile,
-        read now, still covers it; otherwise the job fails rather than mint more than the
-        token may now have. The token goes into the job's Secret where a caller's
+        read now, still covers it, and a child of an operator job only ever gets `reader`;
+        otherwise the job fails rather than mint more than the token may now have. The token goes into the job's Secret where a caller's
         `github` credential would be, and never into the database. The job's deadline is
         capped at the token's expiry, so the token outlasts everything the job does."""
         token_row = s.get(Token, job.token_id)
@@ -288,7 +288,7 @@ class Queue:
             if (
                 asked is None
                 or not covers(own, asked)
-                or (job.parent_job_id is not None and asked.name == SUPERSTAR)
+                or (job.parent_job_id is not None and asked.name != CHILD_PROFILE)
             ):
                 raise RuntimeError(
                     f"the job asked for the GitHub profile '{job.github_profile}', which its"
