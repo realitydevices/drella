@@ -316,6 +316,55 @@ from the default branch.
    a required review, auto-merge has nothing to wait for, and a job's PR can merge with
    no human looking at it.
 
+## Superstar (optional)
+
+The superstar is a scheduled Drella job (issue #75) whose routine is the prompt in
+`docs/superstar.md`, so changes to it are reviewed like code. **v1 reviews and reports
+only.** Every 30 minutes it finds open, non-draft PRs that drella-bot opened from a
+`drella/` branch of this repo, queues two `reader` review jobs on two different models for
+each new head, and once both finish posts one summary comment (verdicts, models, findings
+by severity, CI) and labels the PR `ready-for-merge` (both approve, CI green) or
+`needs-kirk`. It never merges, pushes, approves or closes anything, and never runs PR
+code. **You merge.**
+
+1. **Create its Drella token**, with the `superstar` profile and the `operator` role:
+
+   ```sh
+   kubectl -n drella exec deploy/drella -- drella token create --name superstar \
+     --github-profile superstar --role operator
+   ```
+
+   Its run jobs get a short-lived API token (`DRELLA_API_TOKEN`) to queue the review jobs.
+   **This token must not store a `github` credential**: with one, Drella refuses (422)
+   every repo job its API token queues, so no review can be queued. v1 needs no builder
+   token.
+
+2. **Give it models and a Claude credential** (see **Run a job** below): the alias
+   `claude-opus` (the CronJob asks for it) and the models it may rotate reviews across,
+   local ones included.
+
+3. **Create the Secret and the labels**:
+
+   ```sh
+   kubectl -n drella create secret generic superstar-token --from-literal=token=<the token>
+   gh label create ready-for-merge --repo realitydevices/drella
+   gh label create needs-kirk --repo realitydevices/drella
+   ```
+
+4. **Enable the CronJob** from the repo root. It isn't in the default kustomization
+   (kustomize won't read `docs/` from an overlay), so it's a ConfigMap and plain kubectl:
+
+   ```sh
+   kubectl -n drella create configmap superstar-prompt --from-file=superstar.md=docs/superstar.md --dry-run=client -o yaml | kubectl apply -f -
+   kubectl apply -f deploy/superstar-cronjob.yaml
+   ```
+
+   Run the first command again whenever `docs/superstar.md` changes on `main`. The CronJob
+   skips a tick while a superstar job is queued or running, using
+   `GET /jobs?status=queued,running` (branch `drella/jobs-status-filter`: deploy a Drella
+   with it first). Try it once by hand with
+   `kubectl -n drella create job --from=cronjob/superstar superstar-try`.
+
 ## Reaching Drella
 
 Drella exposes one HTTP service, `drella` on port 8000. What sits in front of it is up

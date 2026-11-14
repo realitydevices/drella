@@ -1,0 +1,103 @@
+# Optional: the superstar's scheduled run (issue #75, docs/superstar.md). Not in the
+# default kustomization. Every 30 minutes it POSTs one Drella job whose prompt is
+# docs/superstar.md, unless a superstar job is still queued or running. In v1 that run
+# only reviews Drella-built PRs and labels them; Kirk merges.
+#
+# Install from the repo root (see "Superstar" in deploy/README.md). Run the first command
+# again whenever docs/superstar.md changes on main:
+#
+#   kubectl -n drella create configmap superstar-prompt --from-file=superstar.md=docs/superstar.md --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl apply -f deploy/superstar-cronjob.yaml
+#
+# It needs a Drella with `GET /jobs?status=` (branch drella/jobs-status-filter, part of
+# #75), and the Secret `superstar-token` (key: token): a Drella token with the `superstar`
+# profile and `operator` role. The posted job sets no `profile`, so it gets the token's own.
+#
+# The prompt's first line, `drella-superstar-run:v1`, is the marker the skip check below
+# looks for: keep the two in step.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: superstar
+  namespace: drella
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100      # curlimages/curl's curl_user
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: post-job
+              # A tiny curl image (busybox sh, grep, sed, awk). Pin it by digest in your overlay.
+              image: curlimages/curl:8.11.1
+              env:
+                - name: DRELLA_URL
+                  value: http://drella.drella.svc:8000
+                - name: DRELLA_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: superstar-token
+                      key: token
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: prompt
+                  mountPath: /prompt
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+              command:
+                - sh
+                - -ec
+                - |
+                  auth="Authorization: Bearer $DRELLA_TOKEN"
+                  marker=$(head -n 1 /prompt/superstar.md)
+                  # Skip if a superstar job is already queued or running: ask Drella for
+                  # only those jobs, and look for a prompt that starts with the marker
+                  # (its first line). The answer streams through awk, never held in a
+                  # variable. A failed request stops the run (nothing is posted).
+                  found=$({ curl -fsS -H "$auth" "$DRELLA_URL/jobs?status=queued,running" \
+                            || echo "__drella_jobs_request_failed__"; } \
+                          | awk -v m="$marker" '
+                              index($0, "__drella_jobs_request_failed__") { e = 1 }
+                              index($0, "\"prompt\":\"" m) || index($0, "\"prompt\": \"" m) { f = 1 }
+                              END { print (e ? "error" : (f ? "yes" : "no")) }')
+                  if [ "$found" = error ]; then
+                    echo "couldn't list Drella's queued and running jobs" >&2
+                    exit 1
+                  fi
+                  if [ "$found" = yes ]; then
+                    echo "a superstar job is already queued or running; skipping"
+                    exit 0
+                  fi
+                  # JSON-encode the prompt: escape \ and ", turn newlines into \n. The
+                  # prompt has no tabs or other control characters (a test checks).
+                  prompt=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' /prompt/superstar.md | awk 'BEGIN{ORS="\\n"} {print}')
+                  printf '{"prompt":"%s","model":"claude-opus","repo":"realitydevices/drella"}' "$prompt" > /tmp/job.json
+                  curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
+                    --data-binary @/tmp/job.json "$DRELLA_URL/jobs"
+                  echo
+              resources:
+                requests: {cpu: 10m, memory: 16Mi}
+                limits: {memory: 64Mi}
+          volumes:
+            - name: prompt
+              configMap:
+                name: superstar-prompt
+            - name: tmp
+              emptyDir: {}
